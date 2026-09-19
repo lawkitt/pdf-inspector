@@ -45,7 +45,7 @@ pub use fusion::{
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 pub use models::{
     ModelAcquireError, ModelArtifact, ModelArtifactKind, ModelDownloader, ModelManifest,
-    ModelPaths, ModelStore, ModelStoreError, PP_OCR_V6_SMALL,
+    ModelPaths, ModelStore, ModelStoreError, PP_OCR_CYRILLIC, PP_OCR_V6_SMALL,
 };
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
 pub use oar::{OarOcrEngine, OarOcrError, ONNX_RUNTIME_LIBRARY_ENV};

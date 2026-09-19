@@ -94,6 +94,30 @@ pub const PP_OCR_V6_SMALL: ModelManifest = ModelManifest {
     artifacts: PP_OCR_V6_SMALL_ARTIFACTS,
 };
 
+/// English/Cyrillic recognizer with the PP-OCRv6 Small detector.
+pub const PP_OCR_CYRILLIC: ModelManifest = ModelManifest {
+    schema_version: 1,
+    id: "pp-ocr-cyrillic",
+    revision: "oar-det-v0.7.0-rec-v0.3.0",
+    artifacts: &[
+        PP_OCR_V6_SMALL_ARTIFACTS[0],
+        ModelArtifact {
+            kind: ModelArtifactKind::TextRecognition,
+            filename: "cyrillic_pp-ocrv5_mobile_rec.onnx",
+            url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/cyrillic_pp-ocrv5_mobile_rec.onnx",
+            sha256: "a18d96d7c8d73d90f2ed056549caa1de3a8e6cb744cccba16cd593ea8cd2d569",
+            size: 8_076_390,
+        },
+        ModelArtifact {
+            kind: ModelArtifactKind::CharacterDictionary,
+            filename: "ppocrv5_cyrillic_dict.txt",
+            url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/ppocrv5_cyrillic_dict.txt",
+            sha256: "db40aa52ceb112055be80c694afdf655d5d2c4f7873704524cc16a447ca913ba",
+            size: 2_781,
+        },
+    ],
+};
+
 /// Resolved, verified filesystem paths for one model manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPaths {

@@ -583,3 +583,22 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |
+# Fork additions: explicit local OCR model and runtime selection
+
+`OcrPdfOptions::model_manifest` selects a checksum-pinned model set; the
+upstream default remains `PP_OCR_V6_SMALL`. This fork also exports
+`vision::PP_OCR_CYRILLIC`: the v6 Small detector with the v5 Cyrillic mobile
+recognizer and matching dictionary, supporting English and Russian characters.
+The CLI accepts `--ocr-model cyrillic`. Model cache keys and output provenance
+use the selected manifest, including its artifact digests.
+
+`OcrPdfOptions::pdfium_library` and `onnx_runtime_library` accept explicit
+library paths for app-managed installations without changing environment
+variables. ONNX Runtime is initialized process-wide, so select its library
+before constructing the first engine. `OarOcrEngine::from_models_with_runtime`
+provides the same explicit path at the lower level.
+
+An explicit `model_directory` is still verified against the selected manifest;
+it never means "load arbitrary replacement files". Use `ModelDownloadPolicy::Offline`
+during document conversion after explicit setup. Character coverage is not a
+recognition-quality guarantee; qualify real documents for the chosen languages.

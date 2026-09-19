@@ -24,9 +24,10 @@ use super::oar::onnx_runtime_library_path;
 use super::pdfium::PdfiumTextPage;
 use super::{
     route_ocr_pages, run_ocr_pages, FusedPageMarkdown, FusedPages, HttpModelDownloadError,
-    HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
-    OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun,
-    OcrRunError, PageRenderer, PdfiumRenderer, RenderError, RenderOptions, PP_OCR_V6_SMALL,
+    HttpModelDownloader, ModelAcquireError, ModelManifest, ModelStore, ModelStoreError,
+    OarOcrEngine, OarOcrError, OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions,
+    OcrRoutingError, OcrRun, OcrRunError, PageRenderer, PdfiumRenderer, RenderError, RenderOptions,
+    PP_OCR_V6_SMALL,
 };
 
 /// Bounds live rendered-page memory while preserving small OCR batches.
@@ -64,6 +65,12 @@ static OCR_ENGINE_CACHE: OnceLock<Mutex<Option<CachedOcrEngine>>> = OnceLock::ne
 /// Options for native extraction with optional OCR.
 #[derive(Clone)]
 pub struct OcrPdfOptions {
+    /// Pinned model set used for acquisition, engine identity, and cache keys.
+    pub model_manifest: &'static ModelManifest,
+    /// Explicit PDFium library, without changing process environment.
+    pub pdfium_library: Option<PathBuf>,
+    /// Explicit ONNX Runtime library. The runtime is process-wide once loaded.
+    pub onnx_runtime_library: Option<PathBuf>,
     /// Page rasterization settings used when OCR is routed.
     pub render: RenderOptions,
     /// OCR routing, model, and recognition settings.
@@ -84,6 +91,9 @@ pub struct OcrPdfOptions {
 impl Default for OcrPdfOptions {
     fn default() -> Self {
         Self {
+            model_manifest: &PP_OCR_V6_SMALL,
+            pdfium_library: None,
+            onnx_runtime_library: None,
             render: RenderOptions::default(),
             ocr: OcrOptions::default(),
             markdown: MarkdownOptions::default(),
@@ -98,6 +108,9 @@ impl std::fmt::Debug for OcrPdfOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OcrPdfOptions")
+            .field("model_manifest", &self.model_manifest.id)
+            .field("pdfium_library", &self.pdfium_library)
+            .field("onnx_runtime_library", &self.onnx_runtime_library)
             .field("render", &self.render)
             .field("ocr", &self.ocr)
             .field("markdown", &self.markdown)
@@ -312,7 +325,7 @@ pub fn process_pdf_with_ocr_mem(
                 .copied(),
         );
         if !native_probe_pages.is_empty() {
-            let native_renderer = PdfiumRenderer::load()?;
+            let native_renderer = load_renderer(&options)?;
             let recovered = native_renderer.extract_text_pages(
                 buffer,
                 &native_probe_pages.iter().copied().collect::<Vec<_>>(),
@@ -376,7 +389,7 @@ pub fn process_pdf_with_ocr_mem(
     {
         let native_renderer = match renderer {
             Some(renderer) => renderer,
-            None => PdfiumRenderer::load()?,
+            None => load_renderer(&options)?,
         };
         let elapsed = filter_supplemental_routes_by_pixels(
             &native_renderer,
@@ -416,9 +429,9 @@ pub fn process_pdf_with_ocr_mem(
         // PDFium installation cannot trigger a model download it cannot use.
         let renderer = match renderer {
             Some(renderer) => renderer,
-            None => PdfiumRenderer::load()?,
+            None => load_renderer(&options)?,
         };
-        let engine = cached_ocr_engine(&options.ocr)?;
+        let engine = cached_ocr_engine(&options)?;
         run_and_fuse_ocr_chunks(
             &renderer,
             engine.as_ref(),
@@ -646,20 +659,37 @@ fn clone_native_page(page: &PageMarkdown) -> PageMarkdown {
     }
 }
 
-fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipelineError> {
-    let store = ModelStore::from_options(options)?;
-    let key = OcrEngineCacheKey {
-        model_root: normalized_cache_path(store.model_root(&PP_OCR_V6_SMALL)),
-        runtime_library: normalized_cache_path(onnx_runtime_library_path()),
-        manifest_schema: PP_OCR_V6_SMALL.schema_version,
-        manifest_id: PP_OCR_V6_SMALL.id,
-        manifest_revision: PP_OCR_V6_SMALL.revision,
-        artifact_digests: PP_OCR_V6_SMALL
+fn load_renderer(options: &OcrPdfOptions) -> Result<PdfiumRenderer, RenderError> {
+    match &options.pdfium_library {
+        Some(path) => PdfiumRenderer::load_from_path(path),
+        None => PdfiumRenderer::load(),
+    }
+}
+
+fn engine_cache_key(options: &OcrPdfOptions, store: &ModelStore) -> OcrEngineCacheKey {
+    OcrEngineCacheKey {
+        model_root: normalized_cache_path(store.model_root(options.model_manifest)),
+        runtime_library: normalized_cache_path(
+            options
+                .onnx_runtime_library
+                .clone()
+                .unwrap_or_else(onnx_runtime_library_path),
+        ),
+        manifest_schema: options.model_manifest.schema_version,
+        manifest_id: options.model_manifest.id,
+        manifest_revision: options.model_manifest.revision,
+        artifact_digests: options
+            .model_manifest
             .artifacts
             .iter()
             .map(|artifact| artifact.sha256)
             .collect(),
-    };
+    }
+}
+
+fn cached_ocr_engine(options: &OcrPdfOptions) -> Result<Arc<OarOcrEngine>, OcrPipelineError> {
+    let store = ModelStore::from_options(&options.ocr)?;
+    let key = engine_cache_key(options, &store);
     let cache = OCR_ENGINE_CACHE.get_or_init(|| Mutex::new(None));
     {
         let cached = cache.lock().unwrap_or_else(|error| error.into_inner());
@@ -674,11 +704,14 @@ fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipel
     // OCR requests can continue using a warm engine. Concurrent cold misses may
     // build redundantly; the second cache check keeps only one shared session.
     let models = store.resolve_or_download(
-        &PP_OCR_V6_SMALL,
-        options.model_downloads,
+        options.model_manifest,
+        options.ocr.model_downloads,
         &HttpModelDownloader::default(),
     )?;
-    let engine = Arc::new(OarOcrEngine::from_models(&models)?);
+    let engine = Arc::new(OarOcrEngine::from_models_with_runtime(
+        &models,
+        options.onnx_runtime_library.as_deref(),
+    )?);
 
     let mut cached = cache.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(cached) = cached.as_ref().filter(|cached| cached.key == key) {
@@ -1501,5 +1534,24 @@ mod tests {
                 OcrFusionError::InvalidHostedConfidence { .. }
             ))
         ));
+    }
+}
+
+#[cfg(test)]
+mod model_selection_tests {
+    use super::*;
+    use crate::vision::PP_OCR_CYRILLIC;
+
+    #[test]
+    fn model_and_runtime_choices_isolate_cached_engines() {
+        let store = ModelStore::new("models");
+        let mut options = OcrPdfOptions::auto();
+        let default = engine_cache_key(&options, &store);
+        options.model_manifest = &PP_OCR_CYRILLIC;
+        let cyrillic = engine_cache_key(&options, &store);
+        assert_ne!(default, cyrillic);
+        assert_ne!(default.artifact_digests, cyrillic.artifact_digests);
+        options.onnx_runtime_library = Some(PathBuf::from("other-runtime"));
+        assert_ne!(cyrillic, engine_cache_key(&options, &store));
     }
 }

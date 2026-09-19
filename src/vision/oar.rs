@@ -1,6 +1,6 @@
 //! PP-OCRv6 Small implementation backed by OAR and ONNX Runtime.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -240,7 +240,16 @@ fn build_workers(
 impl OarOcrEngine {
     /// Loads PP-OCRv6 Small from a resolved, verified model set.
     pub fn from_models(models: &ModelPaths) -> Result<Self, OarOcrError> {
-        load_onnx_runtime()?;
+        Self::from_models_with_runtime(models, None)
+    }
+
+    /// Loads a verified model set with an optional explicit ONNX Runtime path.
+    /// ONNX Runtime is process-wide; select its path before the first engine.
+    pub fn from_models_with_runtime(
+        models: &ModelPaths,
+        runtime: Option<&Path>,
+    ) -> Result<Self, OarOcrError> {
+        load_onnx_runtime(runtime)?;
         let detection = required_model(models, ModelArtifactKind::TextDetection)?;
         let recognition = required_model(models, ModelArtifactKind::TextRecognition)?;
         let dictionary = required_model(models, ModelArtifactKind::CharacterDictionary)?;
@@ -508,8 +517,10 @@ fn ocr_session_config(intra_threads: usize) -> OrtSessionConfig {
         .with_parallel_execution(false)
 }
 
-fn load_onnx_runtime() -> Result<(), OarOcrError> {
-    let path = onnx_runtime_library_path();
+fn load_onnx_runtime(runtime: Option<&Path>) -> Result<(), OarOcrError> {
+    let path = runtime
+        .map(Path::to_path_buf)
+        .unwrap_or_else(onnx_runtime_library_path);
     drop(
         ort::init_from(&path).map_err(|source| OarOcrError::OnnxRuntimeLoad {
             path: path.clone(),

@@ -4,7 +4,7 @@ use pdf_inspector::extractor::ItemType;
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 use pdf_inspector::vision::{
     process_pdf_with_ocr, ModelDownloadPolicy, OcrMode, OcrOptions, OcrPdfOptions, OcrPdfResult,
-    PageContentSource, RenderOptions,
+    PageContentSource, RenderOptions, PP_OCR_CYRILLIC,
 };
 use pdf_inspector::{
     extract_text_with_positions_pages_with_password, process_pdf_with_options, LayoutComplexity,
@@ -433,6 +433,7 @@ fn main() {
         eprintln!("  --ocr-dpi N         OCR render resolution (default: 150)");
         eprintln!("  --ocr-min-confidence N  Drop OCR spans below N (default: 0)");
         eprintln!("  --ocr-hosted-threshold N  Recommend hosted parsing below N (default: 0.5)");
+        eprintln!("  --ocr-model NAME    Model: default or cyrillic");
         eprintln!("  --ocr-model-dir DIR Use a package-managed local model directory");
         eprintln!("  --ocr-offline       Never download missing OCR models");
         process::exit(1);
@@ -490,6 +491,7 @@ fn main() {
         "--ocr-min-confidence",
         "--ocr-hosted-threshold",
         "--ocr-model-dir",
+        "--ocr-model",
         "--ocr-offline",
     ]
     .iter()
@@ -566,6 +568,13 @@ fn main() {
                 .ocr(ocr)
                 .markdown(markdown)
                 .hosted_recommendation_confidence(hosted_threshold);
+            match argument_value(&args, "--ocr-model")
+                .unwrap_or_else(|error| exit_ocr_error(&error, json_output))
+            {
+                None | Some("default") => {}
+                Some("cyrillic") => pdf_options.model_manifest = &PP_OCR_CYRILLIC,
+                Some(value) => exit_ocr_error(&format!("unknown OCR model: {value}"), json_output),
+            }
             if let Some(pages) = page_filter.clone() {
                 pdf_options = pdf_options.page_numbers(pages);
             }
