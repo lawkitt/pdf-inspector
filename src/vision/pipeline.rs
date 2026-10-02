@@ -26,8 +26,8 @@ use super::{
     route_ocr_pages, run_ocr_pages, FusedPageMarkdown, FusedPages, HttpModelDownloadError,
     HttpModelDownloader, ModelAcquireError, ModelManifest, ModelStore, ModelStoreError,
     OarOcrEngine, OarOcrError, OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions,
-    OcrRoutingError, OcrRun, OcrRunError, PageRenderer, PdfiumRenderer, RenderError, RenderOptions,
-    PP_OCR_V6_SMALL,
+    OcrPage, OcrRoutingError, OcrRun, OcrRunError, PageRenderer, PdfiumRenderer, RenderError,
+    RenderOptions, PP_OCR_V6_SMALL,
 };
 
 /// Bounds live rendered-page memory while preserving small OCR batches.
@@ -81,6 +81,9 @@ pub struct OcrPdfOptions {
     pub page_numbers: Option<BTreeSet<u32>>,
     /// Password for an encrypted PDF.
     pub password: Option<String>,
+    /// Retain raw recognition evidence before native fusion, for local QA.
+    /// Disabled by default to avoid retaining extra text in normal conversion.
+    pub retain_recognition: bool,
     /// Weak OCR threshold for recommending the hosted pipeline.
     ///
     /// Pages with incomplete native coverage may also recommend the hosted
@@ -100,6 +103,7 @@ impl Default for OcrPdfOptions {
             page_numbers: None,
             password: None,
             hosted_recommendation_confidence: 0.5,
+            retain_recognition: false,
         }
     }
 }
@@ -115,6 +119,7 @@ impl std::fmt::Debug for OcrPdfOptions {
             .field("ocr", &self.ocr)
             .field("markdown", &self.markdown)
             .field("page_numbers", &self.page_numbers)
+            .field("retain_recognition", &self.retain_recognition)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .field(
                 "hosted_recommendation_confidence",
@@ -181,6 +186,8 @@ impl OcrPdfOptions {
 /// Complete native/OCR Markdown output for a PDF request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OcrPdfResult {
+    /// Raw recognition evidence, before fusion; empty unless explicitly requested.
+    pub recognition: Vec<OcrPage>,
     /// Final document Markdown in selected-page order.
     pub markdown: String,
     /// Final per-page Markdown and provenance, using 1-indexed page numbers.
@@ -411,6 +418,7 @@ pub fn process_pdf_with_ocr_mem(
         .markdown(page_markdown_options)
         .render_dpi(options.render.dpi)
         .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
+    let mut recognition = Vec::new();
     let mut fused = if routed.is_empty() {
         fuse_ocr_pages_adaptive_with_routes(
             &native.pages,
@@ -445,6 +453,7 @@ pub fn process_pdf_with_ocr_mem(
             &fusion_options,
             &native_candidates,
             &fusion_routes,
+            options.retain_recognition.then_some(&mut recognition),
         )?
     };
     fused.render_time_ms = fused
@@ -474,6 +483,7 @@ pub fn process_pdf_with_ocr_mem(
     pages_with_tables.sort_unstable();
 
     Ok(OcrPdfResult {
+        recognition,
         markdown,
         pages: fused.pages,
         page_count,
@@ -554,6 +564,7 @@ fn run_and_fuse_ocr_chunks<R, O>(
     fusion_options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
     fusion_routes: &BTreeMap<u32, OcrFusionRoute>,
+    mut recognition: Option<&mut Vec<OcrPage>>,
 ) -> Result<FusedPages, OcrPipelineError>
 where
     R: PageRenderer,
@@ -597,6 +608,9 @@ where
             native_candidates,
             fusion_routes,
         )?;
+        if let Some(recognition) = recognition.as_mut() {
+            recognition.extend(run.pages.into_iter().map(|page| page.ocr));
+        }
         render_time_ms = render_time_ms.saturating_add(fused.render_time_ms);
         ocr_time_ms = ocr_time_ms.saturating_add(fused.ocr_time_ms);
         for page in fused.pages {
@@ -1229,6 +1243,7 @@ mod tests {
             .collect();
         let ocr_options = OcrOptions::new().mode(OcrMode::Force);
 
+        let mut recognition = Vec::new();
         let fused = run_and_fuse_ocr_chunks(
             &renderer,
             &engine,
@@ -1242,12 +1257,21 @@ mod tests {
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
             &routes,
+            Some(&mut recognition),
         )
         .unwrap();
 
         let expected = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10]];
         assert_eq!(*renderer.batches.lock().unwrap(), expected);
         assert_eq!(*engine.batches.lock().unwrap(), expected);
+        assert_eq!(recognition.len(), 10);
+        assert_eq!(
+            recognition
+                .iter()
+                .map(|p| p.page_number)
+                .collect::<Vec<_>>(),
+            routed_pages
+        );
         assert_eq!(fused.pages.len(), 10);
         assert!(fused
             .pages
