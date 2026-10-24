@@ -1418,7 +1418,7 @@ struct ListNesting {
 impl ListNesting {
     /// The indentation, in spaces, of an item whose marker starts at `x`
     /// and whose formatted line is `formatted`, at body font size
-    /// `base_size`. A marker more than four ems right of the last starts
+    /// `base_size`. A marker more than eight ems right of the last starts
     /// a new list (another column) rather than a child.
     fn indent(&mut self, x: f32, formatted: &str, base_size: f32) -> usize {
         let digits = formatted.bytes().take_while(u8::is_ascii_digit).count();
@@ -1427,7 +1427,7 @@ impl ListNesting {
         if self
             .levels
             .last()
-            .is_some_and(|&(level_x, _)| x > level_x + 4.0 * base_size)
+            .is_some_and(|&(level_x, _)| x > level_x + 8.0 * base_size)
         {
             self.levels.clear();
         }
@@ -2122,6 +2122,18 @@ mod tests {
         for md in both_converters(lines) {
             assert!(!md.contains(" 3.") && !md.contains(" 4."), "{md}");
             assert!(md.contains("3. Вторая колонка\n"), "{md}");
+        }
+    }
+
+    #[test]
+    fn a_widely_indented_child_still_nests() {
+        let lines = vec![
+            placed("1. Parent", 72.0, 700.0, 100.0),
+            placed("• Потомок", 132.0, 686.0, 100.0),
+            placed("2. Next parent", 72.0, 672.0, 100.0),
+        ];
+        for md in both_converters(lines) {
+            assert_eq!(md, "1. Parent\n   - Потомок\n2. Next parent\n");
         }
     }
 

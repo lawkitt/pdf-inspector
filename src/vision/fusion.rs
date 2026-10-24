@@ -735,17 +735,42 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
             .find(|span| span.0 >= line_start)
             .map(|span| span.2)
     };
-    // The page's usual gap between consecutive lines, from at least three
-    // of them: a double-spaced item's continuation is that far below it.
-    let mut line_gaps: Vec<f32> = mapped
+    // For each consecutive pair: the gap between them when the second span
+    // sits at a hanging indent under a list item's line, a candidate
+    // continuation of that item.
+    let hanging: Vec<Option<f32>> = mapped
         .windows(2)
-        .map(|pair| pair[1].3 - pair[0].5)
-        .filter(|gap| gap.is_finite() && *gap > 0.0)
+        .map(|pair| {
+            let (_, current_end, _, _, _, current_bottom) = pair[0];
+            let (_, _, next_left, next_top, _, _) = pair[1];
+            (markdown_line_at(markdown, current_end).is_some_and(is_markdown_list_line)
+                && line_left(current_end)
+                    .is_some_and(|left| next_left > left + median_height * 0.5))
+            .then_some(next_top - current_bottom)
+        })
         .collect();
-    line_gaps.sort_by(f32::total_cmp);
-    let usual_gap = (line_gaps.len() >= 3).then(|| line_gaps[line_gaps.len() / 2]);
+    // A candidate continues the item when it is closer than a line height,
+    // or when it belongs to a run of at least two hanging lines spaced
+    // alike (a double-spaced item): one indented line after a wide gap is
+    // as likely a paragraph of its own.
+    let mut continues = vec![false; hanging.len()];
+    let mut i = 0;
+    while i < hanging.len() {
+        let run_end = (i..hanging.len())
+            .find(|&j| hanging[j].is_none())
+            .unwrap_or(hanging.len());
+        let gaps: Vec<f32> = hanging[i..run_end].iter().flatten().copied().collect();
+        let (low, high) = gaps.iter().fold((f32::MAX, f32::MIN), |(low, high), &g| {
+            (low.min(g), high.max(g))
+        });
+        let regular = gaps.len() >= 2 && low > 0.0 && high <= low * 1.25;
+        for (j, gap) in (i..run_end).zip(gaps) {
+            continues[j] = regular || gap < median_height;
+        }
+        i = run_end + 1;
+    }
     let mut replacements = Vec::new();
-    for pair in mapped.windows(2) {
+    for (index, pair) in mapped.windows(2).enumerate() {
         let (_, current_end, current_left, _, current_right, current_bottom) = pair[0];
         let (next_start, _, next_left, next_top, next_right, _) = pair[1];
         let overlap = (current_right.min(next_right) - current_left.max(next_left)).max(0.0);
@@ -756,11 +781,7 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
         // A word joined across the spans ("contrac" + "tion") has nothing
         // between them, and a list item's continuation at a hanging indent
         // stays in the item.
-        let gap = next_top - current_bottom;
-        let continues_item = (gap < median_height
-            || usual_gap.is_some_and(|usual| gap <= usual * 1.25))
-            && markdown_line_at(markdown, current_end).is_some_and(is_markdown_list_line)
-            && line_left(current_end).is_some_and(|left| next_left > left + median_height * 0.5);
+        let continues_item = continues[index];
         if same_text_flow
             && separated
             && !between.is_empty()
@@ -1657,6 +1678,36 @@ mod tests {
         assert_eq!(
             ocr_page_to_markdown(&page, 1, &MarkdownOptions::default()).trim_end(),
             markdown
+        );
+    }
+
+    #[test]
+    fn line_break_recovery_splits_one_indented_line_on_a_double_spaced_page() {
+        // Paragraph gaps everywhere do not make the indented line after the
+        // item a continuation: it is not part of a regular hanging run.
+        let texts = [
+            "• First item.",
+            "An indented paragraph.",
+            "Третий абзац.",
+            "Fourth paragraph.",
+        ];
+        let spans = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let top = 10.0 + 25.0 * i as f32;
+                let left = if i == 1 { 20.0 } else { 10.0 };
+                positioned_span(text, left, top, 190.0, top + 10.0)
+            })
+            .collect();
+        let page = routed_page(1, spans, Some(0.9));
+        let recovered = preserve_ocr_line_breaks(
+            "- First item. An indented paragraph. Третий абзац. Fourth paragraph.",
+            &page,
+        );
+        assert_eq!(
+            recovered,
+            "- First item.\n\nAn indented paragraph.\n\nТретий абзац.\n\nFourth paragraph."
         );
     }
 
