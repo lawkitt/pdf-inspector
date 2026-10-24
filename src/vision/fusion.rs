@@ -735,6 +735,15 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
             .find(|span| span.0 >= line_start)
             .map(|span| span.2)
     };
+    // The page's usual gap between consecutive lines, from at least three
+    // of them: a double-spaced item's continuation is that far below it.
+    let mut line_gaps: Vec<f32> = mapped
+        .windows(2)
+        .map(|pair| pair[1].3 - pair[0].5)
+        .filter(|gap| gap.is_finite() && *gap > 0.0)
+        .collect();
+    line_gaps.sort_by(f32::total_cmp);
+    let usual_gap = (line_gaps.len() >= 3).then(|| line_gaps[line_gaps.len() / 2]);
     let mut replacements = Vec::new();
     for pair in mapped.windows(2) {
         let (_, current_end, current_left, _, current_right, current_bottom) = pair[0];
@@ -747,7 +756,9 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
         // A word joined across the spans ("contrac" + "tion") has nothing
         // between them, and a list item's continuation at a hanging indent
         // stays in the item.
-        let continues_item = next_top - current_bottom < median_height
+        let gap = next_top - current_bottom;
+        let continues_item = (gap < median_height
+            || usual_gap.is_some_and(|usual| gap <= usual * 1.25))
             && markdown_line_at(markdown, current_end).is_some_and(is_markdown_list_line)
             && line_left(current_end).is_some_and(|left| next_left > left + median_height * 0.5);
         if same_text_flow
@@ -1605,6 +1616,48 @@ mod tests {
         );
         let markdown = "- First item starts continued on another line.";
         assert_eq!(preserve_ocr_line_breaks(markdown, &page), markdown);
+    }
+
+    #[test]
+    fn line_break_recovery_keeps_a_double_spaced_items_continuation() {
+        let lines = [
+            "• The tenant agrees to pay all charges",
+            "arising under this lease and all related",
+            "costs assessed during the contractual",
+            "period unless otherwise agreed by both",
+            "parties in writing before the relevant",
+            "payment becomes due under the agreement.",
+        ];
+        let spans = lines
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let top = 10.0 + 23.0 * i as f32;
+                let left = if i == 0 { 10.0 } else { 20.0 };
+                positioned_span(text, left, top, 190.0, top + 10.0)
+            })
+            .collect();
+        let mut page = routed_page(1, spans, Some(0.9));
+        let transform =
+            PageTransform::from_corners(200, 200, (0., 200.), (200., 200.), (0., 0.)).unwrap();
+        page.rendered = RenderedPage::new(
+            1,
+            200.,
+            200.,
+            200,
+            200,
+            600,
+            RenderPixelFormat::Rgb8,
+            vec![255; 120_000],
+            transform,
+        )
+        .unwrap();
+        let markdown = format!("- {}", lines.join(" ").trim_start_matches("• "));
+        assert_eq!(preserve_ocr_line_breaks(&markdown, &page), markdown);
+        assert_eq!(
+            ocr_page_to_markdown(&page, 1, &MarkdownOptions::default()).trim_end(),
+            markdown
+        );
     }
 
     #[test]

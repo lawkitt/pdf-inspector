@@ -96,7 +96,10 @@ fn block_line(line: &str) -> BlockLine {
     static RULE_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r"^(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$").unwrap()
     });
-    if line.starts_with([' ', '\t']) {
+    if line.starts_with('\t') {
+        return BlockLine::Indented;
+    }
+    if line.starts_with(' ') {
         let item = line.trim_start_matches(' ');
         return match block_line(item) {
             BlockLine::ListItem(marker, _) => BlockLine::ListItem(marker, line.len() - item.len()),
@@ -1302,6 +1305,14 @@ mod tests {
         assert_eq!(
             normalize_block_spacing("\n\n## Раздел\n\n\n\nText.\n \n\t\nMore text.\n\n\n"),
             "## Раздел\n\nText.\n\nMore text."
+        );
+    }
+
+    #[test]
+    fn tab_indented_lines_are_indented_text() {
+        assert_eq!(
+            normalize_block_spacing("Text\n\tindented\n  \tдальше"),
+            "Text\n\tindented\n  \tдальше"
         );
     }
 

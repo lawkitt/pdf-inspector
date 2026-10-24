@@ -1271,12 +1271,15 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             }
             let after_item = in_list && !is_para_break && last_line_opens_item(&output);
             let formatted = format_list_item(trimmed, after_item);
-            if !in_list {
+            // Nesting continues only from an item directly before, in the
+            // same column: not after a paragraph, caption or table, nor
+            // when the reading order went back up the page.
+            if !in_list || !last_line_opens_item(&output) || y_gap < -base_size {
                 nesting = ListNesting::default();
             }
             if starts_markdown_list_item(&formatted) {
                 let x = line.items.first().map_or(0.0, |i| i.x);
-                output.push_str(&" ".repeat(nesting.indent(x, &formatted)));
+                output.push_str(&" ".repeat(nesting.indent(x, &formatted, base_size)));
             }
             output.push_str(&formatted);
             output.push('\n');
@@ -1414,11 +1417,20 @@ struct ListNesting {
 
 impl ListNesting {
     /// The indentation, in spaces, of an item whose marker starts at `x`
-    /// and whose formatted line is `formatted`.
-    fn indent(&mut self, x: f32, formatted: &str) -> usize {
+    /// and whose formatted line is `formatted`, at body font size
+    /// `base_size`. A marker more than four ems right of the last starts
+    /// a new list (another column) rather than a child.
+    fn indent(&mut self, x: f32, formatted: &str, base_size: f32) -> usize {
         let digits = formatted.bytes().take_while(u8::is_ascii_digit).count();
         // "- " or "12. "
         let width = if digits == 0 { 2 } else { digits + 2 };
+        if self
+            .levels
+            .last()
+            .is_some_and(|&(level_x, _)| x > level_x + 4.0 * base_size)
+        {
+            self.levels.clear();
+        }
         while self
             .levels
             .last()
@@ -1803,12 +1815,15 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
             let after_item = in_list && !is_para_break && last_line_opens_item(&output);
             let formatted = format_list_item(trimmed, after_item);
-            if !in_list {
+            // Nesting continues only from an item directly before, in the
+            // same column: not after a paragraph, caption or table, nor
+            // when the reading order went back up the page.
+            if !in_list || !last_line_opens_item(&output) || y_gap < -base_size {
                 nesting = ListNesting::default();
             }
             if starts_markdown_list_item(&formatted) {
                 let x = line.items.first().map_or(0.0, |i| i.x);
-                output.push_str(&" ".repeat(nesting.indent(x, &formatted)));
+                output.push_str(&" ".repeat(nesting.indent(x, &formatted, base_size)));
             }
             output.push_str(&formatted);
             output.push('\n');
@@ -2093,6 +2108,42 @@ mod tests {
                 md,
                 "1. Parent item\n   - a) Child one\n   - б) Второй потомок\n     - Grandchild\n2. Next parent\n"
             );
+        }
+    }
+
+    #[test]
+    fn a_second_columns_items_do_not_nest() {
+        let lines = vec![
+            placed("1. First column", 72.0, 700.0, 120.0),
+            placed("2. Last in first column", 72.0, 686.0, 140.0),
+            placed("3. Вторая колонка", 320.0, 700.0, 120.0),
+            placed("4. Last in second column", 320.0, 686.0, 140.0),
+        ];
+        for md in both_converters(lines) {
+            assert!(!md.contains(" 3.") && !md.contains(" 4."), "{md}");
+            assert!(md.contains("3. Вторая колонка\n"), "{md}");
+        }
+    }
+
+    #[test]
+    fn nesting_starts_over_after_a_caption() {
+        let lines = vec![
+            placed("1. Parent", 72.0, 700.0, 100.0),
+            placed("• Child", 92.0, 686.0, 100.0),
+            placed("• Grandchild", 110.0, 672.0, 100.0),
+            placed("Figure 1: Illustration", 72.0, 658.0, 150.0),
+            placed("1. Новый список", 110.0, 644.0, 120.0),
+            placed("• New child", 130.0, 630.0, 100.0),
+        ];
+        for md in both_converters(lines) {
+            assert!(md.contains("\n1. Новый список\n   - New child"), "{md}");
+        }
+    }
+
+    #[test]
+    fn a_tab_indented_line_converts() {
+        for md in both_converters(vec![placed("Text\n\tindented", 72.0, 700.0, 100.0)]) {
+            assert!(md.contains("indented"), "{md}");
         }
     }
 
