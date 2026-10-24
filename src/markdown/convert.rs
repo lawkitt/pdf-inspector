@@ -1268,7 +1268,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            let formatted = format_list_item(trimmed);
+            let formatted = format_list_item(trimmed, in_list && last_line_opens_item(&output));
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
@@ -1388,6 +1388,12 @@ fn wraps_back(line_x: f32, prior_x: f32, base_size: f32) -> bool {
     line_x <= prior_x + 3.0 && line_x >= prior_x - 4.0 * base_size
 }
 
+/// Whether the last line of `output` opened a Markdown list item.
+fn last_line_opens_item(output: &str) -> bool {
+    let text = output.trim_end_matches('\n');
+    starts_markdown_list_item(text.rsplit('\n').next().unwrap_or(text))
+}
+
 /// Right edge of a line's text.
 fn line_right(line: &TextLine) -> f32 {
     line.items
@@ -1428,9 +1434,10 @@ fn list_item_edges(lines: &[TextLine], idx: usize) -> Option<(f32, f32)> {
 /// not open a Markdown list item itself (`formatted` is its text with inline
 /// markup). At a hanging indent that is enough. At or left of the item's
 /// left edge — no hanging indent, or a label paragraph wrapping back to the
-/// margin — it must also follow without a paragraph break, after a full
-/// line: after a short one it starts the next paragraph ("3. Third" then
-/// "Interrupting paragraph").
+/// margin by at most a first-line indent (further left is another column) —
+/// it must also follow without a paragraph break, after a full line: after
+/// a short one it starts the next paragraph ("3. Third" then "Interrupting
+/// paragraph").
 #[allow(clippy::too_many_arguments)]
 fn continues_list_item(
     list_x: f32,
@@ -1446,9 +1453,14 @@ fn continues_list_item(
     let after_full_line = edges.is_none_or(|(right, column_right)| {
         right >= column_right - 0.3 * (column_right - list_x.min(line_x))
     });
-    let opens_item = is_list_item(plain) && starts_markdown_list_item(&format_list_item(formatted));
+    let opens_item =
+        is_list_item(plain) && starts_markdown_list_item(&format_list_item(formatted, true));
     y_gap < base_size * 7.0
-        && (hanging || (line_x <= list_x + 5.0 && !is_para_break && after_full_line))
+        && (hanging
+            || (line_x <= list_x + 5.0
+                && line_x >= list_x - 4.0 * base_size
+                && !is_para_break
+                && after_full_line))
         && !opens_item
         && !is_thematic_break(plain)
         && !has_dot_leaders(plain)
@@ -1750,7 +1762,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            let formatted = format_list_item(trimmed);
+            let formatted = format_list_item(trimmed, in_list && last_line_opens_item(&output));
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
@@ -1943,6 +1955,20 @@ mod tests {
         ];
         for md in both_converters(lines) {
             assert!(md.contains("com- real"), "{md}");
+        }
+    }
+
+    #[test]
+    fn a_line_in_another_column_does_not_continue_a_list_item() {
+        let lines = vec![
+            placed("1. The contract is short-", 320.0, 700.0, 200.0),
+            placed("other column unrelated text.", 72.0, 686.0, 200.0),
+        ];
+        for md in both_converters(lines) {
+            assert_eq!(
+                md,
+                "1. The contract is short-\n\nother column unrelated text.\n"
+            );
         }
     }
 

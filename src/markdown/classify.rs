@@ -223,7 +223,13 @@ fn split_list_label(text: &str) -> Option<(&str, &str, Label)> {
 /// ordered-list markers ("1. ", "1) "), and labels Markdown cannot number
 /// ("a)", "iv.", "(a)") become a `-` item that keeps the label as text, as
 /// anydoc renders them. A label run into its text gets its space back.
-pub(crate) fn format_list_item(text: &str) -> String {
+///
+/// A lone capital and a period ("V.", "I.Smith", "A. Background") is as
+/// often an initial or a heading as a label, so it opens an item only
+/// `after_item`, right after another list item line.
+pub(crate) fn format_list_item(text: &str, after_item: bool) -> String {
+    let label =
+        |text| split_list_label(text).filter(|(label, ..)| after_item || !is_capital_label(label));
     let trimmed = text.trim_start();
 
     // Convert various bullet styles to markdown
@@ -242,7 +248,7 @@ pub(crate) fn format_list_item(text: &str) -> String {
         };
         let (marker, rest) = if let Some(rest) = after_bullet(inner) {
             ("-".to_string(), rest)
-        } else if let Some((label, rest, kind)) = split_list_label(inner) {
+        } else if let Some((label, rest, kind)) = label(inner) {
             (marker_for(label, kind), rest)
         } else {
             continue;
@@ -263,10 +269,16 @@ pub(crate) fn format_list_item(text: &str) -> String {
         return trimmed.to_string();
     }
 
-    if let Some((label, rest, kind)) = split_list_label(trimmed) {
+    if let Some((label, rest, kind)) = label(trimmed) {
         return format!("{} {rest}", marker_for(label, kind));
     }
     trimmed.to_string()
+}
+
+/// "V.", "A.": one capital letter and a period.
+fn is_capital_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b'.'
 }
 
 /// The Markdown marker for a list label.
@@ -388,6 +400,11 @@ pub(crate) fn is_monospace_font(font_name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A line formatted with no list item before it.
+    fn format_list_item_t(text: &str) -> String {
+        format_list_item(text, false)
+    }
+
     #[test]
     fn monotype_foundry_faces_are_not_monospace() {
         // "Monotype" is a foundry prefix on proportional faces; the generic
@@ -401,15 +418,18 @@ mod tests {
 
     #[test]
     fn format_list_item_plain_bullet() {
-        assert_eq!(format_list_item("● Item"), "- Item");
-        assert_eq!(format_list_item("• Item"), "- Item");
+        assert_eq!(format_list_item_t("● Item"), "- Item");
+        assert_eq!(format_list_item_t("• Item"), "- Item");
     }
 
     #[test]
     fn format_list_item_bullet_inside_underline() {
         // Fully-underlined bullet line: the marker must move outside the
         // <u> wrapper so markdown still renders a list item.
-        assert_eq!(format_list_item("<u>● Item text</u>"), "- <u>Item text</u>");
+        assert_eq!(
+            format_list_item_t("<u>● Item text</u>"),
+            "- <u>Item text</u>"
+        );
     }
 
     #[test]
@@ -418,58 +438,61 @@ mod tests {
         // a single bold run like "**● Label:** rest"; the bullet must still
         // be stripped and the bold wrapper preserved on the label.
         assert_eq!(
-            format_list_item("**● Fraud: Willing cooperation;**"),
+            format_list_item_t("**● Fraud: Willing cooperation;**"),
             "- **Fraud: Willing cooperation;**"
         );
         assert_eq!(
-            format_list_item("**● Label:** rest of line"),
+            format_list_item_t("**● Label:** rest of line"),
             "- **Label:** rest of line"
         );
-        assert_eq!(format_list_item("*● Italic:* rest"), "- *Italic:* rest");
+        assert_eq!(format_list_item_t("*● Italic:* rest"), "- *Italic:* rest");
     }
 
     #[test]
     fn format_list_item_already_dash() {
-        assert_eq!(format_list_item("- existing"), "- existing");
+        assert_eq!(format_list_item_t("- existing"), "- existing");
     }
 
     #[test]
     fn format_list_item_restores_markers_run_into_text() {
         // A producer that drops the tab after the marker ("1.First").
-        assert_eq!(format_list_item("1.First numbered"), "1. First numbered");
-        assert_eq!(format_list_item("•Bullet one"), "- Bullet one");
-        assert_eq!(format_list_item("◦Nested bullet"), "- Nested bullet");
-        assert_eq!(format_list_item("1.Первый пункт"), "1. Первый пункт");
+        assert_eq!(format_list_item_t("1.First numbered"), "1. First numbered");
+        assert_eq!(format_list_item_t("•Bullet one"), "- Bullet one");
+        assert_eq!(format_list_item_t("◦Nested bullet"), "- Nested bullet");
+        assert_eq!(format_list_item_t("1.Первый пункт"), "1. Первый пункт");
         assert!(is_list_item("•Bullet one"));
         assert!(is_list_item("IV.Roman starting at four"));
     }
 
     #[test]
     fn format_list_item_keeps_labels_markdown_cannot_number_as_text() {
-        assert_eq!(format_list_item("a)Alpha sub one"), "- a) Alpha sub one");
-        assert_eq!(format_list_item("i.Roman sub sub"), "- i. Roman sub sub");
+        assert_eq!(format_list_item_t("a)Alpha sub one"), "- a) Alpha sub one");
+        assert_eq!(format_list_item_t("i.Roman sub sub"), "- i. Roman sub sub");
         assert_eq!(
-            format_list_item("IV.Roman starting at four"),
+            format_list_item_t("IV.Roman starting at four"),
             "- IV. Roman starting at four"
         );
-        assert_eq!(format_list_item("V.Roman five"), "- V. Roman five");
+        // A lone capital is a label only after another item.
+        assert_eq!(format_list_item("V.Roman five", true), "- V. Roman five");
+        assert_eq!(format_list_item("A. Background", true), "- A. Background");
+        assert_eq!(format_list_item_t("A. Background"), "A. Background");
         assert_eq!(
-            format_list_item("(a) The Tenant shall pay"),
+            format_list_item_t("(a) The Tenant shall pay"),
             "- (a) The Tenant shall pay"
         );
         assert_eq!(
-            format_list_item("(2) <u>Expiration</u> date"),
+            format_list_item_t("(2) <u>Expiration</u> date"),
             "- (2) <u>Expiration</u> date"
         );
-        assert_eq!(format_list_item("**a)** Bold label"), "- a) Bold label");
+        assert_eq!(format_list_item_t("**a)** Bold label"), "- a) Bold label");
         // Russian lettered lists: "а)", "б)".
         assert_eq!(
-            format_list_item("а) арендатор обязуется"),
+            format_list_item_t("а) арендатор обязуется"),
             "- а) арендатор обязуется"
         );
-        assert_eq!(format_list_item("б)арендодатель"), "- б) арендодатель");
-        assert_eq!(format_list_item("2) Second"), "2) Second");
-        assert_eq!(format_list_item("* Item"), "- Item");
+        assert_eq!(format_list_item_t("б)арендодатель"), "- б) арендодатель");
+        assert_eq!(format_list_item_t("2) Second"), "2) Second");
+        assert_eq!(format_list_item_t("* Item"), "- Item");
     }
 
     #[test]
@@ -481,13 +504,15 @@ mod tests {
             "т.е. первое",
             "J.Smith signed",
             "J. W. Tukey suggested",
+            "I.Smith signed the lease.",
+            "V. Putin signed the lease.",
             "(c)(2) of this section",
             "(b).",
             "* * * * *",
         ] {
-            assert_eq!(format_list_item(text), text);
+            assert_eq!(format_list_item(text, false), text);
             assert!(
-                !starts_markdown_list_item(&format_list_item(text)),
+                !starts_markdown_list_item(&format_list_item(text, false)),
                 "{text}"
             );
         }

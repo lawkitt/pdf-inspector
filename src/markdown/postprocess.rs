@@ -357,10 +357,15 @@ fn join_decision(
 ///     stem ("договора" for "дого- вор") joins plain, a hyphenated
 ///     compound starting with it ("нормативно-правовой" for "нормативно-
 ///     правовых") keeps the hyphen — Russian rarely repeats a word form;
+///   - a conjunction after the hyphen is a suspended hyphen ("pre- and
+///     post-war", "двух- или трёхкомнатный"): left as it is;
 ///   - compounds whose spelling is a rule, not a guess, keep the hyphen
-///     ([`is_hyphenated_compound`]);
-///   - a short continuation that the document uses as a word is a
-///     suspended hyphen ("pre- and post-war", "двух- и трёхкомнатный");
+///     ([`is_hyphenated_compound`]: кто-то, что-либо, по-русски,
+///     short-term, twenty-five);
+///   - before a compound modifier's second element ("commercial- type",
+///     but also "proto- type") nothing is decided: left as it is;
+///   - a short continuation that the document uses as a word is likely a
+///     suspended hyphen too ("writ- ten" is lost to this; it stays);
 ///   - a long first part that the document uses as a word may head a
 ///     compound ("commercial- type") as easily as take a suffix
 ///     ("establish- ment"): left visibly broken;
@@ -382,6 +387,9 @@ fn line_break_join(
         return Join::Keep;
     }
     let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    if is_suspension_conjunction(&b) {
+        return Join::Keep;
+    }
     let head: String = b.chars().take(3).collect();
     if a.chars().count() + head.chars().count() >= 5 {
         if has_prefix(words, &format!("{a}{head}")) {
@@ -393,6 +401,10 @@ fn line_break_join(
     }
     if is_hyphenated_compound(&a, &b, words) {
         return Join::Hyphen;
+    }
+    if is_compound_head(&b) {
+        // "commercial- type", but also "proto- type": left visibly broken.
+        return Join::Keep;
     }
     if b.chars().count() <= 3 && words.contains(&b) {
         return Join::Keep;
@@ -408,13 +420,62 @@ fn line_break_join(
 
 /// Compounds hyphenated by spelling rule, so a line break inside them keeps
 /// the hyphen: the Russian particles (что-либо, кто-нибудь, всё-таки,
-/// что-то after a word the document uses alone — not the syllable in "ле-
-/// то"), кое-/кой-, по-русски (not "по- иски"), во-первых, из-за / из-под,
-/// and English self- before a word ("self-employed"; not "self-ish",
-/// "self-less").
+/// что-то after an interrogative or a word the document uses alone — not
+/// the syllable in "ле- то"), кое-/кой-, по-русски (not "по- иски"),
+/// во-первых, из-за / из-под; English self- before a word
+/// ("self-employed"; not "self-ish", "self-less"), and a few first elements
+/// before a word, not a suffix ("short-term", "twenty-five"; not
+/// "short-age").
 fn is_hyphenated_compound(a: &str, b: &str, words: &BTreeSet<String>) -> bool {
+    // English first elements that form hyphenated compounds ("short-term",
+    // "well-known", "twenty-five"), unless a suffix follows ("short-age",
+    // "well-ness", "four-teen"). Words that split into common words
+    // ("part-ner", "ten-ant", "cross-ing") are not on the list.
+    const EN_FIRST: [&str; 18] = [
+        "short", "long", "well", "first", "two", "three", "four", "five", "year", "month", "week",
+        "twenty", "thirty", "forty", "fifty", "sixty", "eighty", "ninety",
+    ];
+    const EN_SUFFIXES: [&str; 18] = [
+        "age", "ing", "ings", "est", "ness", "er", "ers", "en", "ed", "ish", "less", "ful", "ant",
+        "ary", "ner", "teen", "ly", "ise",
+    ];
+    // Interrogatives and their forms before the particle -то (кто-то,
+    // чего-то, какой-то).
+    const RU_TO: [&str; 30] = [
+        "кто",
+        "кого",
+        "кому",
+        "кем",
+        "ком",
+        "что",
+        "чего",
+        "чему",
+        "чем",
+        "чём",
+        "где",
+        "куда",
+        "когда",
+        "как",
+        "какой",
+        "какая",
+        "какое",
+        "какие",
+        "какого",
+        "какому",
+        "каким",
+        "какую",
+        "каких",
+        "чей",
+        "чья",
+        "чьё",
+        "почему",
+        "зачем",
+        "откуда",
+        "сколько",
+    ];
     matches!(b, "либо" | "нибудь" | "таки")
-        || (b == "то" && words.contains(a))
+        || (b == "то" && (words.contains(a) || RU_TO.contains(&a)))
+        || (EN_FIRST.contains(&a) && b.chars().count() >= 3 && !EN_SUFFIXES.contains(&b))
         || matches!(a, "кое" | "кой")
         || (a == "по" && b.chars().count() >= 6 && (b.ends_with("ски") || b.ends_with("цки")))
         || (a == "во" && b.chars().count() >= 5 && (b.ends_with("ых") || b.ends_with("их")))
@@ -423,6 +484,53 @@ fn is_hyphenated_compound(a: &str, b: &str, words: &BTreeSet<String>) -> bool {
             && b.chars().count() >= 5
             && !b.starts_with("ish")
             && !b.starts_with("less"))
+}
+
+/// A conjunction after the hyphen makes it a suspended one ("pre- and
+/// post-war", "mid- to long-term", "двух- или трёхкомнатный"), whatever the
+/// document's vocabulary says.
+fn is_suspension_conjunction(b: &str) -> bool {
+    matches!(
+        b,
+        "and"
+            | "or"
+            | "to"
+            | "nor"
+            | "und"
+            | "oder"
+            | "bis"
+            | "et"
+            | "ou"
+            | "или"
+            | "и"
+            | "а"
+            | "но"
+            | "да"
+    )
+}
+
+/// Second elements of English compound modifiers ("commercial-type",
+/// "court-based"): with no evidence, a break before one may be a compound
+/// or a syllable ("proto-type"), so it is not joined either way.
+fn is_compound_head(b: &str) -> bool {
+    matches!(
+        b,
+        "type"
+            | "term"
+            | "based"
+            | "related"
+            | "specific"
+            | "like"
+            | "wide"
+            | "free"
+            | "owned"
+            | "level"
+            | "scale"
+            | "made"
+            | "party"
+            | "oriented"
+            | "driven"
+    )
 }
 
 /// "нормативно- правовых": a first part of five or more letters ending in
@@ -1070,6 +1178,11 @@ mod tests {
             ("Отказ из-", "за погоды.", "Отказ из-за погоды."),
             ("Во-", "первых, срок.", "Во-первых, срок."),
             ("A self-", "employed person.", "A self-employed person."),
+            ("A short-", "term contract.", "A short-term contract."),
+            ("A well-", "known clause.", "A well-known clause."),
+            ("Twenty-", "five days.", "Twenty-five days."),
+            ("Если кто-", "то возражает.", "Если кто-то возражает."),
+            ("Сделать что-", "то иное.", "Сделать что-то иное."),
         ] {
             assert_eq!(dehyphenate_line_breaks(&wrapped(first, second)), joined);
         }
@@ -1090,20 +1203,29 @@ mod tests {
             let out = clean_markdown(text, &MarkdownOptions::default());
             assert_eq!(out.trim_end(), format!("{first} {second}"));
         };
-        // Suspended hyphens: the short continuation is a document word.
+        // Suspended hyphens: a conjunction follows, used elsewhere or not.
         keep("Both pre-", "and post-war rules and terms.");
+        keep("Both pre-", "and post-war contracts.");
+        keep("Over the mid-", "to long-term horizon.");
         keep("Двух-", "или трёхкомнатные, или иные.");
+        keep("Двух-", "или трёхкомнатный объект.");
+        // A short continuation the document uses as a word.
+        keep("The writ-", "ten text is ten pages.");
         // A capital, a digit or another script on either side.
         keep("PDF-", "based tools.");
         keep("Version CO-", "op.");
         keep("Раздел-", "section.");
         // A long first part the document uses on its own may head a
-        // compound: "commercial-type" or "establish-ment" cannot be told
+        // compound: "developer-friendly" or "establish-ment" cannot be told
         // apart without a dictionary.
-        keep(
-            "Any commercial firm offering commercial-",
-            "type insurance.",
-        );
+        keep("The developer ships developer-", "friendly tools.");
+        // A compound modifier's second element without evidence: a
+        // compound ("commercial-type") or a syllable ("proto-type").
+        keep("Offering commercial-", "type insurance.");
+        keep("Their proto-", "type systems.");
+        // Not a first element when a suffix follows: "shortage".
+        let text = wrapped("A short-", "age of goods.");
+        assert_eq!(dehyphenate_line_breaks(&text), "A shortage of goods.");
         // A Russian compound adjective, solid or hyphenated by meaning.
         keep("Нормативно-", "правовых актов.");
         keep("Много-", "этажный дом.");
