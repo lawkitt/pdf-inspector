@@ -12,6 +12,8 @@ mod convert;
 mod furniture;
 mod heading;
 mod postprocess;
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+pub(crate) use postprocess::normalize_block_spacing;
 mod preprocess;
 
 pub use convert::to_markdown_from_lines;
@@ -1347,7 +1349,7 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
 
         // Detect list items
         if options.detect_lists && is_list_item(trimmed) {
-            let formatted = format_list_item(trimmed);
+            let formatted = format_list_item(trimmed, in_list);
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
@@ -2459,9 +2461,9 @@ mod tests {
 
     #[test]
     fn test_format_list_item() {
-        assert_eq!(format_list_item("• Item"), "- Item");
-        assert_eq!(format_list_item("- Item"), "- Item");
-        assert_eq!(format_list_item("1. First"), "1. First");
+        assert_eq!(format_list_item("• Item", false), "- Item");
+        assert_eq!(format_list_item("- Item", false), "- Item");
+        assert_eq!(format_list_item("1. First", false), "1. First");
     }
 
     #[test]

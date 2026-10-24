@@ -1,5 +1,7 @@
 //! Markdown cleanup and post-processing.
 
+use std::collections::BTreeSet;
+
 use regex::Regex;
 
 use super::{MarkdownOptions, MarkdownProfile};
@@ -21,6 +23,10 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
     if options.fix_hyphenation {
         text = fix_hyphenation(&text);
     }
+    // Line breaks the hyphenation pass left alone read as spaces.
+    if text.contains(LINE_BREAK) {
+        text = text.replace(LINE_BREAK, " ");
+    }
 
     // Remove standalone page numbers
     if options.remove_page_numbers {
@@ -40,16 +46,150 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
     remove_spaces_before_closing_brackets(&mut text);
     remove_spaces_before_sentence_punctuation(&mut text);
 
-    // Remove excessive newlines (more than 2 in a row)
-    while text.contains("\n\n\n") {
-        text = text.replace("\n\n\n", "\n\n");
+    // One blank line between blocks, none at the ends; ends with a newline.
+    let mut text = normalize_block_spacing(text.trim());
+    text.push('\n');
+    text
+}
+
+/// Joins two lines of one paragraph in place of the space when the first
+/// line ends in a hyphen, recording that the hyphen sat at a line break.
+/// [`dehyphenate_line_breaks`] may join such a break without vocabulary
+/// evidence; [`clean_markdown`] turns any it leaves into a space. A Unicode
+/// noncharacter, so document text never carries it.
+pub(crate) const LINE_BREAK: char = '\u{FDD0}';
+
+/// The separator for appending a line to `before`, the paragraph so far:
+/// [`LINE_BREAK`] when the line `wraps` (it starts where a wrapped line of
+/// this paragraph would, which interleaved columns do not) and `before`
+/// ends in a hyphen (also one inside closing emphasis, "Bap-**"); otherwise
+/// a space.
+pub(crate) fn line_join_separator(before: &str, wraps: bool) -> char {
+    if wraps && before.trim_end_matches('*').ends_with('-') {
+        LINE_BREAK
+    } else {
+        ' '
+    }
+}
+
+/// The block a line of converter output belongs to, for spacing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockLine {
+    Paragraph,
+    Heading,
+    /// A list item line: the marker family (`-`, `*`, `+`, `.`, `)`), which
+    /// decides which items CommonMark keeps in one list, and the indent of a
+    /// nested item.
+    ListItem(char, usize),
+    Table,
+    Quote,
+    Rule,
+    Comment,
+    /// Indented text: its relation to the line before is not ours to judge.
+    Indented,
+    Code,
+}
+
+fn block_line(line: &str) -> BlockLine {
+    use once_cell::sync::Lazy;
+    static ORDERED_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d{1,9}([.)])( |$)").unwrap());
+    static RULE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$").unwrap()
+    });
+    if line.starts_with('\t') {
+        return BlockLine::Indented;
+    }
+    if line.starts_with(' ') {
+        let item = line.trim_start_matches(' ');
+        return match block_line(item) {
+            BlockLine::ListItem(marker, _) => BlockLine::ListItem(marker, line.len() - item.len()),
+            _ => BlockLine::Indented,
+        };
+    }
+    if RULE_RE.is_match(line) {
+        return BlockLine::Rule;
+    }
+    let mut chars = line.chars();
+    match (chars.next(), chars.next()) {
+        (Some(marker @ ('-' | '*' | '+')), None | Some(' ')) => {
+            return BlockLine::ListItem(marker, 0);
+        }
+        (Some('|'), _) => return BlockLine::Table,
+        (Some('>'), _) => return BlockLine::Quote,
+        _ => {}
+    }
+    if let Some(caps) = ORDERED_RE.captures(line) {
+        return BlockLine::ListItem(caps[1].chars().next().unwrap_or('.'), 0);
+    }
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && matches!(line[hashes..].chars().next(), None | Some(' ')) {
+        return BlockLine::Heading;
+    }
+    if line.starts_with("<!--") {
+        return BlockLine::Comment;
+    }
+    BlockLine::Paragraph
+}
+
+/// Block spacing for finished Markdown: exactly one blank line between
+/// blocks, none at the start or end, and none between the items of a tight
+/// list. Only blank lines change — no line is joined, split or edited — and
+/// fenced code keeps its content, blank lines included.
+///
+/// Consecutive lines of one paragraph, quote, table or indented run keep
+/// whatever separation they had: a single newline there is part of the
+/// block. Anything else gets a blank line, which also stops a paragraph
+/// after a list item from reading as its lazy continuation, or after a
+/// table as another row.
+pub(crate) fn normalize_block_spacing(text: &str) -> String {
+    // (kind, text, blank line before it in the input)
+    let mut blocks: Vec<(BlockLine, String, bool)> = Vec::new();
+    let mut lines = text.split('\n');
+    let mut blank_before = false;
+    while let Some(line) = lines.next() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() {
+            blank_before = true;
+            continue;
+        }
+        let fence = line.trim_start();
+        if fence.starts_with("```") || fence.starts_with("~~~") {
+            let marker = &fence[..3];
+            let mut code = line.to_string();
+            for inner in lines.by_ref() {
+                code.push('\n');
+                code.push_str(inner);
+                if inner.trim_start().starts_with(marker) {
+                    break;
+                }
+            }
+            blocks.push((BlockLine::Code, code, blank_before));
+        } else {
+            blocks.push((block_line(line), line.to_string(), blank_before));
+        }
+        blank_before = false;
     }
 
-    // Trim leading and trailing whitespace, ensure ends with single newline
-    text = text.trim().to_string();
-    text.push('\n');
-
-    text
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<BlockLine> = None;
+    for (kind, line, blank_before) in blocks {
+        if let Some(prev) = prev {
+            let tight = match (prev, kind) {
+                // A nested item stays with its parent and siblings.
+                (BlockLine::ListItem(a, ia), BlockLine::ListItem(b, ib)) => ia != ib || a == b,
+                (BlockLine::Paragraph, BlockLine::Paragraph)
+                | (BlockLine::Quote, BlockLine::Quote)
+                | (BlockLine::Table, BlockLine::Table)
+                | (BlockLine::Indented, _)
+                | (_, BlockLine::Indented) => !blank_before,
+                _ => false,
+            };
+            out.push_str(if tight { "\n" } else { "\n\n" });
+        }
+        out.push_str(&line);
+        prev = Some(kind);
+    }
+    out
 }
 
 /// Collapse runs of 2+ spaces to a single space within each line.
@@ -170,8 +310,9 @@ enum Join {
 fn join_decision(
     a: &str,
     b: &str,
-    words: &std::collections::HashSet<String>,
-    hyphenated: &std::collections::HashSet<String>,
+    at_line_break: bool,
+    words: &BTreeSet<String>,
+    hyphenated: &BTreeSet<String>,
 ) -> Join {
     // Word-length sanity: syllable fragments are short, and even long German
     // compounds stay under this. Fragments beyond it are already fused
@@ -201,6 +342,8 @@ fn join_decision(
         // three letters in any language — the length floor keeps this rule
         // off them without a hard-coded conjunction list.
         Join::Hyphen
+    } else if at_line_break {
+        line_break_join(a, b, words, hyphenated)
     } else {
         // No evidence at all: leave the break as it is. An unconditional join
         // here covered only ~1% more breaks on a vocabulary-rich document,
@@ -210,6 +353,260 @@ fn join_decision(
         // is not.
         Join::Keep
     }
+}
+
+/// What a hyphen at a known line break ([`LINE_BREAK`]) becomes when the
+/// document has no direct evidence for the pair. Layout put the two lines
+/// in one paragraph, so the interleaved-column fusion that keeps
+/// [`join_decision`] from guessing elsewhere does not apply; a typeset
+/// line-wrap hyphen is the likely reading. Still conservative:
+///
+///   - only a lowercase letter, hyphen, lowercase letter in one script
+///     ("contrac- tion", "дого- вор") can join; "PDF- based" or a Latin
+///     fragment against a Cyrillic one stays as it is;
+///   - inflected evidence first: another word starting with the joined
+///     stem ("договора" for "дого- вор") joins plain, a hyphenated
+///     compound starting with it ("нормативно-правовой" for "нормативно-
+///     правовых") keeps the hyphen — Russian rarely repeats a word form;
+///   - a conjunction after the hyphen is a suspended hyphen ("pre- and
+///     post-war", "двух- или трёхкомнатный"): left as it is;
+///   - compounds whose spelling is a rule, not a guess, keep the hyphen
+///     ([`is_hyphenated_compound`]: кто-то, что-либо, по-русски,
+///     short-term, twenty-five, six-month);
+///   - before a compound modifier's second element ("commercial- type",
+///     but also "proto- type") nothing is decided: left as it is;
+///   - a short continuation that the document uses as a word is likely a
+///     suspended hyphen too ("writ- ten" is lost to this; it stays);
+///   - a long first part that the document uses as a word may head a
+///     compound ("commercial- type") as easily as take a suffix
+///     ("establish- ment"): left visibly broken;
+///   - a long vowel-final first part before an adjective ("нормативно-
+///     правовых", but also "много- этажный") is a Russian compound
+///     adjective whose solid or hyphenated spelling depends on meaning:
+///     left visibly broken;
+///   - everything else joins plain.
+fn line_break_join(
+    a: &str,
+    b: &str,
+    words: &BTreeSet<String>,
+    hyphenated: &BTreeSet<String>,
+) -> Join {
+    let (Some(last), Some(first)) = (a.chars().last(), b.chars().next()) else {
+        return Join::Keep;
+    };
+    if !last.is_lowercase() || !first.is_lowercase() || script(last) != script(first) {
+        return Join::Keep;
+    }
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    if is_suspension_conjunction(&b) {
+        return Join::Keep;
+    }
+    let head: String = b.chars().take(3).collect();
+    if a.chars().count() + head.chars().count() >= 5 {
+        if has_prefix(words, &format!("{a}{head}")) {
+            return Join::Plain;
+        }
+        if has_prefix(hyphenated, &format!("{a}-{head}")) {
+            return Join::Hyphen;
+        }
+    }
+    if is_hyphenated_compound(&a, &b, words) {
+        return Join::Hyphen;
+    }
+    if is_compound_head(&b) {
+        // "commercial- type", but also "proto- type": left visibly broken.
+        return Join::Keep;
+    }
+    if b.chars().count() <= 3 && words.contains(&b) {
+        return Join::Keep;
+    }
+    if a.chars().count() >= 6 && b.chars().count() >= 4 && words.contains(&a) {
+        return Join::Keep;
+    }
+    if is_russian_compound_adjective(&a, &b) {
+        return Join::Keep;
+    }
+    Join::Plain
+}
+
+/// Compounds hyphenated by spelling rule, so a line break inside them keeps
+/// the hyphen: the Russian particles (что-либо, кто-нибудь, всё-таки, -то
+/// after an interrogative or a word the document uses alone — not the
+/// syllable in "ле- то"), кое-/кой-, по-русски (not "по- иски"),
+/// во-первых, из-за / из-под; English self- before a word
+/// ("self-employed"; not "self-ish", "self-less") and whole known pairs
+/// ([`is_english_compound`]).
+fn is_hyphenated_compound(a: &str, b: &str, words: &BTreeSet<String>) -> bool {
+    matches!(b, "либо" | "нибудь" | "таки")
+        || (b == "то" && (words.contains(a) || is_russian_interrogative(a)))
+        || matches!(a, "кое" | "кой")
+        || (a == "по" && b.chars().count() >= 6 && (b.ends_with("ски") || b.ends_with("цки")))
+        || (a == "во" && b.chars().count() >= 5 && (b.ends_with("ых") || b.ends_with("их")))
+        || (a == "из" && matches!(b, "за" | "под"))
+        || (a == "self"
+            && b.chars().count() >= 5
+            && !b.starts_with("ish")
+            && !b.starts_with("less"))
+        || is_english_compound(a, b)
+}
+
+/// Russian interrogatives in any form, before -то (кто-то, чьи-то,
+/// какими-то, сколько-то).
+fn is_russian_interrogative(a: &str) -> bool {
+    a.starts_with("как")
+        || a.starts_with("чь")
+        || matches!(
+            a,
+            "кто"
+                | "кого"
+                | "кому"
+                | "кем"
+                | "ком"
+                | "что"
+                | "чего"
+                | "чему"
+                | "чем"
+                | "чём"
+                | "чей"
+                | "где"
+                | "куда"
+                | "когда"
+                | "откуда"
+                | "почему"
+                | "зачем"
+                | "отчего"
+                | "сколько"
+        )
+}
+
+/// English compounds whose both halves are on a short list, so that no
+/// word splitting at the same place is one ("short-term", "well-known",
+/// "twenty-five", "six-month"; never "short-ening", "long-itude",
+/// "ten-ant").
+fn is_english_compound(a: &str, b: &str) -> bool {
+    const NUMBERS: [&str; 18] = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "twenty",
+        "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    ];
+    const UNITS: [&str; 16] = [
+        "day", "week", "month", "year", "hour", "minute", "page", "member", "person", "party",
+        "fold", "part", "way", "step", "stage", "time",
+    ];
+    let first_nine = &NUMBERS[..9];
+    match a {
+        "short" | "long" => matches!(b, "term" | "range" | "lived" | "run" | "haul" | "standing"),
+        "well" => matches!(
+            b,
+            "known"
+                | "being"
+                | "founded"
+                | "established"
+                | "defined"
+                | "documented"
+                | "suited"
+                | "informed"
+                | "intentioned"
+        ),
+        "first" | "second" | "third" => {
+            matches!(
+                b,
+                "class" | "hand" | "rate" | "party" | "degree" | "tier" | "time"
+            )
+        }
+        _ if a.ends_with("ty") && NUMBERS.contains(&a) => {
+            first_nine.contains(&b) || UNITS.contains(&b)
+        }
+        _ if NUMBERS.contains(&a) => UNITS.contains(&b),
+        _ => false,
+    }
+}
+
+/// A conjunction after the hyphen makes it a suspended one ("pre- and
+/// post-war", "mid- to long-term", "двух- или трёхкомнатный"), whatever the
+/// document's vocabulary says.
+fn is_suspension_conjunction(b: &str) -> bool {
+    matches!(
+        b,
+        "and"
+            | "or"
+            | "to"
+            | "nor"
+            | "und"
+            | "oder"
+            | "bis"
+            | "et"
+            | "ou"
+            | "или"
+            | "и"
+            | "а"
+            | "но"
+            | "да"
+    )
+}
+
+/// Second elements of English compound modifiers ("commercial-type",
+/// "court-based"): with no evidence, a break before one may be a compound
+/// or a syllable ("proto-type"), so it is not joined either way.
+fn is_compound_head(b: &str) -> bool {
+    matches!(
+        b,
+        "type"
+            | "term"
+            | "based"
+            | "related"
+            | "specific"
+            | "like"
+            | "wide"
+            | "free"
+            | "owned"
+            | "level"
+            | "scale"
+            | "made"
+            | "party"
+            | "oriented"
+            | "driven"
+    )
+}
+
+/// "нормативно- правовых": a first part of five or more letters ending in
+/// the linking о / е after a consonant, before a word with an adjective
+/// ending.
+fn is_russian_compound_adjective(a: &str, b: &str) -> bool {
+    const VOWELS: &str = "аеёиоуыэюя";
+    const ENDINGS: [&str; 20] = [
+        "ый", "ий", "ой", "ая", "яя", "ое", "ее", "ые", "ие", "ых", "их", "ого", "его", "ому",
+        "ему", "ым", "им", "ую", "юю", "ми",
+    ];
+    let mut tail = a.chars().rev();
+    let (Some(link), Some(before)) = (tail.next(), tail.next()) else {
+        return false;
+    };
+    a.chars().count() >= 5
+        && matches!(link, 'о' | 'е')
+        && script(before) == script('а')
+        && !VOWELS.contains(before)
+        && before != 'ь'
+        && b.chars().count() >= 5
+        && ENDINGS.iter().any(|ending| b.ends_with(ending))
+}
+
+/// A coarse script id: Latin, Greek and Cyrillic, else the 128-code-point
+/// block. Enough to keep a join inside one script.
+fn script(c: char) -> u32 {
+    match c as u32 {
+        0x41..=0x24F | 0x1E00..=0x1EFF => 0,
+        0x370..=0x3FF | 0x1F00..=0x1FFF => 1,
+        0x400..=0x52F => 2,
+        n => n >> 7,
+    }
+}
+
+/// Whether some entry of `set` starts with `prefix`.
+fn has_prefix(set: &BTreeSet<String>, prefix: &str) -> bool {
+    use std::ops::Bound;
+    set.range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+        .next()
+        .is_some_and(|word| word.starts_with(prefix))
 }
 
 /// Rejoin words hyphenated at the original line breaks.
@@ -234,7 +631,9 @@ fn join_decision(
 ///   4. no evidence — leave the break untouched. Evidence covers ~99% of
 ///      breaks on vocabulary-rich documents, and an unconditional join was
 ///      the one rule able to corrupt output (fusing interleaved-column
-///      fragments into unrecoverable tokens).
+///      fragments into unrecoverable tokens). At a break the converter
+///      marked as a line wrap inside one paragraph ([`LINE_BREAK`]), rule 4
+///      gives way to [`line_break_join`].
 ///
 /// Every rule is either document evidence or script-agnostic typography;
 /// deliberately no hard-coded word lists beyond the three suspension
@@ -245,19 +644,19 @@ fn join_decision(
 /// Table rows and fenced code blocks are left untouched.
 fn dehyphenate_line_breaks(text: &str) -> String {
     use once_cell::sync::Lazy;
-    use std::collections::HashSet;
 
     const WORD: &str = r"\p{L}";
 
-    // "de- fendant"
-    static BREAK_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})- ({WORD}{{2,}})")).unwrap());
+    // "de- fendant", or the same across a known line break (`LINE_BREAK`).
+    static BREAK_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(&format!(r"({WORD}{{2,}})-([ \x{{FDD0}}])({WORD}{{2,}})")).unwrap()
+    });
     // "Bap-** **tist" — an emphasis span split together with the word. The
     // regex crate has no backreferences, so both markers are captured and
     // compared in the replacement closure.
     static BREAK_EMPH_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(&format!(
-            r"({WORD}{{2,}})-(\*{{1,2}}) (\*{{1,2}})({WORD}{{2,}})"
+            r"({WORD}{{2,}})-(\*{{1,2}})([ \x{{FDD0}}])(\*{{1,2}})({WORD}{{2,}})"
         ))
         .unwrap()
     });
@@ -288,8 +687,8 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     }
     let scrubbed = BREAK_EMPH_RE.replace_all(&prose, " ");
     let scrubbed = BREAK_RE.replace_all(&scrubbed, " ");
-    let mut words: HashSet<String> = HashSet::new();
-    let mut hyphenated: HashSet<String> = HashSet::new();
+    let mut words: BTreeSet<String> = BTreeSet::new();
+    let mut hyphenated: BTreeSet<String> = BTreeSet::new();
     for m in PLAIN_WORD_RE.find_iter(&scrubbed) {
         words.insert(m.as_str().to_lowercase());
     }
@@ -301,7 +700,9 @@ fn dehyphenate_line_breaks(text: &str) -> String {
         ));
     }
 
-    let join = |a: &str, b: &str| join_decision(a, b, &words, &hyphenated);
+    let join = |a: &str, b: &str, separator: &str| {
+        join_decision(a, b, separator != " ", &words, &hyphenated)
+    };
 
     let mut in_code_block = false;
     let mut out = String::with_capacity(text.len());
@@ -325,11 +726,11 @@ fn dehyphenate_line_breaks(text: &str) -> String {
                 .replace_all(&current, |caps: &regex::Captures| {
                     // Mismatched markers aren't a split span; a Keep decision
                     // preserves the original spacing and markers.
-                    if caps[2] != caps[3] {
+                    if caps[2] != caps[4] {
                         return caps[0].to_string();
                     }
-                    let (a, b) = (&caps[1], &caps[4]);
-                    match join(a, b) {
+                    let (a, b) = (&caps[1], &caps[5]);
+                    match join(a, b, &caps[3]) {
                         Join::Plain => format!("{a}{b}"),
                         Join::Hyphen => format!("{a}-{b}"),
                         Join::Keep => caps[0].to_string(),
@@ -338,8 +739,8 @@ fn dehyphenate_line_breaks(text: &str) -> String {
                 .to_string();
             let next = BREAK_RE
                 .replace_all(&next, |caps: &regex::Captures| {
-                    let (a, b) = (&caps[1], &caps[2]);
-                    match join(a, b) {
+                    let (a, b) = (&caps[1], &caps[3]);
+                    match join(a, b, &caps[2]) {
                         Join::Plain => format!("{a}{b}"),
                         Join::Hyphen => format!("{a}-{b}"),
                         Join::Keep => caps[0].to_string(),
@@ -745,6 +1146,203 @@ mod tests {
         assert_eq!(
             dehyphenate_line_breaks(text),
             "The word unconstitutional, and unconstitu appears too: unconstitutional."
+        );
+    }
+
+    // --- hyphens at known line breaks ---
+
+    /// Two lines of one paragraph joined the way the converter joins them.
+    fn wrapped(first: &str, second: &str) -> String {
+        format!("{first}{}{second}", line_join_separator(first, true))
+    }
+
+    #[test]
+    fn line_break_hyphen_joins_without_evidence() {
+        // English and Russian: a lowercase letter, a hyphen at the line end,
+        // a lowercase letter.
+        let text = wrapped("The contrac-", "tion was signed.");
+        assert_eq!(
+            dehyphenate_line_breaks(&text),
+            "The contraction was signed."
+        );
+        let text = wrapped("Стороны заключили дого-", "вор аренды.");
+        assert_eq!(
+            dehyphenate_line_breaks(&text),
+            "Стороны заключили договор аренды."
+        );
+    }
+
+    #[test]
+    fn line_break_hyphen_joins_on_inflected_evidence() {
+        // "законодательства" elsewhere: the stem is document vocabulary, so
+        // "законо- дательных" joins although the form never appears whole
+        // (without it, this shape is left broken; see below).
+        let text = format!(
+            "Нормы законодательства. {}",
+            wrapped("Акты законо-", "дательных органов.")
+        );
+        assert_eq!(
+            dehyphenate_line_breaks(&text),
+            "Нормы законодательства. Акты законодательных органов."
+        );
+        let text = wrapped("Акты законо-", "дательных органов.");
+        assert_eq!(dehyphenate_line_breaks(&text), text);
+        // A hyphenated compound elsewhere keeps the hyphen in another form.
+        let text = format!(
+            "Нормативно-правовой акт. {}",
+            wrapped("Нормативно-", "правовых актов.")
+        );
+        assert_eq!(
+            dehyphenate_line_breaks(&text),
+            "Нормативно-правовой акт. Нормативно-правовых актов."
+        );
+    }
+
+    #[test]
+    fn line_break_hyphen_keeps_compounds_spelled_with_one() {
+        for (first, second, joined) in [
+            ("Что-", "либо иное.", "Что-либо иное."),
+            ("Кто-", "нибудь придёт.", "Кто-нибудь придёт."),
+            ("Всё-", "таки верно.", "Всё-таки верно."),
+            (
+                "Говорит по-",
+                "русски и по-немецки.",
+                "Говорит по-русски и по-немецки.",
+            ),
+            ("Это кое-", "что значит.", "Это кое-что значит."),
+            ("Отказ из-", "за погоды.", "Отказ из-за погоды."),
+            ("Во-", "первых, срок.", "Во-первых, срок."),
+            ("A self-", "employed person.", "A self-employed person."),
+            ("A short-", "term contract.", "A short-term contract."),
+            ("A well-", "known clause.", "A well-known clause."),
+            ("Twenty-", "five days.", "Twenty-five days."),
+            ("Если кто-", "то возражает.", "Если кто-то возражает."),
+            ("Сделать что-", "то иное.", "Сделать что-то иное."),
+            ("Чьи-", "то вещи.", "Чьи-то вещи."),
+            ("Какими-", "то путями.", "Какими-то путями."),
+            ("A six-", "month term.", "A six-month term."),
+            ("First-", "class mail.", "First-class mail."),
+        ] {
+            assert_eq!(dehyphenate_line_breaks(&wrapped(first, second)), joined);
+        }
+        // "-то" after a word the document uses alone, not after a syllable.
+        let text = format!("Что сказано. {}", wrapped("Что-", "то сказано."));
+        assert_eq!(
+            dehyphenate_line_breaks(&text),
+            "Что сказано. Что-то сказано."
+        );
+        let text = wrapped("Прошло ле-", "то.");
+        assert_eq!(dehyphenate_line_breaks(&text), "Прошло лето.");
+    }
+
+    #[test]
+    fn line_break_hyphen_stays_when_a_join_would_guess() {
+        let keep = |first: &str, second: &str| {
+            let text = wrapped(first, second);
+            let out = clean_markdown(text, &MarkdownOptions::default());
+            assert_eq!(out.trim_end(), format!("{first} {second}"));
+        };
+        // Suspended hyphens: a conjunction follows, used elsewhere or not.
+        keep("Both pre-", "and post-war rules and terms.");
+        keep("Both pre-", "and post-war contracts.");
+        keep("Over the mid-", "to long-term horizon.");
+        keep("Двух-", "или трёхкомнатные, или иные.");
+        keep("Двух-", "или трёхкомнатный объект.");
+        // A short continuation the document uses as a word.
+        keep("The writ-", "ten text is ten pages.");
+        // A capital, a digit or another script on either side.
+        keep("PDF-", "based tools.");
+        keep("Version CO-", "op.");
+        keep("Раздел-", "section.");
+        // A long first part the document uses on its own may head a
+        // compound: "developer-friendly" or "establish-ment" cannot be told
+        // apart without a dictionary.
+        keep("The developer ships developer-", "friendly tools.");
+        // A compound modifier's second element without evidence: a
+        // compound ("commercial-type") or a syllable ("proto-type").
+        keep("Offering commercial-", "type insurance.");
+        keep("Their proto-", "type systems.");
+        // Not a known pair: a word ("shortage", "shortening", "longitude",
+        // "tenant") joins plain.
+        for (first, second, joined) in [
+            ("A short-", "age of goods.", "A shortage of goods."),
+            ("A short-", "ening step.", "A shortening step."),
+            ("The long-", "itude.", "The longitude."),
+            ("The ten-", "ant pays.", "The tenant pays."),
+        ] {
+            assert_eq!(dehyphenate_line_breaks(&wrapped(first, second)), joined);
+        }
+        // A Russian compound adjective, solid or hyphenated by meaning.
+        keep("Нормативно-", "правовых актов.");
+        keep("Много-", "этажный дом.");
+    }
+
+    #[test]
+    fn hyphen_without_a_known_line_break_still_needs_evidence() {
+        // A space, not LINE_BREAK: a join cannot be told from
+        // interleaved-column noise, so the old rules apply.
+        let text = "The contrac- tion was signed.";
+        assert_eq!(dehyphenate_line_breaks(text), text);
+        assert_eq!(line_join_separator("steadily com-", false), ' ');
+        assert_eq!(line_join_separator("plain end", true), ' ');
+        assert_eq!(line_join_separator("Bap-**", true), LINE_BREAK);
+    }
+
+    #[test]
+    fn line_breaks_never_reach_the_output() {
+        let options = MarkdownOptions {
+            fix_hyphenation: false,
+            ..MarkdownOptions::default()
+        };
+        let out = clean_markdown(wrapped("The contrac-", "tion."), &options);
+        assert_eq!(out, "The contrac- tion.\n");
+    }
+
+    // --- normalize_block_spacing ---
+
+    #[test]
+    fn blank_line_runs_collapse_and_ends_are_trimmed() {
+        assert_eq!(
+            normalize_block_spacing("\n\n## Раздел\n\n\n\nText.\n \n\t\nMore text.\n\n\n"),
+            "## Раздел\n\nText.\n\nMore text."
+        );
+    }
+
+    #[test]
+    fn tab_indented_lines_are_indented_text() {
+        assert_eq!(
+            normalize_block_spacing("Text\n\tindented\n  \tдальше"),
+            "Text\n\tindented\n  \tдальше"
+        );
+    }
+
+    #[test]
+    fn exactly_one_blank_line_separates_blocks() {
+        // A heading, a list, a paragraph after a list item (which would
+        // otherwise read as its lazy continuation), a table, and a
+        // paragraph after the table (which would otherwise be a row).
+        let text = "# Title\nIntro line one\nintro line two\n- item\nAfter the list.\n|a|b|\n|---|---|\n|1|2|\nAfter the table.\n> quote\nAfter the quote.";
+        assert_eq!(
+            normalize_block_spacing(text),
+            "# Title\n\nIntro line one\nintro line two\n\n- item\n\nAfter the list.\n\n|a|b|\n|---|---|\n|1|2|\n\nAfter the table.\n\n> quote\n\nAfter the quote."
+        );
+    }
+
+    #[test]
+    fn tight_lists_lose_inner_blank_lines() {
+        let text = "1. Первый\n\n2. Второй\n\n\n3. Third\n- a) alpha\n\n- b) beta\n* other\n+ plus";
+        assert_eq!(
+            normalize_block_spacing(text),
+            "1. Первый\n2. Второй\n3. Third\n\n- a) alpha\n- b) beta\n\n* other\n\n+ plus"
+        );
+    }
+
+    #[test]
+    fn code_blocks_keep_their_lines_and_get_blank_lines_around() {
+        let text = "Before\n```\nfn a() {}\n\n\nfn b() {}\n```\nAfter\n* * *\nEnd";
+        assert_eq!(
+            normalize_block_spacing(text),
+            "Before\n\n```\nfn a() {}\n\n\nfn b() {}\n```\n\nAfter\n\n* * *\n\nEnd"
         );
     }
 

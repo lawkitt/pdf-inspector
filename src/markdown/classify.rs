@@ -80,18 +80,23 @@ pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
         || trimmed.starts_with("* ")
 }
 
+/// Bullet glyphs PDFs paint as list markers; [`format_list_item`] turns
+/// them into `-`.
+const BULLETS: [char; 6] = ['•', '●', '○', '◦', '▪', '■'];
+
+/// The text after a leading bullet glyph, with or without a space between
+/// them ("•Bullet" is a producer that dropped the tab after the marker).
+fn after_bullet(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix(BULLETS)?.trim_start();
+    (!rest.is_empty()).then_some(rest)
+}
+
 /// Check if text looks like a list item
 pub(crate) fn is_list_item(text: &str) -> bool {
     let trimmed = text.trim_start();
 
     // Bullet patterns
-    if trimmed.starts_with("• ")
-        || trimmed.starts_with("- ")
-        || trimmed.starts_with("* ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("◦ ")
-    {
+    if after_bullet(trimmed).is_some() || trimmed.starts_with("- ") || trimmed.starts_with("* ") {
         return true;
     }
 
@@ -118,38 +123,170 @@ pub(crate) fn is_list_item(text: &str) -> bool {
         }
     }
 
-    false
+    // Roman numerals of more than one letter ("iv.", "XII)") and letters of
+    // other scripts ("а)")
+    split_list_label(trimmed).is_some()
 }
 
-/// Format list item to markdown
-pub(crate) fn format_list_item(text: &str) -> String {
+/// Whether `label` is a Roman numeral from 1 to 39 in one case.
+fn is_roman(label: &str) -> bool {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static ROMAN_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^(?:X{0,3}(?:IX|IV|V?I{0,3})|x{0,3}(?:ix|iv|v?i{0,3}))$").unwrap()
+    });
+    !label.is_empty() && ROMAN_RE.is_match(label)
+}
+
+/// What a list label numbers with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Label {
+    /// "1." / "1)": a Markdown ordered-list marker.
+    Decimal,
+    /// "a)", "iv.", "(a)", "(1)": no Markdown equivalent.
+    Other,
+}
+
+/// Whether `formatted`, a line from [`format_list_item`], opens a Markdown
+/// list item. A label that cannot ("1.1 Scope", "(b)." ending a sentence)
+/// stays plain text.
+pub(crate) fn starts_markdown_list_item(formatted: &str) -> bool {
+    let digits = formatted.bytes().take_while(u8::is_ascii_digit).count();
+    let after = &formatted[digits..];
+    formatted.starts_with("- ")
+        || ((1..=9).contains(&digits) && (after.starts_with(". ") || after.starts_with(") ")))
+}
+
+/// "* * * * *", "***": a thematic break, not a bullet.
+pub(crate) fn is_thematic_break(text: &str) -> bool {
+    let marks: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    marks.len() >= 3 && marks.chars().all(|c| c == '*')
+}
+
+/// Split a leading list label from its text: "1.First" -> ("1.", "First"),
+/// "a) Alpha" -> ("a)", "Alpha"), "(iv) Text" -> ("(iv)", "Text"). A label
+/// is a number, a Roman numeral, one Latin letter, or one letter of any
+/// script before ")" ("а)", "б)" in Russian; "т." is an abbreviation). It
+/// may run straight into its text (a dropped tab), but not into a digit
+/// ("1.5 million") or an abbreviation ("e.g.", "U.S."), and an unspaced
+/// capital that is no numeral is an initial ("J.Smith"), as is one before
+/// another initial ("J. W. Tukey").
+fn split_list_label(text: &str) -> Option<(&str, &str, Label)> {
+    let (label_len, body, parenthesized) = match text.strip_prefix('(') {
+        Some(inner) => {
+            let close = inner.find(')')?;
+            (close + 2, &inner[..close], true)
+        }
+        None => {
+            let end = text.find(['.', ')'])?;
+            (end + 1, &text[..end], false)
+        }
+    };
+    let mut letters = body.chars();
+    let single_letter = match (letters.next(), letters.next()) {
+        (Some(c), None) if c.is_ascii_alphabetic() => true,
+        (Some(c), None) => c.is_alphabetic() && text[label_len - 1..].starts_with(')'),
+        _ => false,
+    };
+    let number = (1..=9).contains(&body.len()) && body.bytes().all(|b| b.is_ascii_digit());
+    let kind = if number && !parenthesized {
+        Label::Decimal
+    } else if number || single_letter || is_roman(body) {
+        Label::Other
+    } else {
+        return None;
+    };
+    let (label, rest) = text.split_at(label_len);
+    let mut after = rest.chars();
+    let next = after.next()?;
+    if next.is_whitespace() {
+        let rest = rest.trim_start();
+        // "J. W. Tukey": initials, not a label.
+        let mut words = rest.chars();
+        let initials = label.ends_with('.')
+            && body.bytes().all(|b| b.is_ascii_uppercase())
+            && words.next().is_some_and(char::is_uppercase)
+            && words.next() == Some('.');
+        return (!rest.is_empty() && !initials).then_some((label, rest, kind));
+    }
+    // Not "(": "(c)(2)" is a cross-reference.
+    let runs_into_text = next.is_alphabetic() || matches!(next, '*' | '"' | '“' | '«' | '<');
+    let abbreviation = label.ends_with('.') && after.next() == Some('.');
+    let initial = !parenthesized
+        && body.len() == 1
+        && body.bytes().all(|b| b.is_ascii_uppercase())
+        && !is_roman(body);
+    (runs_into_text && !abbreviation && !initial).then_some((label, rest, kind))
+}
+
+/// Format list item to markdown: bullets become `-`, decimal labels stay
+/// ordered-list markers ("1. ", "1) "), and labels Markdown cannot number
+/// ("a)", "iv.", "(a)") become a `-` item that keeps the label as text, as
+/// anydoc renders them. A label run into its text gets its space back.
+///
+/// A lone capital and a period ("V.", "I.Smith", "A. Background") is as
+/// often an initial or a heading as a label, so it opens an item only
+/// `after_item`, right after another list item line.
+pub(crate) fn format_list_item(text: &str, after_item: bool) -> String {
+    let label =
+        |text| split_list_label(text).filter(|(label, ..)| after_item || !is_capital_label(label));
     let trimmed = text.trim_start();
 
     // Convert various bullet styles to markdown
     // Note: bullet characters like • are multi-byte in UTF-8, use char indices
-    for bullet in &['•', '○', '●', '◦'] {
-        if let Some(rest) = trimmed.strip_prefix(*bullet) {
-            return format!("- {}", rest.trim_start());
-        }
-        // Bullet inside a leading style run (e.g. "**● Label:** rest" or
-        // "<u>● Label</u>"). The run wraps both the marker and the following
-        // label because both carry the style in the PDF. The marker must move
-        // outside the wrapper so markdown still sees a list item.
-        for wrapper in ["**", "*", "<u>"] {
-            if let Some(after_open) = trimmed.strip_prefix(wrapper) {
-                if let Some(rest) = after_open.strip_prefix(*bullet) {
-                    return format!("- {}{}", wrapper, rest.trim_start());
-                }
-            }
-        }
+    if let Some(rest) = after_bullet(trimmed) {
+        return format!("- {rest}");
+    }
+    // A marker inside a leading style run (e.g. "**● Label:** rest",
+    // "<u>● Label</u>", "**a)** rest"). The run wraps both the marker and
+    // the following label because both carry the style in the PDF. The
+    // marker must move outside the wrapper so markdown still sees a list
+    // item; a wrapper left around nothing is dropped.
+    for (open, close) in [("**", "**"), ("*", "*"), ("<u>", "</u>")] {
+        let Some(inner) = trimmed.strip_prefix(open) else {
+            continue;
+        };
+        let (marker, rest) = if let Some(rest) = after_bullet(inner) {
+            ("-".to_string(), rest)
+        } else if let Some((label, rest, kind)) = label(inner) {
+            (marker_for(label, kind), rest)
+        } else {
+            continue;
+        };
+        return match rest.strip_prefix(close) {
+            Some(after) if !after.trim().is_empty() => format!("{marker} {}", after.trim_start()),
+            _ => format!("{marker} {open}{rest}"),
+        };
     }
 
-    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        if is_thematic_break(trimmed) {
+            return trimmed.to_string();
+        }
+        return format!("- {}", rest.trim_start());
+    }
+    if trimmed.starts_with("- ") {
         return trimmed.to_string();
     }
 
-    // Keep numbered lists as-is (markdown supports them)
+    if let Some((label, rest, kind)) = label(trimmed) {
+        return format!("{} {rest}", marker_for(label, kind));
+    }
     trimmed.to_string()
+}
+
+/// "V.", "A.": one capital letter and a period.
+fn is_capital_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b'.'
+}
+
+/// The Markdown marker for a list label.
+fn marker_for(label: &str, kind: Label) -> String {
+    match kind {
+        Label::Decimal => label.to_string(),
+        Label::Other => format!("- {label}"),
+    }
 }
 
 /// Check if text looks like code
@@ -263,6 +400,11 @@ pub(crate) fn is_monospace_font(font_name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A line formatted with no list item before it.
+    fn format_list_item_t(text: &str) -> String {
+        format_list_item(text, false)
+    }
+
     #[test]
     fn monotype_foundry_faces_are_not_monospace() {
         // "Monotype" is a foundry prefix on proportional faces; the generic
@@ -276,15 +418,18 @@ mod tests {
 
     #[test]
     fn format_list_item_plain_bullet() {
-        assert_eq!(format_list_item("● Item"), "- Item");
-        assert_eq!(format_list_item("• Item"), "- Item");
+        assert_eq!(format_list_item_t("● Item"), "- Item");
+        assert_eq!(format_list_item_t("• Item"), "- Item");
     }
 
     #[test]
     fn format_list_item_bullet_inside_underline() {
         // Fully-underlined bullet line: the marker must move outside the
         // <u> wrapper so markdown still renders a list item.
-        assert_eq!(format_list_item("<u>● Item text</u>"), "- <u>Item text</u>");
+        assert_eq!(
+            format_list_item_t("<u>● Item text</u>"),
+            "- <u>Item text</u>"
+        );
     }
 
     #[test]
@@ -293,19 +438,84 @@ mod tests {
         // a single bold run like "**● Label:** rest"; the bullet must still
         // be stripped and the bold wrapper preserved on the label.
         assert_eq!(
-            format_list_item("**● Fraud: Willing cooperation;**"),
+            format_list_item_t("**● Fraud: Willing cooperation;**"),
             "- **Fraud: Willing cooperation;**"
         );
         assert_eq!(
-            format_list_item("**● Label:** rest of line"),
+            format_list_item_t("**● Label:** rest of line"),
             "- **Label:** rest of line"
         );
-        assert_eq!(format_list_item("*● Italic:* rest"), "- *Italic:* rest");
+        assert_eq!(format_list_item_t("*● Italic:* rest"), "- *Italic:* rest");
     }
 
     #[test]
     fn format_list_item_already_dash() {
-        assert_eq!(format_list_item("- existing"), "- existing");
+        assert_eq!(format_list_item_t("- existing"), "- existing");
+    }
+
+    #[test]
+    fn format_list_item_restores_markers_run_into_text() {
+        // A producer that drops the tab after the marker ("1.First").
+        assert_eq!(format_list_item_t("1.First numbered"), "1. First numbered");
+        assert_eq!(format_list_item_t("•Bullet one"), "- Bullet one");
+        assert_eq!(format_list_item_t("◦Nested bullet"), "- Nested bullet");
+        assert_eq!(format_list_item_t("1.Первый пункт"), "1. Первый пункт");
+        assert!(is_list_item("•Bullet one"));
+        assert!(is_list_item("IV.Roman starting at four"));
+    }
+
+    #[test]
+    fn format_list_item_keeps_labels_markdown_cannot_number_as_text() {
+        assert_eq!(format_list_item_t("a)Alpha sub one"), "- a) Alpha sub one");
+        assert_eq!(format_list_item_t("i.Roman sub sub"), "- i. Roman sub sub");
+        assert_eq!(
+            format_list_item_t("IV.Roman starting at four"),
+            "- IV. Roman starting at four"
+        );
+        // A lone capital is a label only after another item.
+        assert_eq!(format_list_item("V.Roman five", true), "- V. Roman five");
+        assert_eq!(format_list_item("A. Background", true), "- A. Background");
+        assert_eq!(format_list_item_t("A. Background"), "A. Background");
+        assert_eq!(
+            format_list_item_t("(a) The Tenant shall pay"),
+            "- (a) The Tenant shall pay"
+        );
+        assert_eq!(
+            format_list_item_t("(2) <u>Expiration</u> date"),
+            "- (2) <u>Expiration</u> date"
+        );
+        assert_eq!(format_list_item_t("**a)** Bold label"), "- a) Bold label");
+        // Russian lettered lists: "а)", "б)".
+        assert_eq!(
+            format_list_item_t("а) арендатор обязуется"),
+            "- а) арендатор обязуется"
+        );
+        assert_eq!(format_list_item_t("б)арендодатель"), "- б) арендодатель");
+        assert_eq!(format_list_item_t("2) Second"), "2) Second");
+        assert_eq!(format_list_item_t("* Item"), "- Item");
+    }
+
+    #[test]
+    fn format_list_item_leaves_text_that_only_looks_like_a_label() {
+        for text in [
+            "1.5 million was paid",
+            "1.1 Scope",
+            "e.g. the first case",
+            "т.е. первое",
+            "J.Smith signed",
+            "J. W. Tukey suggested",
+            "I.Smith signed the lease.",
+            "V. Putin signed the lease.",
+            "(c)(2) of this section",
+            "(b).",
+            "* * * * *",
+        ] {
+            assert_eq!(format_list_item(text, false), text);
+            assert!(
+                !starts_markdown_list_item(&format_list_item(text, false)),
+                "{text}"
+            );
+        }
     }
 
     #[test]

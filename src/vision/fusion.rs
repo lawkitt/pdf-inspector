@@ -727,8 +727,50 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
         return markdown.to_string();
     }
 
+    // The left edge of the span that opens the Markdown line at `offset`.
+    let line_left = |offset: usize| {
+        let line_start = markdown[..offset].rfind('\n').map_or(0, |i| i + 1);
+        mapped
+            .iter()
+            .find(|span| span.0 >= line_start)
+            .map(|span| span.2)
+    };
+    // For each consecutive pair: the gap between them when the second span
+    // sits at a hanging indent under a list item's line, a candidate
+    // continuation of that item.
+    let hanging: Vec<Option<f32>> = mapped
+        .windows(2)
+        .map(|pair| {
+            let (_, current_end, _, _, _, current_bottom) = pair[0];
+            let (_, _, next_left, next_top, _, _) = pair[1];
+            (markdown_line_at(markdown, current_end).is_some_and(is_markdown_list_line)
+                && line_left(current_end)
+                    .is_some_and(|left| next_left > left + median_height * 0.5))
+            .then_some(next_top - current_bottom)
+        })
+        .collect();
+    // A candidate continues the item when it is closer than a line height,
+    // or when it belongs to a run of at least two hanging lines spaced
+    // alike (a double-spaced item): one indented line after a wide gap is
+    // as likely a paragraph of its own.
+    let mut continues = vec![false; hanging.len()];
+    let mut i = 0;
+    while i < hanging.len() {
+        let run_end = (i..hanging.len())
+            .find(|&j| hanging[j].is_none())
+            .unwrap_or(hanging.len());
+        let gaps: Vec<f32> = hanging[i..run_end].iter().flatten().copied().collect();
+        let (low, high) = gaps.iter().fold((f32::MAX, f32::MIN), |(low, high), &g| {
+            (low.min(g), high.max(g))
+        });
+        let regular = gaps.len() >= 2 && low > 0.0 && high <= low * 1.25;
+        for (j, gap) in (i..run_end).zip(gaps) {
+            continues[j] = regular || gap < median_height;
+        }
+        i = run_end + 1;
+    }
     let mut replacements = Vec::new();
-    for pair in mapped.windows(2) {
+    for (index, pair) in mapped.windows(2).enumerate() {
         let (_, current_end, current_left, _, current_right, current_bottom) = pair[0];
         let (next_start, _, next_left, next_top, next_right, _) = pair[1];
         let overlap = (current_right.min(next_right) - current_left.max(next_left)).max(0.0);
@@ -736,10 +778,16 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
         let same_text_flow = narrowest_width > 0.0 && overlap >= narrowest_width * 0.2;
         let separated = next_top - current_bottom >= median_height * 0.65;
         let between = &markdown[current_end..next_start];
+        // A word joined across the spans ("contrac" + "tion") has nothing
+        // between them, and a list item's continuation at a hanging indent
+        // stays in the item.
+        let continues_item = continues[index];
         if same_text_flow
             && separated
+            && !between.is_empty()
             && between.chars().all(char::is_whitespace)
             && !markdown_line_at(markdown, current_end).is_some_and(is_markdown_table_line)
+            && !continues_item
             && !markdown_line_at(markdown, next_start).is_some_and(is_markdown_table_line)
         {
             replacements.push((current_end, next_start));
@@ -761,12 +809,27 @@ fn unique_markdown_span(markdown: &str, span_text: &str) -> Option<(usize, usize
         _ => return None,
     }
 
-    let normalized = strip_list_marker(span_text)?;
-    let matches: Vec<_> = markdown.match_indices(normalized).collect();
-    match matches.as_slice() {
-        [(start, matched)] => Some((*start, *start + matched.len())),
-        _ => None,
+    // The converter normalizes a list marker away, and a line-end hyphen
+    // may be joined away ("contrac-" in "contraction"); either or both.
+    let unmarked = strip_list_marker(span_text);
+    fn unhyphenated(text: &str) -> Option<&str> {
+        text.strip_suffix('-')
+            .filter(|word| word.ends_with(char::is_alphabetic))
     }
+    [
+        unmarked,
+        unhyphenated(span_text),
+        unmarked.and_then(unhyphenated),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|normalized| {
+        let matches: Vec<_> = markdown.match_indices(normalized).collect();
+        match matches.as_slice() {
+            [(start, matched)] => Some((*start, *start + matched.len())),
+            _ => None,
+        }
+    })
 }
 
 fn strip_list_marker(text: &str) -> Option<&str> {
@@ -787,6 +850,16 @@ fn markdown_line_at(markdown: &str, offset: usize) -> Option<&str> {
         .find('\n')
         .map_or(markdown.len(), |index| offset + index);
     markdown.get(start..end)
+}
+
+/// A line that opens a Markdown list item ("- ", "1. ", "1) ").
+fn is_markdown_list_line(line: &str) -> bool {
+    let line = line.trim_start();
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    line.starts_with("- ")
+        || line.starts_with("* ")
+        || ((1..=9).contains(&digits)
+            && (line[digits..].starts_with(". ") || line[digits..].starts_with(") ")))
 }
 
 fn is_markdown_table_line(line: &str) -> bool {
@@ -1484,6 +1557,158 @@ mod tests {
         let recovered = preserve_ocr_line_breaks("- First item Next paragraph", &page);
 
         assert_eq!(recovered, "- First item\n\nNext paragraph");
+    }
+
+    #[test]
+    fn line_break_recovery_survives_a_joined_line_end_hyphen() {
+        // EN and RU: "contrac-" / "дого-" were joined into one word, and
+        // the paragraph break after the next span is still recovered.
+        for (first, second, third, joined) in [
+            (
+                "This is a contrac-",
+                "tion clause.",
+                "The next paragraph.",
+                "This is a contraction clause.",
+            ),
+            (
+                "Стороны заключили дого-",
+                "вор аренды.",
+                "Следующий абзац.",
+                "Стороны заключили договор аренды.",
+            ),
+        ] {
+            let page = routed_page(
+                1,
+                vec![
+                    positioned_span(first, 10.0, 10.0, 190.0, 20.0),
+                    positioned_span(second, 10.0, 24.0, 190.0, 34.0),
+                    positioned_span(third, 10.0, 41.0, 190.0, 51.0),
+                ],
+                Some(0.9),
+            );
+            let recovered = preserve_ocr_line_breaks(&format!("{joined} {third}"), &page);
+            assert_eq!(recovered, format!("{joined}\n\n{third}"));
+        }
+    }
+
+    #[test]
+    fn line_break_recovery_survives_a_bullet_and_a_joined_hyphen_together() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("• This is a contrac-", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("tion clause.", 20.0, 24.0, 190.0, 34.0),
+                positioned_span("The next paragraph.", 10.0, 41.0, 190.0, 51.0),
+            ],
+            Some(0.9),
+        );
+        let recovered =
+            preserve_ocr_line_breaks("- This is a contraction clause. The next paragraph.", &page);
+        assert_eq!(
+            recovered,
+            "- This is a contraction clause.\n\nThe next paragraph."
+        );
+    }
+
+    #[test]
+    fn line_break_recovery_splits_an_indented_paragraph_after_a_list_item() {
+        // A paragraph-sized gap: not a hanging continuation.
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("• First item.", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("An indented paragraph.", 20.0, 41.0, 190.0, 51.0),
+            ],
+            Some(0.9),
+        );
+        let recovered = preserve_ocr_line_breaks("- First item. An indented paragraph.", &page);
+        assert_eq!(recovered, "- First item.\n\nAn indented paragraph.");
+    }
+
+    #[test]
+    fn line_break_recovery_keeps_a_list_items_hanging_continuation() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("• First item starts", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("continued on another line.", 20.0, 27.0, 190.0, 37.0),
+            ],
+            Some(0.9),
+        );
+        let markdown = "- First item starts continued on another line.";
+        assert_eq!(preserve_ocr_line_breaks(markdown, &page), markdown);
+    }
+
+    #[test]
+    fn line_break_recovery_keeps_a_double_spaced_items_continuation() {
+        let lines = [
+            "• The tenant agrees to pay all charges",
+            "arising under this lease and all related",
+            "costs assessed during the contractual",
+            "period unless otherwise agreed by both",
+            "parties in writing before the relevant",
+            "payment becomes due under the agreement.",
+        ];
+        let spans = lines
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let top = 10.0 + 23.0 * i as f32;
+                let left = if i == 0 { 10.0 } else { 20.0 };
+                positioned_span(text, left, top, 190.0, top + 10.0)
+            })
+            .collect();
+        let mut page = routed_page(1, spans, Some(0.9));
+        let transform =
+            PageTransform::from_corners(200, 200, (0., 200.), (200., 200.), (0., 0.)).unwrap();
+        page.rendered = RenderedPage::new(
+            1,
+            200.,
+            200.,
+            200,
+            200,
+            600,
+            RenderPixelFormat::Rgb8,
+            vec![255; 120_000],
+            transform,
+        )
+        .unwrap();
+        let markdown = format!("- {}", lines.join(" ").trim_start_matches("• "));
+        assert_eq!(preserve_ocr_line_breaks(&markdown, &page), markdown);
+        assert_eq!(
+            ocr_page_to_markdown(&page, 1, &MarkdownOptions::default()).trim_end(),
+            markdown
+        );
+    }
+
+    #[test]
+    fn line_break_recovery_splits_one_indented_line_on_a_double_spaced_page() {
+        // Paragraph gaps everywhere do not make the indented line after the
+        // item a continuation: it is not part of a regular hanging run.
+        let texts = [
+            "• First item.",
+            "An indented paragraph.",
+            "Третий абзац.",
+            "Fourth paragraph.",
+        ];
+        let spans = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let top = 10.0 + 25.0 * i as f32;
+                let left = if i == 1 { 20.0 } else { 10.0 };
+                positioned_span(text, left, top, 190.0, top + 10.0)
+            })
+            .collect();
+        let page = routed_page(1, spans, Some(0.9));
+        let recovered = preserve_ocr_line_breaks(
+            "- First item. An indented paragraph. Третий абзац. Fourth paragraph.",
+            &page,
+        );
+        assert_eq!(
+            recovered,
+            "- First item.\n\nAn indented paragraph.\n\nТретий абзац.\n\nFourth paragraph."
+        );
     }
 
     #[test]
