@@ -18,11 +18,12 @@ version and date. Earlier releases are described in their
   a line that starts elsewhere (an interleaved column) keeps the old
   evidence-only rules. A stem the document uses in another form joins
   ("законо-" + "дательных" after "законодательства"); compounds spelled
-  with a hyphen keep it (кто-то, что-либо, по-русски, из-за, self-employed,
-  short-term, twenty-five); suspended hyphens ("pre-" + "and"), breaks
-  before a compound modifier's second element ("commercial-" + "type"),
-  a long first part the document uses as a word, and Russian compound
-  adjectives ("нормативно-" + "правовых") stay as they are.
+  with a hyphen keep it (кто-то, чьи-то, что-либо, по-русски, из-за,
+  self-employed, and known English pairs such as short-term, six-month);
+  suspended hyphens ("pre-" + "and"), breaks before a compound modifier's
+  second element ("commercial-" + "type"), a long first part the document
+  uses as a word, and Russian compound adjectives ("нормативно-" +
+  "правовых") stay as they are.
 - List items: a bullet or label run into its text ("•Bullet", "1.First")
   gets its space back, `*` bullets become `-`, and labels Markdown cannot
   number ("a)", "iv.", "(a)", "(2)", Russian "а)") become a `-` item that
@@ -31,7 +32,10 @@ version and date. Earlier releases are described in their
   left edge continues it only after a full line and without a paragraph
   break, and a label paragraph wrapping back to the margin is rejoined. The
   OCR pipeline's paragraph recovery no longer splits a list item from its
-  hanging continuation, or gives up on a page where a hyphen was joined.
+  hanging continuation, or gives up on a page where a hyphen was joined. An
+  item whose marker starts further right than the one before nests under
+  it, indented by the parent's marker width; a paragraph gap always ends an
+  item.
 - Block spacing: exactly one blank line between blocks, none inside a
   tight list, none at the start or end, also across the pages of the OCR
   pipeline. A paragraph after a list item or table no longer reads as its

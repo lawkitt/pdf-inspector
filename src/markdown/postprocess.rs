@@ -77,9 +77,10 @@ pub(crate) fn line_join_separator(before: &str, wraps: bool) -> char {
 enum BlockLine {
     Paragraph,
     Heading,
-    /// A list item line; the marker family (`-`, `*`, `+`, `.`, `)`) decides
-    /// which items CommonMark keeps in one list.
-    ListItem(char),
+    /// A list item line: the marker family (`-`, `*`, `+`, `.`, `)`), which
+    /// decides which items CommonMark keeps in one list, and the indent of a
+    /// nested item.
+    ListItem(char, usize),
     Table,
     Quote,
     Rule,
@@ -96,20 +97,26 @@ fn block_line(line: &str) -> BlockLine {
         Regex::new(r"^(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$").unwrap()
     });
     if line.starts_with([' ', '\t']) {
-        return BlockLine::Indented;
+        let item = line.trim_start_matches(' ');
+        return match block_line(item) {
+            BlockLine::ListItem(marker, _) => BlockLine::ListItem(marker, line.len() - item.len()),
+            _ => BlockLine::Indented,
+        };
     }
     if RULE_RE.is_match(line) {
         return BlockLine::Rule;
     }
     let mut chars = line.chars();
     match (chars.next(), chars.next()) {
-        (Some(marker @ ('-' | '*' | '+')), None | Some(' ')) => return BlockLine::ListItem(marker),
+        (Some(marker @ ('-' | '*' | '+')), None | Some(' ')) => {
+            return BlockLine::ListItem(marker, 0);
+        }
         (Some('|'), _) => return BlockLine::Table,
         (Some('>'), _) => return BlockLine::Quote,
         _ => {}
     }
     if let Some(caps) = ORDERED_RE.captures(line) {
-        return BlockLine::ListItem(caps[1].chars().next().unwrap_or('.'));
+        return BlockLine::ListItem(caps[1].chars().next().unwrap_or('.'), 0);
     }
     let hashes = line.chars().take_while(|&c| c == '#').count();
     if (1..=6).contains(&hashes) && matches!(line[hashes..].chars().next(), None | Some(' ')) {
@@ -165,7 +172,8 @@ pub(crate) fn normalize_block_spacing(text: &str) -> String {
     for (kind, line, blank_before) in blocks {
         if let Some(prev) = prev {
             let tight = match (prev, kind) {
-                (BlockLine::ListItem(a), BlockLine::ListItem(b)) => a == b,
+                // A nested item stays with its parent and siblings.
+                (BlockLine::ListItem(a, ia), BlockLine::ListItem(b, ib)) => ia != ib || a == b,
                 (BlockLine::Paragraph, BlockLine::Paragraph)
                 | (BlockLine::Quote, BlockLine::Quote)
                 | (BlockLine::Table, BlockLine::Table)
@@ -361,7 +369,7 @@ fn join_decision(
 ///     post-war", "двух- или трёхкомнатный"): left as it is;
 ///   - compounds whose spelling is a rule, not a guess, keep the hyphen
 ///     ([`is_hyphenated_compound`]: кто-то, что-либо, по-русски,
-///     short-term, twenty-five);
+///     short-term, twenty-five, six-month);
 ///   - before a compound modifier's second element ("commercial- type",
 ///     but also "proto- type") nothing is decided: left as it is;
 ///   - a short continuation that the document uses as a word is likely a
@@ -419,63 +427,15 @@ fn line_break_join(
 }
 
 /// Compounds hyphenated by spelling rule, so a line break inside them keeps
-/// the hyphen: the Russian particles (что-либо, кто-нибудь, всё-таки,
-/// что-то after an interrogative or a word the document uses alone — not
-/// the syllable in "ле- то"), кое-/кой-, по-русски (not "по- иски"),
+/// the hyphen: the Russian particles (что-либо, кто-нибудь, всё-таки, -то
+/// after an interrogative or a word the document uses alone — not the
+/// syllable in "ле- то"), кое-/кой-, по-русски (not "по- иски"),
 /// во-первых, из-за / из-под; English self- before a word
-/// ("self-employed"; not "self-ish", "self-less"), and a few first elements
-/// before a word, not a suffix ("short-term", "twenty-five"; not
-/// "short-age").
+/// ("self-employed"; not "self-ish", "self-less") and whole known pairs
+/// ([`is_english_compound`]).
 fn is_hyphenated_compound(a: &str, b: &str, words: &BTreeSet<String>) -> bool {
-    // English first elements that form hyphenated compounds ("short-term",
-    // "well-known", "twenty-five"), unless a suffix follows ("short-age",
-    // "well-ness", "four-teen"). Words that split into common words
-    // ("part-ner", "ten-ant", "cross-ing") are not on the list.
-    const EN_FIRST: [&str; 18] = [
-        "short", "long", "well", "first", "two", "three", "four", "five", "year", "month", "week",
-        "twenty", "thirty", "forty", "fifty", "sixty", "eighty", "ninety",
-    ];
-    const EN_SUFFIXES: [&str; 18] = [
-        "age", "ing", "ings", "est", "ness", "er", "ers", "en", "ed", "ish", "less", "ful", "ant",
-        "ary", "ner", "teen", "ly", "ise",
-    ];
-    // Interrogatives and their forms before the particle -то (кто-то,
-    // чего-то, какой-то).
-    const RU_TO: [&str; 30] = [
-        "кто",
-        "кого",
-        "кому",
-        "кем",
-        "ком",
-        "что",
-        "чего",
-        "чему",
-        "чем",
-        "чём",
-        "где",
-        "куда",
-        "когда",
-        "как",
-        "какой",
-        "какая",
-        "какое",
-        "какие",
-        "какого",
-        "какому",
-        "каким",
-        "какую",
-        "каких",
-        "чей",
-        "чья",
-        "чьё",
-        "почему",
-        "зачем",
-        "откуда",
-        "сколько",
-    ];
     matches!(b, "либо" | "нибудь" | "таки")
-        || (b == "то" && (words.contains(a) || RU_TO.contains(&a)))
-        || (EN_FIRST.contains(&a) && b.chars().count() >= 3 && !EN_SUFFIXES.contains(&b))
+        || (b == "то" && (words.contains(a) || is_russian_interrogative(a)))
         || matches!(a, "кое" | "кой")
         || (a == "по" && b.chars().count() >= 6 && (b.ends_with("ски") || b.ends_with("цки")))
         || (a == "во" && b.chars().count() >= 5 && (b.ends_with("ых") || b.ends_with("их")))
@@ -484,6 +444,78 @@ fn is_hyphenated_compound(a: &str, b: &str, words: &BTreeSet<String>) -> bool {
             && b.chars().count() >= 5
             && !b.starts_with("ish")
             && !b.starts_with("less"))
+        || is_english_compound(a, b)
+}
+
+/// Russian interrogatives in any form, before -то (кто-то, чьи-то,
+/// какими-то, сколько-то).
+fn is_russian_interrogative(a: &str) -> bool {
+    a.starts_with("как")
+        || a.starts_with("чь")
+        || matches!(
+            a,
+            "кто"
+                | "кого"
+                | "кому"
+                | "кем"
+                | "ком"
+                | "что"
+                | "чего"
+                | "чему"
+                | "чем"
+                | "чём"
+                | "чей"
+                | "где"
+                | "куда"
+                | "когда"
+                | "откуда"
+                | "почему"
+                | "зачем"
+                | "отчего"
+                | "сколько"
+        )
+}
+
+/// English compounds whose both halves are on a short list, so that no
+/// word splitting at the same place is one ("short-term", "well-known",
+/// "twenty-five", "six-month"; never "short-ening", "long-itude",
+/// "ten-ant").
+fn is_english_compound(a: &str, b: &str) -> bool {
+    const NUMBERS: [&str; 18] = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "twenty",
+        "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    ];
+    const UNITS: [&str; 16] = [
+        "day", "week", "month", "year", "hour", "minute", "page", "member", "person", "party",
+        "fold", "part", "way", "step", "stage", "time",
+    ];
+    let first_nine = &NUMBERS[..9];
+    match a {
+        "short" | "long" => matches!(b, "term" | "range" | "lived" | "run" | "haul" | "standing"),
+        "well" => matches!(
+            b,
+            "known"
+                | "being"
+                | "founded"
+                | "established"
+                | "defined"
+                | "documented"
+                | "suited"
+                | "informed"
+                | "intentioned"
+        ),
+        "first" | "second" | "third" => {
+            matches!(
+                b,
+                "class" | "hand" | "rate" | "party" | "degree" | "tier" | "time"
+            )
+        }
+        _ if a.ends_with("ty") && NUMBERS.contains(&a) => {
+            first_nine.contains(&b) || UNITS.contains(&b)
+        }
+        _ if NUMBERS.contains(&a) => UNITS.contains(&b),
+        _ => false,
+    }
 }
 
 /// A conjunction after the hyphen makes it a suspended one ("pre- and
@@ -1183,6 +1215,10 @@ mod tests {
             ("Twenty-", "five days.", "Twenty-five days."),
             ("Если кто-", "то возражает.", "Если кто-то возражает."),
             ("Сделать что-", "то иное.", "Сделать что-то иное."),
+            ("Чьи-", "то вещи.", "Чьи-то вещи."),
+            ("Какими-", "то путями.", "Какими-то путями."),
+            ("A six-", "month term.", "A six-month term."),
+            ("First-", "class mail.", "First-class mail."),
         ] {
             assert_eq!(dehyphenate_line_breaks(&wrapped(first, second)), joined);
         }
@@ -1223,9 +1259,16 @@ mod tests {
         // compound ("commercial-type") or a syllable ("proto-type").
         keep("Offering commercial-", "type insurance.");
         keep("Their proto-", "type systems.");
-        // Not a first element when a suffix follows: "shortage".
-        let text = wrapped("A short-", "age of goods.");
-        assert_eq!(dehyphenate_line_breaks(&text), "A shortage of goods.");
+        // Not a known pair: a word ("shortage", "shortening", "longitude",
+        // "tenant") joins plain.
+        for (first, second, joined) in [
+            ("A short-", "age of goods.", "A shortage of goods."),
+            ("A short-", "ening step.", "A shortening step."),
+            ("The long-", "itude.", "The longitude."),
+            ("The ten-", "ant pays.", "The tenant pays."),
+        ] {
+            assert_eq!(dehyphenate_line_breaks(&wrapped(first, second)), joined);
+        }
         // A Russian compound adjective, solid or hyphenated by meaning.
         keep("Нормативно-", "правовых актов.");
         keep("Много-", "этажный дом.");

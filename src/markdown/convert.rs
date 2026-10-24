@@ -845,6 +845,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
     let mut list_edges: Option<(f32, f32)> = None;
+    let mut nesting = ListNesting::default();
     // Code lines accumulate here and the fence is emitted only when the
     // block flushes with content — an empty ``` ``` pair can never appear.
     fn flush_code_block(output: &mut String, pending_code: &mut String) {
@@ -1268,7 +1269,15 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            let formatted = format_list_item(trimmed, in_list && last_line_opens_item(&output));
+            let after_item = in_list && !is_para_break && last_line_opens_item(&output);
+            let formatted = format_list_item(trimmed, after_item);
+            if !in_list {
+                nesting = ListNesting::default();
+            }
+            if starts_markdown_list_item(&formatted) {
+                let x = line.items.first().map_or(0.0, |i| i.x);
+                output.push_str(&" ".repeat(nesting.indent(x, &formatted)));
+            }
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
@@ -1391,7 +1400,39 @@ fn wraps_back(line_x: f32, prior_x: f32, base_size: f32) -> bool {
 /// Whether the last line of `output` opened a Markdown list item.
 fn last_line_opens_item(output: &str) -> bool {
     let text = output.trim_end_matches('\n');
-    starts_markdown_list_item(text.rsplit('\n').next().unwrap_or(text))
+    starts_markdown_list_item(text.rsplit('\n').next().unwrap_or(text).trim_start())
+}
+
+/// The open list's levels by where item markers start: an item further
+/// right than the one before is its child, one back at an earlier item's x
+/// returns to that level. Each level keeps its marker's x and Markdown
+/// marker width, which indents the levels inside it.
+#[derive(Default)]
+struct ListNesting {
+    levels: Vec<(f32, usize)>,
+}
+
+impl ListNesting {
+    /// The indentation, in spaces, of an item whose marker starts at `x`
+    /// and whose formatted line is `formatted`.
+    fn indent(&mut self, x: f32, formatted: &str) -> usize {
+        let digits = formatted.bytes().take_while(u8::is_ascii_digit).count();
+        // "- " or "12. "
+        let width = if digits == 0 { 2 } else { digits + 2 };
+        while self
+            .levels
+            .last()
+            .is_some_and(|&(level_x, _)| level_x > x + 5.0)
+        {
+            self.levels.pop();
+        }
+        match self.levels.last_mut() {
+            Some(level) if (level.0 - x).abs() <= 5.0 => level.1 = width,
+            _ => self.levels.push((x, width)),
+        }
+        let parents = self.levels.len() - 1;
+        self.levels[..parents].iter().map(|&(_, width)| width).sum()
+    }
 }
 
 /// Right edge of a line's text.
@@ -1430,14 +1471,13 @@ fn list_item_edges(lines: &[TextLine], idx: usize) -> Option<(f32, f32)> {
 }
 
 /// Whether a line continues the open list item, one the PDF wrapped: it
-/// follows within a few lines, is no leader line or thematic break and does
-/// not open a Markdown list item itself (`formatted` is its text with inline
-/// markup). At a hanging indent that is enough. At or left of the item's
-/// left edge — no hanging indent, or a label paragraph wrapping back to the
-/// margin by at most a first-line indent (further left is another column) —
-/// it must also follow without a paragraph break, after a full line: after
-/// a short one it starts the next paragraph ("3. Third" then "Interrupting
-/// paragraph").
+/// follows without a paragraph break, is no leader line or thematic break
+/// and does not open a Markdown list item itself (`formatted` is its text
+/// with inline markup). At a hanging indent that is enough. At or left of
+/// the item's left edge — no hanging indent, or a label paragraph wrapping
+/// back to the margin by at most a first-line indent (further left is
+/// another column) — it must also follow a full line: after a short one it
+/// starts the next paragraph ("3. Third" then "Interrupting paragraph").
 #[allow(clippy::too_many_arguments)]
 fn continues_list_item(
     list_x: f32,
@@ -1456,11 +1496,9 @@ fn continues_list_item(
     let opens_item =
         is_list_item(plain) && starts_markdown_list_item(&format_list_item(formatted, true));
     y_gap < base_size * 7.0
+        && !is_para_break
         && (hanging
-            || (line_x <= list_x + 5.0
-                && line_x >= list_x - 4.0 * base_size
-                && !is_para_break
-                && after_full_line))
+            || (line_x <= list_x + 5.0 && line_x >= list_x - 4.0 * base_size && after_full_line))
         && !opens_item
         && !is_thematic_break(plain)
         && !has_dot_leaders(plain)
@@ -1576,6 +1614,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
     let mut list_edges: Option<(f32, f32)> = None;
+    let mut nesting = ListNesting::default();
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
     let mut toc_suppress_page: Option<u32> = None;
@@ -1762,7 +1801,15 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            let formatted = format_list_item(trimmed, in_list && last_line_opens_item(&output));
+            let after_item = in_list && !is_para_break && last_line_opens_item(&output);
+            let formatted = format_list_item(trimmed, after_item);
+            if !in_list {
+                nesting = ListNesting::default();
+            }
+            if starts_markdown_list_item(&formatted) {
+                let x = line.items.first().map_or(0.0, |i| i.x);
+                output.push_str(&" ".repeat(nesting.indent(x, &formatted)));
+            }
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
@@ -1995,9 +2042,8 @@ mod tests {
 
     #[test]
     fn wrapped_list_items_rejoin() {
+        // A bullet item wrapped to a hanging indent, with a line-wrap hyphen.
         let lines = vec![
-            // A bullet item wrapped to a hanging indent, with a line-wrap
-            // hyphen.
             placed(
                 "• An item whose text runs all the way to the contrac-",
                 72.0,
@@ -2005,9 +2051,17 @@ mod tests {
                 460.0,
             ),
             placed("tion at the right margin.", 86.0, 686.0, 150.0),
-            // A label paragraph: first-line indent, wrapping back to the
-            // margin, then continuing with something that looks like a
-            // label but cannot open a list item.
+        ];
+        for md in both_converters(lines) {
+            assert_eq!(
+                md,
+                "- An item whose text runs all the way to the contraction at the right margin.\n"
+            );
+        }
+        // A label paragraph: first-line indent, wrapping back to the margin,
+        // then continuing with something that looks like a label but cannot
+        // open a list item.
+        let lines = vec![
             placed(
                 "(a) Арендатор обязуется вносить плату не позднее",
                 100.0,
@@ -2020,9 +2074,41 @@ mod tests {
         for md in both_converters(lines) {
             assert_eq!(
                 md,
-                "- An item whose text runs all the way to the contraction at the right margin.\n- (a) Арендатор обязуется вносить плату не позднее пятого числа каждого месяца, см. пункт (b).\n"
+                "- (a) Арендатор обязуется вносить плату не позднее пятого числа каждого месяца, см. пункт (b).\n"
             );
         }
+    }
+
+    #[test]
+    fn nested_items_indent_under_their_parent_marker() {
+        let lines = vec![
+            placed("1. Parent item", 72.0, 700.0, 120.0),
+            placed("a) Child one", 92.0, 686.0, 100.0),
+            placed("б) Второй потомок", 92.0, 672.0, 100.0),
+            placed("• Grandchild", 110.0, 658.0, 100.0),
+            placed("2. Next parent", 72.0, 644.0, 120.0),
+        ];
+        for md in both_converters(lines) {
+            assert_eq!(
+                md,
+                "1. Parent item\n   - a) Child one\n   - б) Второй потомок\n     - Grandchild\n2. Next parent\n"
+            );
+        }
+    }
+
+    #[test]
+    fn a_paragraph_gap_ends_a_list_item() {
+        // Not a continuation even at a hanging indent, and a capital label
+        // after the gap is an initial again.
+        let lines = vec![
+            placed("1. A contrac-", 72.0, 700.0, 460.0),
+            placed("tion follows here at a hanging indent.", 92.0, 650.0, 300.0),
+            placed("V. Putin signed the lease.", 72.0, 600.0, 300.0),
+        ];
+        let [md, _] = both_converters(lines);
+        assert!(!md.contains("contraction"), "{md}");
+        assert!(md.contains("\nV. Putin signed"), "{md}");
+        assert!(!md.contains("- V."), "{md}");
     }
 
     #[test]

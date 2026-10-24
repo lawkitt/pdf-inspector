@@ -747,8 +747,8 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
         // A word joined across the spans ("contrac" + "tion") has nothing
         // between them, and a list item's continuation at a hanging indent
         // stays in the item.
-        let continues_item = markdown_line_at(markdown, current_end)
-            .is_some_and(is_markdown_list_line)
+        let continues_item = next_top - current_bottom < median_height
+            && markdown_line_at(markdown, current_end).is_some_and(is_markdown_list_line)
             && line_left(current_end).is_some_and(|left| next_left > left + median_height * 0.5);
         if same_text_flow
             && separated
@@ -777,19 +777,27 @@ fn unique_markdown_span(markdown: &str, span_text: &str) -> Option<(usize, usize
         _ => return None,
     }
 
-    // A span whose line-end hyphen was joined away ("contrac-" in
-    // "contraction") matches without it.
-    let normalized = match strip_list_marker(span_text) {
-        Some(normalized) => normalized,
-        None => span_text
-            .strip_suffix('-')
-            .filter(|word| word.ends_with(char::is_alphabetic))?,
-    };
-    let matches: Vec<_> = markdown.match_indices(normalized).collect();
-    match matches.as_slice() {
-        [(start, matched)] => Some((*start, *start + matched.len())),
-        _ => None,
+    // The converter normalizes a list marker away, and a line-end hyphen
+    // may be joined away ("contrac-" in "contraction"); either or both.
+    let unmarked = strip_list_marker(span_text);
+    fn unhyphenated(text: &str) -> Option<&str> {
+        text.strip_suffix('-')
+            .filter(|word| word.ends_with(char::is_alphabetic))
     }
+    [
+        unmarked,
+        unhyphenated(span_text),
+        unmarked.and_then(unhyphenated),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|normalized| {
+        let matches: Vec<_> = markdown.match_indices(normalized).collect();
+        match matches.as_slice() {
+            [(start, matched)] => Some((*start, *start + matched.len())),
+            _ => None,
+        }
+    })
 }
 
 fn strip_list_marker(text: &str) -> Option<&str> {
@@ -1549,6 +1557,40 @@ mod tests {
             let recovered = preserve_ocr_line_breaks(&format!("{joined} {third}"), &page);
             assert_eq!(recovered, format!("{joined}\n\n{third}"));
         }
+    }
+
+    #[test]
+    fn line_break_recovery_survives_a_bullet_and_a_joined_hyphen_together() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("• This is a contrac-", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("tion clause.", 20.0, 24.0, 190.0, 34.0),
+                positioned_span("The next paragraph.", 10.0, 41.0, 190.0, 51.0),
+            ],
+            Some(0.9),
+        );
+        let recovered =
+            preserve_ocr_line_breaks("- This is a contraction clause. The next paragraph.", &page);
+        assert_eq!(
+            recovered,
+            "- This is a contraction clause.\n\nThe next paragraph."
+        );
+    }
+
+    #[test]
+    fn line_break_recovery_splits_an_indented_paragraph_after_a_list_item() {
+        // A paragraph-sized gap: not a hanging continuation.
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("• First item.", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("An indented paragraph.", 20.0, 41.0, 190.0, 51.0),
+            ],
+            Some(0.9),
+        );
+        let recovered = preserve_ocr_line_breaks("- First item. An indented paragraph.", &page);
+        assert_eq!(recovered, "- First item.\n\nAn indented paragraph.");
     }
 
     #[test]
