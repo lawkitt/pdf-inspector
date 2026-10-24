@@ -605,7 +605,7 @@ fn test_digit_only_text_runs_are_preserved_in_markdown() {
     let result = process_pdf_mem(&pdf).expect("convert PDF to markdown");
     assert_eq!(
         result.markdown.expect("markdown output").trim(),
-        "A) The total of 730 seats was approved.\nB) let log 2 = a\nC) Control: The total of 730 seats was approved. let log 2 = a"
+        "- A) The total of 730 seats was approved.\n- B) let log 2 = a\n- C) Control: The total of 730 seats was approved. let log 2 = a"
     );
 }
 
@@ -919,11 +919,11 @@ fn test_bullet_variations() {
         assert!(md.contains("- Item"), "Failed for: {}", bullet);
     }
 
-    // Markdown-compatible bullets stay as-is
+    // Markdown bullets normalize to the one marker the output uses
     let md_bullets = ["- Item", "* Item"];
     for bullet in &md_bullets {
         let md = to_markdown(bullet, MarkdownOptions::default());
-        assert!(md.contains(bullet), "Failed for: {}", bullet);
+        assert_eq!(md, "- Item\n", "Failed for: {}", bullet);
     }
 }
 

@@ -11,9 +11,12 @@ use super::analysis::{
     detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment,
     is_leader_continuation, is_toc_entry_line, is_toc_marker_heading, trailing_leader_dots,
 };
-use super::classify::{format_list_item, is_caption_line, is_list_item, starts_with_bullet_marker};
+use super::classify::{
+    format_list_item, is_caption_line, is_list_item, is_thematic_break, starts_markdown_list_item,
+    starts_with_bullet_marker,
+};
 use super::heading::classify_heading_sequences;
-use super::postprocess::clean_markdown;
+use super::postprocess::{clean_markdown, line_join_separator};
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
 use super::{item_is_in_chart_region, MarkdownOptions, CHART_SEPARATOR_PAD};
 
@@ -841,6 +844,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
+    let mut list_edges: Option<(f32, f32)> = None;
     // Code lines accumulate here and the fence is emitted only when the
     // block flushes with content — an empty ``` ``` pair can never appear.
     fn flush_code_block(output: &mut String, pending_code: &mut String) {
@@ -1238,11 +1242,27 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             output.push('\n');
             in_list = true;
             last_list_x = line.items.first().map(|i| i.x);
+            list_edges = list_item_edges(&lines, line_idx);
             continue;
         }
 
-        // Detect list items
-        if options.detect_lists && is_list_item(plain_trimmed) {
+        // Detect list items. A wrapped line of the open item that merely
+        // looks like a label ("(b)." ending its sentence) continues it.
+        let list_continuation = in_list
+            && match (last_list_x, line.items.first().map(|i| i.x)) {
+                (Some(list_x), Some(curr_x)) => continues_list_item(
+                    list_x,
+                    list_edges,
+                    curr_x,
+                    y_gap,
+                    is_para_break,
+                    base_size,
+                    plain_trimmed,
+                    trimmed,
+                ),
+                _ => false,
+            };
+        if options.detect_lists && is_list_item(plain_trimmed) && !list_continuation {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
@@ -1253,31 +1273,21 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             output.push('\n');
             in_list = true;
             last_list_x = line.items.first().map(|i| i.x);
+            list_edges = list_item_edges(&lines, line_idx);
             continue;
         } else if in_list {
-            // Check if this line is a continuation of the previous list item
-            // Continuations have similar X position and reasonable Y gap
-            let line_x = line.items.first().map(|i| i.x);
-            let is_continuation = if let (Some(list_x), Some(curr_x)) = (last_list_x, line_x) {
-                // Continuation criteria:
-                // 1. X is at or past the list text position
-                // 2. Y gap is not too large (max ~5 line heights)
-                // 3. Not a new list item
-                let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
-                let y_ok = y_gap < base_size * 7.0;
-                x_ok && y_ok && !is_list_item(plain_trimmed) && !has_dot_leaders(plain_trimmed)
-            } else {
-                false
-            };
-
-            if is_continuation {
-                // Append to previous list item with a space
+            if list_continuation {
+                // Append to the previous list item as a wrapped line
                 if output.ends_with('\n') {
                     output.pop();
-                    output.push(' ');
+                    let separator = line_join_separator(&output, true);
+                    output.push(separator);
                 }
                 output.push_str(trimmed);
                 output.push('\n');
+                if let Some((right, _)) = list_edges.as_mut() {
+                    *right = line_right(line);
+                }
                 continue;
             } else {
                 in_list = false;
@@ -1318,7 +1328,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if cur_dot_leaders || prev_had_dot_leaders {
                 output.push('\n');
             } else {
-                output.push(' ');
+                let separator =
+                    line_join_separator(&output, wraps_back(line_x, prior_x, base_size));
+                output.push(separator);
             }
         }
         output.push_str(trimmed);
@@ -1367,6 +1379,79 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
     // Clean up and post-process
     clean_markdown(output, &options)
+}
+
+/// Whether a line starting at `line_x` can be the wrap of a paragraph line
+/// starting at `prior_x`: at the same left edge, or left of it by at most a
+/// first-line indent. Lines of interleaved columns start elsewhere.
+fn wraps_back(line_x: f32, prior_x: f32, base_size: f32) -> bool {
+    line_x <= prior_x + 3.0 && line_x >= prior_x - 4.0 * base_size
+}
+
+/// Right edge of a line's text.
+fn line_right(line: &TextLine) -> f32 {
+    line.items
+        .iter()
+        .map(|item| item.x + item.width)
+        .fold(f32::MIN, f32::max)
+}
+
+/// For a list item starting at `lines[idx]`: its right edge, and where a
+/// full line in its column ends — the right edge of the widest nearby line
+/// on the page that starts near the item's left edge.
+fn list_item_edges(lines: &[TextLine], idx: usize) -> Option<(f32, f32)> {
+    let line = &lines[idx];
+    let x = line.items.first()?.x;
+    let right = line_right(line);
+    // Neighbours in reading order share the item's column; the whole page
+    // would bring in a spanning title or the other column.
+    const WINDOW: usize = 20;
+    let same_page = |other: &&TextLine| other.page == line.page;
+    let column_right = lines[idx.saturating_sub(WINDOW)..idx]
+        .iter()
+        .rev()
+        .take_while(same_page)
+        .chain(lines[idx..].iter().take(WINDOW).take_while(same_page))
+        .filter(|other| {
+            other
+                .items
+                .first()
+                .is_some_and(|first| first.x >= x - 5.0 && first.x <= x + 50.0)
+        })
+        .map(line_right)
+        .fold(right, f32::max);
+    Some((right, column_right))
+}
+
+/// Whether a line continues the open list item, one the PDF wrapped: it
+/// follows within a few lines, is no leader line or thematic break and does
+/// not open a Markdown list item itself (`formatted` is its text with inline
+/// markup). At a hanging indent that is enough. At or left of the item's
+/// left edge — no hanging indent, or a label paragraph wrapping back to the
+/// margin — it must also follow without a paragraph break, after a full
+/// line: after a short one it starts the next paragraph ("3. Third" then
+/// "Interrupting paragraph").
+#[allow(clippy::too_many_arguments)]
+fn continues_list_item(
+    list_x: f32,
+    edges: Option<(f32, f32)>,
+    line_x: f32,
+    y_gap: f32,
+    is_para_break: bool,
+    base_size: f32,
+    plain: &str,
+    formatted: &str,
+) -> bool {
+    let hanging = line_x > list_x + 5.0 && line_x <= list_x + 50.0;
+    let after_full_line = edges.is_none_or(|(right, column_right)| {
+        right >= column_right - 0.3 * (column_right - list_x.min(line_x))
+    });
+    let opens_item = is_list_item(plain) && starts_markdown_list_item(&format_list_item(formatted));
+    y_gap < base_size * 7.0
+        && (hanging || (line_x <= list_x + 5.0 && !is_para_break && after_full_line))
+        && !opens_item
+        && !is_thematic_break(plain)
+        && !has_dot_leaders(plain)
 }
 
 /// Convert text lines to markdown
@@ -1474,9 +1559,11 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
+    let mut prev_x = 0.0f32;
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
+    let mut list_edges: Option<(f32, f32)> = None;
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
     let mut toc_suppress_page: Option<u32> = None;
@@ -1524,6 +1611,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // Let the continuation check below decide if we're still in a list
         let prior_y = prev_y;
         prev_y = line.y;
+        let line_x = line.items.first().map(|i| i.x).unwrap_or(0.0);
+        let prior_x = prev_x;
+        prev_x = line_x;
 
         // Get text with optional bold/italic formatting
         let text = line.text_with_formatting(
@@ -1638,8 +1728,23 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
         }
 
-        // Detect list items
-        if options.detect_lists && is_list_item(plain_trimmed) {
+        // Detect list items. A wrapped line of the open item that merely
+        // looks like a label ("(b)." ending its sentence) continues it.
+        let list_continuation = in_list
+            && match (last_list_x, line.items.first().map(|i| i.x)) {
+                (Some(list_x), Some(curr_x)) => continues_list_item(
+                    list_x,
+                    list_edges,
+                    curr_x,
+                    y_gap,
+                    is_para_break,
+                    base_size,
+                    plain_trimmed,
+                    trimmed,
+                ),
+                _ => false,
+            };
+        if options.detect_lists && is_list_item(plain_trimmed) && !list_continuation {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
@@ -1650,30 +1755,21 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             output.push('\n');
             in_list = true;
             last_list_x = line.items.first().map(|i| i.x);
+            list_edges = list_item_edges(&lines, line_idx);
             continue;
         } else if in_list {
-            // Check if this line is a continuation of the previous list item
-            let line_x = line.items.first().map(|i| i.x);
-            let is_continuation = if let (Some(list_x), Some(curr_x)) = (last_list_x, line_x) {
-                // Continuation criteria:
-                // 1. X is at or past the list text position
-                // 2. Y gap is not too large (max ~5 line heights)
-                // 3. Not a new list item
-                let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
-                let y_ok = y_gap < base_size * 7.0;
-                x_ok && y_ok && !is_list_item(plain_trimmed) && !has_dot_leaders(plain_trimmed)
-            } else {
-                false
-            };
-
-            if is_continuation {
-                // Append to previous list item with a space
+            if list_continuation {
+                // Append to the previous list item as a wrapped line
                 if output.ends_with('\n') {
                     output.pop();
-                    output.push(' ');
+                    let separator = line_join_separator(&output, true);
+                    output.push(separator);
                 }
                 output.push_str(trimmed);
                 output.push('\n');
+                if let Some((right, _)) = list_edges.as_mut() {
+                    *right = line_right(line);
+                }
                 continue;
             } else {
                 in_list = false;
@@ -1696,7 +1792,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             if cur_dot_leaders || prev_had_dot_leaders {
                 output.push('\n');
             } else {
-                output.push(' ');
+                let separator =
+                    line_join_separator(&output, wraps_back(line_x, prior_x, base_size));
+                output.push(separator);
             }
         }
         output.push_str(trimmed);
@@ -1784,6 +1882,121 @@ mod tests {
         let mut item = make_item(text, page, None);
         item.y = y;
         make_line(vec![item])
+    }
+
+    /// A one-item line at `x`, `y` whose text ends at `x + width`.
+    fn placed(text: &str, x: f32, y: f32, width: f32) -> TextLine {
+        let mut item = make_item(text, 1, None);
+        item.x = x;
+        item.y = y;
+        item.width = width;
+        make_line(vec![item])
+    }
+
+    /// Both converters, which share the list and line-join rules.
+    fn both_converters(lines: Vec<TextLine>) -> [String; 2] {
+        [
+            to_markdown_from_lines_with_tables_and_images(
+                lines.clone(),
+                MarkdownOptions::default(),
+                HashMap::new(),
+                HashMap::new(),
+                &HashMap::new(),
+                &HashSet::new(),
+                None,
+            ),
+            to_markdown_from_lines(lines, MarkdownOptions::default()),
+        ]
+    }
+
+    #[test]
+    fn hyphen_at_a_paragraph_line_wrap_joins_the_word() {
+        for (first, second, joined) in [
+            (
+                "The parties agree that the term of the contrac-",
+                "tion clause is binding on both of them.",
+                "The parties agree that the term of the contraction clause is binding on both of them.",
+            ),
+            (
+                "Стороны пришли к соглашению и заключили дого-",
+                "вор аренды нежилого помещения на год.",
+                "Стороны пришли к соглашению и заключили договор аренды нежилого помещения на год.",
+            ),
+        ] {
+            let lines = vec![
+                placed(first, 72.0, 700.0, 460.0),
+                placed(second, 72.0, 686.0, 300.0),
+            ];
+            for md in both_converters(lines) {
+                assert_eq!(md, format!("{joined}\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn hyphen_before_a_line_elsewhere_stays_visible() {
+        // The second line starts in another column: interleaved text, not a
+        // wrap, so the old evidence-only rules apply ("com- real" stays).
+        let lines = vec![
+            placed("cap rates spreads steadily com-", 72.0, 700.0, 200.0),
+            placed("real estate cash streams.", 320.0, 686.0, 200.0),
+        ];
+        for md in both_converters(lines) {
+            assert!(md.contains("com- real"), "{md}");
+        }
+    }
+
+    #[test]
+    fn short_list_item_is_not_continued_by_the_next_paragraph() {
+        let lines = vec![
+            placed(
+                "A paragraph line that runs to the right margin of the column.",
+                72.0,
+                700.0,
+                460.0,
+            ),
+            placed("1.First numbered", 72.0, 686.0, 90.0),
+            placed("2.Второй пункт", 72.0, 672.0, 90.0),
+            placed("Interrupting paragraph between lists.", 72.0, 658.0, 180.0),
+        ];
+        for md in both_converters(lines) {
+            assert_eq!(
+                md,
+                "A paragraph line that runs to the right margin of the column.\n\n1. First numbered\n2. Второй пункт\n\nInterrupting paragraph between lists.\n"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_list_items_rejoin() {
+        let lines = vec![
+            // A bullet item wrapped to a hanging indent, with a line-wrap
+            // hyphen.
+            placed(
+                "• An item whose text runs all the way to the contrac-",
+                72.0,
+                700.0,
+                460.0,
+            ),
+            placed("tion at the right margin.", 86.0, 686.0, 150.0),
+            // A label paragraph: first-line indent, wrapping back to the
+            // margin, then continuing with something that looks like a
+            // label but cannot open a list item.
+            placed(
+                "(a) Арендатор обязуется вносить плату не позднее",
+                100.0,
+                672.0,
+                432.0,
+            ),
+            placed("пятого числа каждого месяца, см. пункт", 72.0, 658.0, 460.0),
+            placed("(b).", 72.0, 644.0, 20.0),
+        ];
+        for md in both_converters(lines) {
+            assert_eq!(
+                md,
+                "- An item whose text runs all the way to the contraction at the right margin.\n- (a) Арендатор обязуется вносить плату не позднее пятого числа каждого месяца, см. пункт (b).\n"
+            );
+        }
     }
 
     #[test]

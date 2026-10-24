@@ -1029,6 +1029,9 @@ fn canonical_table_text(text: &str) -> String {
         .join(" ")
 }
 
+/// Joins page Markdown into the document. Block spacing is normalized over
+/// the whole: an empty page adds no blank lines, and a list running across
+/// pages stays tight.
 fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers: bool) -> String {
     let mut document = String::new();
     for (index, page) in pages.iter().enumerate() {
@@ -1040,6 +1043,7 @@ fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers:
         }
         document.push_str(page.markdown.trim());
     }
+    let mut document = crate::markdown::normalize_block_spacing(&document);
     if !document.is_empty() {
         document.push('\n');
     }
@@ -1095,6 +1099,38 @@ pub enum OcrPipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assembled_pages_get_normalized_block_spacing() {
+        use crate::vision::{PageContentSource, PageProvenance, VisionTimings};
+        let page = |page_number: u32, markdown: &str| FusedPageMarkdown {
+            page_number,
+            markdown: markdown.to_string(),
+            provenance: PageProvenance {
+                page_number,
+                source: PageContentSource::Native,
+                ocr_model: None,
+                render_dpi: None,
+                ocr_confidence: None,
+                timings: VisionTimings::default(),
+                warnings: Vec::new(),
+                hosted_recommended: false,
+            },
+        };
+        // A skipped page adds no blank lines, and a list running across a
+        // page break stays one tight list (EN and RU).
+        let pages = [
+            page(1, "## Readable page one\n"),
+            page(2, ""),
+            page(3, "Условия:\n\n- первое\n- второе\n"),
+            page(4, "- третье\n- fourth\n"),
+        ];
+        assert_eq!(
+            assemble_document_markdown(&pages, false),
+            "## Readable page one\n\nУсловия:\n\n- первое\n- второе\n- третье\n- fourth\n"
+        );
+        assert_eq!(assemble_document_markdown(&[page(1, "")], false), "");
+    }
 
     #[test]
     fn chunk_size_scales_with_engine_concurrency() {

@@ -12,6 +12,8 @@ mod convert;
 mod furniture;
 mod heading;
 mod postprocess;
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+pub(crate) use postprocess::normalize_block_spacing;
 mod preprocess;
 
 pub use convert::to_markdown_from_lines;
