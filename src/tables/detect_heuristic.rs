@@ -1587,7 +1587,209 @@ fn detect_table_in_region(
         item_indices.len()
     );
 
-    Some(Table::new(columns, rows, cells, item_indices))
+    let mut table = Table::new(columns, rows, cells, item_indices);
+    let blocks = (table.kind == super::TableKind::Data)
+        .then(|| layout_block_rows(&cell_items, &table.rows, &table.cells))
+        .flatten();
+    if let Some((rows, cells)) = blocks {
+        debug!(
+            "  layout block: {} rows of lines in {} blocks",
+            table.rows.len(),
+            rows.len()
+        );
+        table.rows = rows;
+        table.cells = cells;
+        table.layout_block = true;
+    }
+    Some(table)
+}
+
+/// One line of a column in a table row: where it ends, and how wide its
+/// first word is, from the geometry of the row's items in that column.
+#[derive(Clone, Copy)]
+struct CellLine {
+    left: f32,
+    right: f32,
+    /// Width of the first word; `None` when a width is unknown.
+    first_word: Option<f32>,
+    font_size: f32,
+}
+
+impl CellLine {
+    fn of(items: &[&TextItem]) -> Option<Self> {
+        let first = items.iter().find(|item| !item.text.trim().is_empty())?;
+        let left = items
+            .iter()
+            .map(|item| item.x)
+            .fold(f32::INFINITY, f32::min);
+        let right = items
+            .iter()
+            .map(|item| item.x + item.width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        // The first word's share of its item's width, by characters.
+        let word = first
+            .text
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .count();
+        let first_word = items
+            .iter()
+            .all(|item| item.width > 0.0)
+            .then(|| first.width * word as f32 / first.text.chars().count() as f32);
+        Some(Self {
+            left,
+            right,
+            first_word,
+            font_size: first.font_size,
+        })
+    }
+}
+
+/// Caption filler: a cell holding nothing but the parentheses (or section
+/// signs, colons) a case caption draws between its two columns.
+fn is_caption_filler(cell: &str) -> bool {
+    cell.chars()
+        .all(|c| c.is_whitespace() || matches!(c, ')' | '§' | ':'))
+}
+
+/// A two-column layout block's rows (lawkitt/mdoc#504): a case caption
+/// ("ACME HEALTH | )" over "SYSTEMS, INC. | )") or a counsel block (names
+/// and addresses side by side, where one column has a line the other
+/// lacks). Its rows are a column's lines, not records, so each block of rows
+/// between caption filler rows and blank lines becomes one row whose cells
+/// keep each column's lines together: a space where a line wraps (it reaches
+/// the column's edge and the next line's first word would not fit after
+/// it), `<br>` between separate lines. Filler rows stay as they are. `None`
+/// for any other table.
+fn layout_block_rows(
+    cell_items: &[Vec<Vec<&TextItem>>],
+    rows: &[f32],
+    cells: &[Vec<String>],
+) -> Option<(Vec<f32>, Vec<Vec<String>>)> {
+    let columns = cells.first()?.len();
+    if !(2..=3).contains(&columns) || cells.len() < 3 || cell_items.len() != cells.len() {
+        return None;
+    }
+    let lines: Vec<Vec<Option<CellLine>>> = cell_items
+        .iter()
+        .map(|row| row.iter().map(|items| CellLine::of(items)).collect())
+        .collect();
+    // A column's lines all start at its left edge and stop short of its
+    // right one: the widest line of the block in any column measures it. A
+    // line run together with its caption parenthesis ("Smith, Individually
+    // and )") reaches past the column and measures nothing.
+    let left: Vec<f32> = (0..columns)
+        .map(|col| {
+            lines
+                .iter()
+                .filter_map(|row| row[col].map(|line| line.left))
+                .fold(f32::INFINITY, f32::min)
+        })
+        .collect();
+    let width = (0..columns)
+        .flat_map(|col| {
+            let left = left[col];
+            lines
+                .iter()
+                .zip(cells)
+                .filter(move |(_, texts)| !texts[col].trim().get(1..).unwrap_or("").contains(')'))
+                .filter_map(move |(row, _)| row[col].map(|line| line.right - left))
+        })
+        .fold(0.0_f32, f32::max);
+    let wraps = |row: usize, next: usize, col: usize| -> bool {
+        let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
+            return false;
+        };
+        let Some(word) = after.first_word else {
+            return false;
+        };
+        line.right + 0.25 * line.font_size + word > left[col] + width
+    };
+    let filled = |cell: &String| !cell.trim().is_empty() && !is_caption_filler(cell);
+    let parentheses = cells
+        .iter()
+        .flatten()
+        .filter(|cell| cell.trim_start().starts_with(')'))
+        .count();
+    let caption = parentheses >= 3 && parentheses * 2 >= cells.len();
+    // A counsel block: two text columns, where a line stands alone in its
+    // row without wrapping the line above it, more than once.
+    let counsel = || {
+        if columns != 2
+            || cells.iter().flatten().any(|cell| {
+                cell.chars().any(|c| c.is_ascii_digit()) && !cell.chars().any(char::is_alphabetic)
+            })
+        {
+            return false;
+        }
+        let alone = (1..cells.len())
+            .filter(|&row| {
+                let mut filled_cols = (0..columns).filter(|&col| filled(&cells[row][col]));
+                match (filled_cols.next(), filled_cols.next()) {
+                    (Some(col), None) => filled(&cells[row - 1][col]) && !wraps(row - 1, row, col),
+                    _ => false,
+                }
+            })
+            .count();
+        alone >= 2
+    };
+    if !caption && !counsel() {
+        return None;
+    }
+    // A blank line across every column ends a block too ("SIGNED by …"
+    // over a gap, then "Director | Director").
+    let mut pitches: Vec<f32> = rows
+        .windows(2)
+        .map(|pair| (pair[0] - pair[1]).abs())
+        .collect();
+    pitches.sort_by(f32::total_cmp);
+    let pitch = pitches.get(pitches.len() / 2).copied().unwrap_or(0.0);
+    let gap = |row: usize| (rows[row - 1] - rows[row]).abs() > 1.5 * pitch;
+    let mut block_rows = Vec::new();
+    let mut block_cells = Vec::new();
+    let mut row = 0;
+    while row < cells.len() {
+        if !cells[row].iter().any(filled) {
+            block_rows.push(rows[row]);
+            block_cells.push(cells[row].clone());
+            row += 1;
+            continue;
+        }
+        let start = row;
+        row += 1;
+        while row < cells.len() && cells[row].iter().any(filled) && !gap(row) {
+            row += 1;
+        }
+        let block: Vec<String> = (0..columns)
+            .map(|col| {
+                let kept: Vec<usize> = (start..row).filter(|&r| filled(&cells[r][col])).collect();
+                if kept.is_empty() {
+                    // A column of caption parentheses reads as one.
+                    return (start..row)
+                        .map(|r| cells[r][col].trim())
+                        .find(|cell| !cell.is_empty())
+                        .map(|cell| cell.split_whitespace().next().unwrap_or("").to_string())
+                        .unwrap_or_default();
+                }
+                let mut text = cells[kept[0]][col].clone();
+                for pair in kept.windows(2) {
+                    let (above, below) = (pair[0], pair[1]);
+                    text.push_str(if below == above + 1 && wraps(above, below, col) {
+                        " "
+                    } else {
+                        "<br>"
+                    });
+                    text.push_str(&cells[below][col]);
+                }
+                text
+            })
+            .collect();
+        block_rows.push(rows[start]);
+        block_cells.push(block);
+    }
+    Some((block_rows, block_cells))
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
@@ -4045,5 +4247,178 @@ mod tests {
             vec!["Section D".into(), "TBD".into()],
         ];
         assert!(!is_page_number_toc(&cells));
+    }
+}
+
+#[cfg(test)]
+mod layout_block_tests {
+    //! Two-column layout blocks (lawkitt/mdoc#504): a case caption and a
+    //! counsel block, in a 12 pt monospaced face (7.2 pt a character), the
+    //! left column at x = 72 and the right one at x = 324. Names are
+    //! invented.
+    use super::*;
+    use crate::tables::table_to_markdown;
+
+    const CHAR: f32 = 7.2;
+
+    fn item(text: &str, x: f32, y: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: text.chars().count() as f32 * CHAR,
+            height: 12.0,
+            font: "Courier".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: crate::types::ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    /// One item per non-empty cell, a row every 14 pt down from y = 700.
+    fn page(rows: &[(&str, &str)]) -> Vec<TextItem> {
+        let mut items = Vec::new();
+        for (index, (left, right)) in rows.iter().enumerate() {
+            let y = 700.0 - 14.0 * index as f32;
+            if !left.is_empty() {
+                items.push(item(left, 72.0, y));
+            }
+            if !right.is_empty() {
+                items.push(item(right, 324.0, y));
+            }
+        }
+        items
+    }
+
+    fn markdown(rows: &[(&str, &str)]) -> (Table, String) {
+        let tables = detect_tables(&page(rows), 12.0, false);
+        assert_eq!(tables.len(), 1, "one table: {tables:?}");
+        let table = tables.into_iter().next().unwrap();
+        let markdown = table_to_markdown(&table);
+        (table, markdown)
+    }
+
+    const CAPTION_AND_COUNSEL: &[(&str, &str)] = &[
+        ("", ")"),
+        (
+            "BRAMBLE & COVE TRADING CO., et al.,",
+            ") Case No. 31-4407 (XYZ)",
+        ),
+        ("", ")"),
+        ("MARGUERITE A. TALLOWAY, Trustee of", ")"),
+        ("the Bramble Creditor Trust,", ")"),
+        ("", ")"),
+        ("v.", ") Adv. Proc. No. 31-00912"),
+        ("", ")"),
+        ("NORTHWIND REGIONAL CARE HOLDING", ")"),
+        ("SERVICES, INC., OTTO K. FERRANT", ")"),
+        ("and LUCIA BRENNEMANN,", ")"),
+        ("", ")"),
+    ];
+
+    const COUNSEL: &[(&str, &str)] = &[
+        ("Imogen R. Castellane", "Theo B. Marchetti"),
+        ("", "Saoirse N. Abernathy"),
+        (
+            "Castellane & Hood LLP",
+            "Wren, Ashby, Pell & Quist, Haldane",
+        ),
+        ("410 Harbor Row", "Lindqvist LLP"),
+        ("", "88 Quarry Street"),
+        ("Port Avery, ZZ 00000", "Port Avery, ZZ 00001"),
+        (
+            "Attorneys for Northwind Regional",
+            "Counsel for the Trustee",
+        ),
+        ("Care Holding Services, Inc.", "and the Creditor Trust"),
+    ];
+
+    /// The counsel block's row: each column's lines kept together, a
+    /// wrapped name joined, and the two people in the right column apart.
+    const COUNSEL_ROW: &str = "|Imogen R. Castellane<br>Castellane & Hood LLP<br>410 Harbor Row<br>\
+        Port Avery, ZZ 00000<br>Attorneys for Northwind Regional Care Holding Services, Inc.\
+        |Theo B. Marchetti<br>Saoirse N. Abernathy<br>Wren, Ashby, Pell & Quist, Haldane Lindqvist LLP<br>\
+        88 Quarry Street<br>Port Avery, ZZ 00001<br>Counsel for the Trustee<br>and the Creditor Trust|";
+
+    #[test]
+    fn a_wrapped_caption_name_stays_in_one_cell() {
+        let (table, markdown) = markdown(CAPTION_AND_COUNSEL);
+        assert!(table.layout_block, "{markdown}");
+        assert!(
+            markdown.contains(
+                "|NORTHWIND REGIONAL CARE HOLDING SERVICES, INC., OTTO K. FERRANT and LUCIA BRENNEMANN,|)|"
+            ),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("|MARGUERITE A. TALLOWAY, Trustee of the Bramble Creditor Trust,|)|"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("|v.|) Adv. Proc. No. 31-00912|"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn a_counsel_block_keeps_each_column_and_each_person_apart() {
+        // Under a caption, and on its own.
+        let rows: Vec<(&str, &str)> = CAPTION_AND_COUNSEL.iter().chain(COUNSEL).copied().collect();
+        for rows in [&rows[..], COUNSEL] {
+            let (table, markdown) = markdown(rows);
+            assert!(table.layout_block, "{markdown}");
+            assert!(markdown.contains(COUNSEL_ROW), "{markdown}");
+        }
+    }
+
+    #[test]
+    fn rows_of_records_are_no_layout_block() {
+        let cells = |rows: &[(&str, &str)]| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|(left, right)| vec![left.to_string(), right.to_string()])
+                .collect()
+        };
+        let rows = [
+            ("Part", "Description"),
+            ("Bracket", "Steel bracket for the outer frame of"),
+            ("", "the housing"),
+            ("Gasket", "Rubber seal"),
+            ("Bolt", "Hex bolt"),
+        ];
+        let items = page(&rows);
+        let by_row: Vec<Vec<Vec<&TextItem>>> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let y = 700.0 - 14.0 * index as f32;
+                [72.0, 324.0]
+                    .iter()
+                    .map(|x| {
+                        items
+                            .iter()
+                            .filter(|item| item.y == y && item.x == *x)
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let ys: Vec<f32> = (0..rows.len()).map(|i| 700.0 - 14.0 * i as f32).collect();
+        assert!(layout_block_rows(&by_row, &ys, &cells(&rows)).is_none());
     }
 }

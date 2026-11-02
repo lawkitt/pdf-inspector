@@ -18,7 +18,7 @@ pub fn table_to_markdown(table: &Table) -> String {
     }
 
     // Clean up the table: merge continuation rows, extract footnotes, remove empty rows
-    let (cleaned_cells, footnotes) = clean_table_cells(&table.cells);
+    let (cleaned_cells, footnotes) = clean_table(table);
 
     if cleaned_cells.is_empty() {
         return String::new();
@@ -70,7 +70,7 @@ pub(crate) fn is_complete_data_table(table: &Table) -> bool {
         return false;
     }
 
-    let (cleaned_cells, _) = clean_table_cells(&table.cells);
+    let (cleaned_cells, _) = clean_table(table);
     cleaned_cells.len() >= 2 && cleaned_cells.first().is_some_and(|row| row.len() >= 2)
 }
 
@@ -291,8 +291,21 @@ fn ends_like_incomplete_phrase(cell: &str) -> bool {
         || lower.ends_with('/')
 }
 
+/// A table's cells cleaned up for formatting: a layout block's rows are
+/// whole blocks already, so none folds into the row above it.
+fn clean_table(table: &Table) -> (Vec<Vec<String>>, Vec<String>) {
+    clean_cells(&table.cells, !table.layout_block)
+}
+
 /// Clean up table cells: merge continuation rows, extract footnotes, remove empty rows
+#[cfg(test)]
 fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
+    clean_cells(cells, true)
+}
+
+/// Clean up table cells: extract footnotes, remove empty rows and, when
+/// `fold_continuations`, merge continuation rows into the row above.
+fn clean_cells(cells: &[Vec<String>], fold_continuations: bool) -> (Vec<Vec<String>>, Vec<String>) {
     let mut cleaned: Vec<Vec<String>> = Vec::new();
     let mut footnotes: Vec<String> = Vec::new();
 
@@ -461,7 +474,8 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && !looks_like_section_label_row
             && !is_short_subheader;
 
-        let is_continuation = is_classic_continuation || is_wrapped_continuation;
+        let is_continuation =
+            fold_continuations && (is_classic_continuation || is_wrapped_continuation);
 
         if is_continuation {
             // Merge with previous row
@@ -619,6 +633,37 @@ mod tests {
         assert_eq!(cleaned.len(), 2);
         assert!(cleaned[1][1].contains("Short"));
         assert!(cleaned[1][1].contains("continued text here"));
+    }
+
+    /// A layout block's rows (lawkitt/mdoc#504) never fold: a counsel
+    /// column's next attorney is no overflow of the one above, while the
+    /// same rows in an ordinary table still read as a continuation.
+    #[test]
+    fn layout_block_rows_are_not_folded() {
+        let cells = vec![
+            vec!["For the debtor".into(), "For the trustee".into()],
+            vec![
+                "Ida Fenwick<br>Fenwick & Rowe LLP".into(),
+                "Theo Marchetti".into(),
+            ],
+            vec!["".into(), "Saoirse Abernathy<br>Quist Lindqvist LLP".into()],
+        ];
+        let rows = vec![714.0, 700.0, 686.0];
+        let mut table = Table::new(vec![72.0, 324.0], rows, cells, vec![]);
+        let markdown = table_to_markdown(&table);
+        assert!(
+            markdown
+                .contains("|Ida Fenwick<br>Fenwick & Rowe LLP|Theo Marchetti Saoirse Abernathy"),
+            "an ordinary table folds the row: {markdown}"
+        );
+        table.layout_block = true;
+        let markdown = table_to_markdown(&table);
+        assert_eq!(
+            markdown,
+            "|For the debtor|For the trustee|\n|---|---|\n\
+             |Ida Fenwick<br>Fenwick & Rowe LLP|Theo Marchetti|\n\
+             ||Saoirse Abernathy<br>Quist Lindqvist LLP|\n"
+        );
     }
 
     #[test]
@@ -925,6 +970,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            layout_block: false,
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("|Name|"));
@@ -941,6 +987,7 @@ mod tests {
             cells: vec![vec!["Only".into(), "Row".into()]],
             item_indices: vec![],
             kind: TableKind::Data,
+            layout_block: false,
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("|Only|"));
@@ -958,6 +1005,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            layout_block: false,
         };
         assert!(is_complete_data_table(&complete));
 
@@ -978,6 +1026,7 @@ mod tests {
             cells: vec![],
             item_indices: vec![],
             kind: TableKind::Data,
+            layout_block: false,
         };
         assert_eq!(table_to_markdown(&table), "");
     }
@@ -994,6 +1043,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            layout_block: false,
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("(1) Footnote text"));
@@ -1010,6 +1060,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            layout_block: false,
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("名前"));
@@ -1024,6 +1075,7 @@ mod tests {
             cells: vec![vec![]],
             item_indices: vec![],
             kind: TableKind::Data,
+            layout_block: false,
         };
         assert_eq!(table_to_markdown(&table), "");
     }
