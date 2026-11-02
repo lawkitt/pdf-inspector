@@ -1647,6 +1647,19 @@ impl CellLine {
     }
 }
 
+/// Whether a line's words run on to the next line: it ends on a comma, an
+/// ampersand, a hyphen or a joining word, or the next line starts in lower
+/// case.
+fn runs_on(line: &str, next: &str) -> bool {
+    const JOINING: &[&str] = &["of", "and", "for", "the", "in", "at", "to", "by", "on"];
+    line.ends_with([',', '&', '-'])
+        || line
+            .rsplit(char::is_whitespace)
+            .next()
+            .is_some_and(|word| JOINING.contains(&word))
+        || next.starts_with(char::is_lowercase)
+}
+
 /// Caption filler: a cell holding nothing but the parentheses (or section
 /// signs, colons) a case caption draws between its two columns.
 fn is_caption_filler(cell: &str) -> bool {
@@ -1677,9 +1690,11 @@ fn layout_block_rows(
         .map(|row| row.iter().map(|items| CellLine::of(items)).collect())
         .collect();
     // A column's lines all start at its left edge and stop short of its
-    // right one: the widest line of the block in any column measures it. A
-    // line run together with its caption parenthesis ("Smith, Individually
-    // and )") reaches past the column and measures nothing.
+    // right one. The widest line of the block in any column measures it (a
+    // column cut short by the table's region keeps its full width), but no
+    // column reaches past the start of the next one when none of its lines
+    // does. A line run together with its caption parenthesis ("Smith,
+    // Individually and )") reaches past the column and measures nothing.
     let left: Vec<f32> = (0..columns)
         .map(|col| {
             lines
@@ -1688,16 +1703,47 @@ fn layout_block_rows(
                 .fold(f32::INFINITY, f32::min)
         })
         .collect();
+    let measured = |col: usize| {
+        lines
+            .iter()
+            .zip(cells)
+            .filter(move |(_, texts)| !texts[col].trim().get(1..).unwrap_or("").contains(')'))
+            .filter_map(move |(row, _)| row[col])
+    };
     let width = (0..columns)
         .flat_map(|col| {
             let left = left[col];
-            lines
-                .iter()
-                .zip(cells)
-                .filter(move |(_, texts)| !texts[col].trim().get(1..).unwrap_or("").contains(')'))
-                .filter_map(move |(row, _)| row[col].map(|line| line.right - left))
+            measured(col).map(move |line| line.right - left)
         })
         .fold(0.0_f32, f32::max);
+    let limit: Vec<f32> = (0..columns)
+        .map(|col| {
+            let own = left[col] + width;
+            match left.get(col + 1) {
+                Some(&next)
+                    if lines
+                        .iter()
+                        .all(|row| row[col].is_none_or(|l| l.right < next)) =>
+                {
+                    let space = measured(col)
+                        .map(|l| 0.25 * l.font_size)
+                        .fold(0.0, f32::max);
+                    own.min(next - space)
+                }
+                _ => own,
+            }
+        })
+        .collect();
+    // The widest line measures the column, so nothing fits after it by
+    // construction: it wraps by the geometry only when another line ends
+    // at the same edge, and otherwise only when its words run on ("Trustee
+    // of", "Scherer,", "the" over "estate"). A line that starts with a
+    // digit starts a new line ("123 Oak Road" under a firm's name).
+    let at_edge =
+        |line: &CellLine, col: usize| line.right - left[col] >= width - 0.5 * line.font_size;
+    let edge_lines = (0..columns)
+        .flat_map(|col| measured(col).filter(move |line| at_edge(line, col)))
+        .count();
     let wraps = |row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
@@ -1705,7 +1751,13 @@ fn layout_block_rows(
         let Some(word) = after.first_word else {
             return false;
         };
-        line.right + 0.25 * line.font_size + word > left[col] + width
+        let (text, following) = (cells[row][col].trim(), cells[next][col].trim());
+        if following.starts_with(|c: char| c.is_ascii_digit())
+            || line.right + 0.25 * line.font_size + word <= limit[col]
+        {
+            return false;
+        }
+        edge_lines >= 2 || !at_edge(&line, col) || runs_on(text, following)
     };
     let filled = |cell: &String| !cell.trim().is_empty() && !is_caption_filler(cell);
     let parentheses = cells
@@ -1714,8 +1766,9 @@ fn layout_block_rows(
         .filter(|cell| cell.trim_start().starts_with(')'))
         .count();
     let caption = parentheses >= 3 && parentheses * 2 >= cells.len();
-    // A counsel block: two text columns, where a line stands alone in its
-    // row without wrapping the line above it, more than once.
+    // A counsel block: two text columns, each with a line that stands alone
+    // in its row without wrapping the line above it, three such lines in
+    // all. Rows of records continue only their description column.
     let counsel = || {
         if columns != 2
             || cells.iter().flatten().any(|cell| {
@@ -1724,16 +1777,16 @@ fn layout_block_rows(
         {
             return false;
         }
-        let alone = (1..cells.len())
-            .filter(|&row| {
-                let mut filled_cols = (0..columns).filter(|&col| filled(&cells[row][col]));
-                match (filled_cols.next(), filled_cols.next()) {
-                    (Some(col), None) => filled(&cells[row - 1][col]) && !wraps(row - 1, row, col),
-                    _ => false,
+        let mut alone = [0; 2];
+        for row in 1..cells.len() {
+            let mut filled_cols = (0..columns).filter(|&col| filled(&cells[row][col]));
+            if let (Some(col), None) = (filled_cols.next(), filled_cols.next()) {
+                if filled(&cells[row - 1][col]) && !wraps(row - 1, row, col) {
+                    alone[col] += 1;
                 }
-            })
-            .count();
-        alone >= 2
+            }
+        }
+        alone.iter().all(|&count| count >= 1) && alone.iter().sum::<usize>() >= 3
     };
     if !caption && !counsel() {
         return None;
@@ -4293,6 +4346,10 @@ mod layout_block_tests {
 
     /// One item per non-empty cell, a row every 14 pt down from y = 700.
     fn page(rows: &[(&str, &str)]) -> Vec<TextItem> {
+        page_at(rows, 324.0)
+    }
+
+    fn page_at(rows: &[(&str, &str)], right_x: f32) -> Vec<TextItem> {
         let mut items = Vec::new();
         for (index, (left, right)) in rows.iter().enumerate() {
             let y = 700.0 - 14.0 * index as f32;
@@ -4300,10 +4357,36 @@ mod layout_block_tests {
                 items.push(item(left, 72.0, y));
             }
             if !right.is_empty() {
-                items.push(item(right, 324.0, y));
+                items.push(item(right, right_x, y));
             }
         }
         items
+    }
+
+    /// The rows as `layout_block_rows` reads them, one per line, and what it
+    /// makes of them.
+    fn blocks(rows: &[(&str, &str)], right_x: f32) -> Option<Vec<Vec<String>>> {
+        let items = page_at(rows, right_x);
+        let ys: Vec<f32> = (0..rows.len()).map(|i| 700.0 - 14.0 * i as f32).collect();
+        let grid: Vec<Vec<Vec<&TextItem>>> = ys
+            .iter()
+            .map(|&y| {
+                [72.0, right_x]
+                    .iter()
+                    .map(|&x| {
+                        items
+                            .iter()
+                            .filter(|item| item.y == y && item.x == x)
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let cells: Vec<Vec<String>> = rows
+            .iter()
+            .map(|(left, right)| vec![left.to_string(), right.to_string()])
+            .collect();
+        layout_block_rows(&grid, &ys, &cells).map(|(_, cells)| cells)
     }
 
     fn markdown(rows: &[(&str, &str)]) -> (Table, String) {
@@ -4337,11 +4420,12 @@ mod layout_block_tests {
         ("", "Saoirse N. Abernathy"),
         (
             "Castellane & Hood LLP",
-            "Wren, Ashby, Pell & Quist, Haldane",
+            "Wren, Ashby, Pell, Quist, Haldane,",
         ),
         ("410 Harbor Row", "Lindqvist LLP"),
         ("", "88 Quarry Street"),
         ("Port Avery, ZZ 00000", "Port Avery, ZZ 00001"),
+        ("Second Floor", ""),
         (
             "Attorneys for Northwind Regional",
             "Counsel for the Trustee",
@@ -4352,8 +4436,9 @@ mod layout_block_tests {
     /// The counsel block's row: each column's lines kept together, a
     /// wrapped name joined, and the two people in the right column apart.
     const COUNSEL_ROW: &str = "|Imogen R. Castellane<br>Castellane & Hood LLP<br>410 Harbor Row<br>\
-        Port Avery, ZZ 00000<br>Attorneys for Northwind Regional Care Holding Services, Inc.\
-        |Theo B. Marchetti<br>Saoirse N. Abernathy<br>Wren, Ashby, Pell & Quist, Haldane Lindqvist LLP<br>\
+        Port Avery, ZZ 00000<br>Second Floor<br>\
+        Attorneys for Northwind Regional Care Holding Services, Inc.\
+        |Theo B. Marchetti<br>Saoirse N. Abernathy<br>Wren, Ashby, Pell, Quist, Haldane, Lindqvist LLP<br>\
         88 Quarry Street<br>Port Avery, ZZ 00001<br>Counsel for the Trustee<br>and the Creditor Trust|";
 
     #[test]
@@ -4389,36 +4474,66 @@ mod layout_block_tests {
 
     #[test]
     fn rows_of_records_are_no_layout_block() {
-        let cells = |rows: &[(&str, &str)]| -> Vec<Vec<String>> {
-            rows.iter()
-                .map(|(left, right)| vec![left.to_string(), right.to_string()])
-                .collect()
-        };
+        // A description column that runs on to a second line, twice.
         let rows = [
             ("Part", "Description"),
-            ("Bracket", "Steel bracket for the outer frame of"),
-            ("", "the housing"),
+            ("Bracket", "Steel bracket"),
+            ("", "Powder coated"),
             ("Gasket", "Rubber seal"),
+            ("", "Heat resistant"),
+            ("Cover", "Protective outer housing panel"),
             ("Bolt", "Hex bolt"),
         ];
-        let items = page(&rows);
-        let by_row: Vec<Vec<Vec<&TextItem>>> = rows
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let y = 700.0 - 14.0 * index as f32;
-                [72.0, 324.0]
-                    .iter()
-                    .map(|x| {
-                        items
-                            .iter()
-                            .filter(|item| item.y == y && item.x == *x)
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-        let ys: Vec<f32> = (0..rows.len()).map(|i| 700.0 - 14.0 * i as f32).collect();
-        assert!(layout_block_rows(&by_row, &ys, &cells(&rows)).is_none());
+        assert_eq!(blocks(&rows, 324.0), None);
+    }
+
+    #[test]
+    fn a_line_that_starts_with_a_number_starts_a_new_line() {
+        // The firm's name is the block's widest line: nothing fits after it,
+        // yet its street address is a line of its own.
+        let rows = [
+            ("Ada Quill", "Bram Tolliver"),
+            ("", "Cass Ionescu"),
+            ("Fenwick, Cavendish & Bell LLP", "Tolliver & Ionescu"),
+            ("123 Oak Road", ""),
+            ("Port Avery", "77 Elm Street"),
+            ("", "Port Avery"),
+        ];
+        let cells = blocks(&rows, 324.0).expect("a counsel block");
+        assert_eq!(
+            cells,
+            vec![vec![
+                "Ada Quill<br>Fenwick, Cavendish & Bell LLP<br>123 Oak Road<br>Port Avery"
+                    .to_string(),
+                "Bram Tolliver<br>Cass Ionescu<br>Tolliver & Ionescu<br>77 Elm Street<br>Port Avery"
+                    .to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_narrow_column_wraps_at_the_next_column() {
+        // The right column's long firm name does not widen the left column,
+        // which ends where the right one starts.
+        let rows = [
+            ("Ada Quill", "Bram Tolliver"),
+            ("", "Cass Ionescu"),
+            ("Quill LLP", "Tolliver, Ionescu & Partners LLP"),
+            ("Port Avery", "Port Avery"),
+            ("Suite 4", ""),
+            ("Attorneys for Acme", "Counsel for the Receiver"),
+            ("Corporation", "and the Estate"),
+            ("", "Second Floor"),
+        ];
+        let cells = blocks(&rows, 216.0).expect("a counsel block");
+        assert_eq!(
+            cells[0][0],
+            "Ada Quill<br>Quill LLP<br>Port Avery<br>Suite 4<br>Attorneys for Acme Corporation"
+        );
+        assert_eq!(
+            cells[0][1],
+            "Bram Tolliver<br>Cass Ionescu<br>Tolliver, Ionescu & Partners LLP<br>Port Avery<br>\
+             Counsel for the Receiver<br>and the Estate<br>Second Floor"
+        );
     }
 }
