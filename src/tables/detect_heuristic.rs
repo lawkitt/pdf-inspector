@@ -1735,15 +1735,22 @@ fn layout_block_rows(
         })
         .collect();
     // The widest line measures the column, so nothing fits after it by
-    // construction: it wraps by the geometry only when another line ends
-    // at the same edge, and otherwise only when its words run on ("Trustee
+    // construction: it wraps by the geometry only when a third line ends at
+    // the same edge, and otherwise only when its words run on ("Trustee
     // of", "Scherer,", "the" over "estate"). A line that starts with a
     // digit starts a new line ("123 Oak Road" under a firm's name).
     let at_edge =
         |line: &CellLine, col: usize| line.right - left[col] >= width - 0.5 * line.font_size;
-    let edge_lines = (0..columns)
-        .flat_map(|col| measured(col).filter(move |line| at_edge(line, col)))
-        .count();
+    let edge: Vec<(usize, usize)> = (0..columns)
+        .flat_map(|col| {
+            let lines = &lines;
+            (0..cells.len()).filter_map(move |row| {
+                let line = lines[row][col]?;
+                let joined = cells[row][col].trim().get(1..).unwrap_or("").contains(')');
+                (!joined && at_edge(&line, col)).then_some((row, col))
+            })
+        })
+        .collect();
     let wraps = |row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
@@ -1757,40 +1764,53 @@ fn layout_block_rows(
         {
             return false;
         }
-        edge_lines >= 2 || !at_edge(&line, col) || runs_on(text, following)
+        let corroborated = edge
+            .iter()
+            .any(|&(r, c)| c != col || (r != row && r != next));
+        corroborated || !at_edge(&line, col) || runs_on(text, following)
     };
     let filled = |cell: &String| !cell.trim().is_empty() && !is_caption_filler(cell);
+    let parenthesis = |cell: &String| cell.trim_start().starts_with(')');
     let parentheses = cells
         .iter()
         .flatten()
-        .filter(|cell| cell.trim_start().starts_with(')'))
+        .filter(|cell| parenthesis(cell))
         .count();
     let caption = parentheses >= 3 && parentheses * 2 >= cells.len();
-    // A counsel block: two text columns, each with a line that stands alone
-    // in its row without wrapping the line above it, three such lines in
-    // all. Rows of records continue only their description column.
-    let counsel = || {
+    // A counsel block: two columns of names and addresses (words, not
+    // codes or numbers), each with a line that stands alone in its row
+    // without wrapping the line above it, three such lines in all. Rows of
+    // records continue only their description column, or hold single words.
+    let words = |cell: &str| cell.split_whitespace().count();
+    let counsel = |block: std::ops::Range<usize>| {
+        let texts: Vec<&str> = cells[block.clone()]
+            .iter()
+            .flatten()
+            .map(|cell| cell.trim())
+            .filter(|cell| !cell.is_empty())
+            .collect();
         if columns != 2
-            || cells.iter().flatten().any(|cell| {
+            || texts.iter().any(|cell| {
                 cell.chars().any(|c| c.is_ascii_digit()) && !cell.chars().any(char::is_alphabetic)
             })
+            || texts.iter().filter(|cell| words(cell) >= 2).count() * 5 < texts.len() * 4
         {
             return false;
         }
         let mut alone = [0; 2];
-        for row in 1..cells.len() {
+        for row in block.start + 1..block.end {
             let mut filled_cols = (0..columns).filter(|&col| filled(&cells[row][col]));
             if let (Some(col), None) = (filled_cols.next(), filled_cols.next()) {
-                if filled(&cells[row - 1][col]) && !wraps(row - 1, row, col) {
+                if filled(&cells[row - 1][col])
+                    && !wraps(row - 1, row, col)
+                    && words(&cells[row][col]) >= 2
+                {
                     alone[col] += 1;
                 }
             }
         }
         alone.iter().all(|&count| count >= 1) && alone.iter().sum::<usize>() >= 3
     };
-    if !caption && !counsel() {
-        return None;
-    }
     // A blank line across every column ends a block too ("SIGNED by …"
     // over a gap, then "Director | Director").
     let mut pitches: Vec<f32> = rows
@@ -1802,6 +1822,7 @@ fn layout_block_rows(
     let gap = |row: usize| (rows[row - 1] - rows[row]).abs() > 1.5 * pitch;
     let mut block_rows = Vec::new();
     let mut block_cells = Vec::new();
+    let mut joined_any = false;
     let mut row = 0;
     while row < cells.len() {
         if !cells[row].iter().any(filled) {
@@ -1815,6 +1836,15 @@ fn layout_block_rows(
         while row < cells.len() && cells[row].iter().any(filled) && !gap(row) {
             row += 1;
         }
+        // Only a block of a caption, or a counsel block, is one: any other
+        // keeps its rows.
+        let captioned = caption && cells[start..row].iter().flatten().any(parenthesis);
+        if !captioned && !counsel(start..row) {
+            block_rows.extend_from_slice(&rows[start..row]);
+            block_cells.extend_from_slice(&cells[start..row]);
+            continue;
+        }
+        joined_any = true;
         let block: Vec<String> = (0..columns)
             .map(|col| {
                 let kept: Vec<usize> = (start..row).filter(|&r| filled(&cells[r][col])).collect();
@@ -1841,6 +1871,9 @@ fn layout_block_rows(
             .collect();
         block_rows.push(rows[start]);
         block_cells.push(block);
+    }
+    if !joined_any {
+        return None;
     }
     Some((block_rows, block_cells))
 }
@@ -4349,15 +4382,25 @@ mod layout_block_tests {
         page_at(rows, 324.0)
     }
 
+    /// A row of `BLANK` is a blank line: no items, but the next row is a
+    /// line further down.
+    const BLANK: (&str, &str) = ("~", "~");
+
+    fn y(index: usize) -> f32 {
+        700.0 - 14.0 * index as f32
+    }
+
     fn page_at(rows: &[(&str, &str)], right_x: f32) -> Vec<TextItem> {
         let mut items = Vec::new();
-        for (index, (left, right)) in rows.iter().enumerate() {
-            let y = 700.0 - 14.0 * index as f32;
+        for (index, &(left, right)) in rows.iter().enumerate() {
+            if (left, right) == BLANK {
+                continue;
+            }
             if !left.is_empty() {
-                items.push(item(left, 72.0, y));
+                items.push(item(left, 72.0, y(index)));
             }
             if !right.is_empty() {
-                items.push(item(right, right_x, y));
+                items.push(item(right, right_x, y(index)));
             }
         }
         items
@@ -4367,7 +4410,12 @@ mod layout_block_tests {
     /// makes of them.
     fn blocks(rows: &[(&str, &str)], right_x: f32) -> Option<Vec<Vec<String>>> {
         let items = page_at(rows, right_x);
-        let ys: Vec<f32> = (0..rows.len()).map(|i| 700.0 - 14.0 * i as f32).collect();
+        let lines: Vec<(usize, &(&str, &str))> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, &row)| row != BLANK)
+            .collect();
+        let ys: Vec<f32> = lines.iter().map(|&(index, _)| y(index)).collect();
         let grid: Vec<Vec<Vec<&TextItem>>> = ys
             .iter()
             .map(|&y| {
@@ -4382,11 +4430,17 @@ mod layout_block_tests {
                     .collect()
             })
             .collect();
-        let cells: Vec<Vec<String>> = rows
+        let cells: Vec<Vec<String>> = lines
             .iter()
-            .map(|(left, right)| vec![left.to_string(), right.to_string()])
+            .map(|(_, (left, right))| vec![left.to_string(), right.to_string()])
             .collect();
         layout_block_rows(&grid, &ys, &cells).map(|(_, cells)| cells)
+    }
+
+    fn strings(rows: &[[&str; 2]]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .collect()
     }
 
     fn markdown(rows: &[(&str, &str)]) -> (Table, String) {
@@ -4534,6 +4588,72 @@ mod layout_block_tests {
             cells[0][1],
             "Bram Tolliver<br>Cass Ionescu<br>Tolliver, Ionescu & Partners LLP<br>Port Avery<br>\
              Counsel for the Receiver<br>and the Estate<br>Second Floor"
+        );
+    }
+
+    #[test]
+    fn rows_of_single_words_are_no_layout_block() {
+        let rows = [
+            ("Component description", "Processing status"),
+            ("Bracket", "Pending"),
+            ("", "Approved"),
+            ("Gasket", "Complete"),
+            ("Replacement", ""),
+            ("Cover", "Installed"),
+            ("", "Removed"),
+            ("Bolt", "Available"),
+        ];
+        assert_eq!(blocks(&rows, 324.0), None);
+    }
+
+    #[test]
+    fn a_table_after_a_caption_keeps_its_rows() {
+        let rows = [
+            ("ORRIN VALE and", ")"),
+            ("MIRA VALE,", ") Case No. 12-345"),
+            ("", ")"),
+            ("v.", ")"),
+            ("", ")"),
+            BLANK,
+            ("Item", "Quantity"),
+            ("Bracket", "10"),
+            ("Gasket", "20"),
+            ("Bolt", "30"),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[
+                ["ORRIN VALE and MIRA VALE,", ") Case No. 12-345"],
+                ["", ")"],
+                ["v.", ")"],
+                ["", ")"],
+                ["Item", "Quantity"],
+                ["Bracket", "10"],
+                ["Gasket", "20"],
+                ["Bolt", "30"],
+            ]))
+        );
+    }
+
+    #[test]
+    fn two_names_of_the_widest_width_stay_apart() {
+        // Both lines reach the edge they measure: nothing says the first
+        // runs on into the second.
+        let rows = [
+            ("Alexandra Morris", ")"),
+            ("Nathaniel Turner", ")"),
+            ("", ")"),
+            ("v.", ")"),
+            ("", ")"),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[
+                ["Alexandra Morris<br>Nathaniel Turner", ")"],
+                ["", ")"],
+                ["v.", ")"],
+                ["", ")"],
+            ]))
         );
     }
 }
