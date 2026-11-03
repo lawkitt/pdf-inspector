@@ -1788,8 +1788,10 @@ fn layout_block_rows(
         line.right - left[col] >= width(row) - 0.5 * line.font_size
     };
     // Whether the next line could continue this one: it does not start
-    // with a digit, is no address line of its own ("Wilmington, DE 19801"
-    // under a street), and its first word would not fit after this line.
+    // with a digit, is no numbered address line of its own ("Wilmington, DE
+    // 19801" under a street, "Suite 900"), does not put a street under a
+    // firm ("… Perretti LLP" over "Headquarters Plaza"), and its first word
+    // would not fit after this line.
     let may_wrap = |row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
@@ -1797,9 +1799,10 @@ fn layout_block_rows(
         let Some(word) = after.first_word else {
             return false;
         };
-        let following = cells[next][col].trim();
+        let (text, following) = (cells[row][col].trim(), cells[next][col].trim());
         !following.starts_with(|c: char| c.is_ascii_digit())
-            && !is_address_line(following)
+            && !is_numbered_address_line(following)
+            && !(ends_firm_name(text) && is_address_line(following))
             && line.right + 0.25 * line.font_size + word > limit(col, row)
     };
     // The wraps the text confirms at a block's edge, with how far each
@@ -1848,11 +1851,12 @@ fn layout_block_rows(
                     || (edge_reach - reach).abs() <= 0.5 * line.font_size)
         });
         // A role names its party, which runs on at the edge ("Attorneys for
-        // Avanti Corporate" over "Health Systems, Inc.").
+        // Avanti Corporate" over "Health Systems, Inc."), unless the next line
+        // is a role of its own. "Of Counsel" names no party.
         corroborated
             || !at_edge(&line, col, row)
             || runs_on(text, following)
-            || is_counsel_role(text)
+            || (names_a_party(text) && !is_counsel_role(following))
     };
     let parenthesis = |cell: &String| cell.trim_start().starts_with(')');
     let parentheses = cells
@@ -1968,6 +1972,18 @@ fn layout_block_rows(
 /// for Acme", "Of Counsel", "Solicitors for the Claimant". Whole words only:
 /// "Counsel formatting" is none.
 fn is_counsel_role(line: &str) -> bool {
+    counsel_role(line).is_some()
+}
+
+/// A role line that names the party it represents ("Attorneys for Avanti
+/// Corporate"), not a complete label ("Of Counsel").
+fn names_a_party(line: &str) -> bool {
+    counsel_role(line) == Some(true)
+}
+
+/// A counsel role in `line`: `Some(true)` for a role and the party it is
+/// for, `Some(false)` for "Of Counsel" at the line's end.
+fn counsel_role(line: &str) -> Option<bool> {
     const ROLES: &[&str] = &[
         "attorney",
         "attorneys",
@@ -1986,13 +2002,40 @@ fn is_counsel_role(line: &str) -> bool {
                 .to_lowercase()
         })
         .collect();
-    words.iter().enumerate().any(|(at, word)| {
+    words.iter().enumerate().find_map(|(at, word)| {
         // "co-counsel", "trial-attorneys": the role is the last part.
         let role = word.rsplit('-').next().unwrap_or("");
         let next = words.get(at + 1).map(String::as_str);
-        (ROLES.contains(&role) && next == Some("for"))
-            || (word == "of" && next == Some("counsel") && at + 2 == words.len())
+        if ROLES.contains(&role) && next == Some("for") {
+            Some(at + 2 < words.len())
+        } else if word == "of" && next == Some("counsel") && at + 2 == words.len() {
+            Some(false)
+        } else {
+            None
+        }
     })
+}
+
+/// A line that ends in a firm's or company's legal form ("Hyland &
+/// Perretti LLP", "Stevens & Lee, P.C.").
+fn ends_firm_name(line: &str) -> bool {
+    const FORMS: &[&str] = &[
+        "llp", "llc", "lp", "pc", "pllc", "pa", "inc", "ltd", "plc", "co", "corp", "gmbh",
+    ];
+    line.split_whitespace().last().is_some_and(|word| {
+        let form: String = word
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        FORMS.contains(&form.as_str())
+    })
+}
+
+/// An address line with a number in it: a street number, a numbered
+/// suite, floor or box, or a state and ZIP code.
+fn is_numbered_address_line(line: &str) -> bool {
+    is_address_line(line) && line.chars().any(|c| c.is_ascii_digit())
 }
 
 /// An address line: a street number, a name and a street word ("410
@@ -4787,6 +4830,48 @@ mod layout_block_tests {
     }
 
     #[test]
+    fn a_complete_role_label_names_no_party_to_run_on() {
+        // "Of Counsel" ends its line: the next attorney is apart.
+        let rows = [
+            ("Jonathan Robert Reed, Of Counsel", "Theo Marchetti"),
+            ("Martha Jane King", "Saoirse Abernathy"),
+            ("", "Quist Lindqvist LLP"),
+            ("Reed King LLP", "Counsel for the Trustee"),
+            ("Port Avery, ZZ 00000", ""),
+            ("Attorneys for Acme", ""),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[[
+                "Jonathan Robert Reed, Of Counsel<br>Martha Jane King<br>Reed King LLP<br>\
+                 Port Avery, ZZ 00000<br>Attorneys for Acme",
+                "Theo Marchetti<br>Saoirse Abernathy<br>Quist Lindqvist LLP<br>\
+                 Counsel for the Trustee",
+            ]]))
+        );
+    }
+
+    #[test]
+    fn a_wrapped_party_name_may_end_in_a_street_word() {
+        let rows = [
+            ("THE SHOPS AT", ")"),
+            ("HEADQUARTERS PLAZA,", ")"),
+            ("", ")"),
+            ("v.", ")"),
+            ("", ")"),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[
+                ["THE SHOPS AT HEADQUARTERS PLAZA,", ")"],
+                ["", ")"],
+                ["v.", ")"],
+                ["", ")"],
+            ]))
+        );
+    }
+
+    #[test]
     fn rows_of_records_are_no_layout_block() {
         // A description column that runs on to a second line, twice.
         let rows = [
@@ -5114,6 +5199,12 @@ mod layout_block_tests {
         ] {
             assert!(is_counsel_role(line), "{line}");
         }
+        assert!(names_a_party("Attorneys for Avanti Corporate"));
+        assert!(!names_a_party("Jonathan Robert Reed, Of Counsel"));
+        assert!(!names_a_party("Attorneys for"));
+        assert!(ends_firm_name("Hyland & Perretti LLP"));
+        assert!(ends_firm_name("Stevens & Lee, P.C."));
+        assert!(!ends_firm_name("THE SHOPS AT"));
         for line in [
             "Recounsel forms",
             "Counsel formatting",
