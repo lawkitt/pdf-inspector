@@ -1656,8 +1656,15 @@ fn runs_on(line: &str, next: &str) -> bool {
         || line
             .rsplit(char::is_whitespace)
             .next()
-            .is_some_and(|word| JOINING.contains(&word))
+            .is_some_and(|word| JOINING.contains(&word.to_lowercase().as_str()))
         || next.starts_with(char::is_lowercase)
+}
+
+/// Whether a line ends on "and", "or" or "&": a list that goes on.
+fn ends_on_conjunction(line: &str) -> bool {
+    line.rsplit(char::is_whitespace)
+        .next()
+        .is_some_and(|word| matches!(word.to_lowercase().as_str(), "and" | "or" | "&"))
 }
 
 /// Caption filler: a cell holding nothing but the parentheses (or section
@@ -1788,12 +1795,13 @@ fn layout_block_rows(
         line.right - left[col] >= width(row) - 0.5 * line.font_size
     };
     // Whether the next line could continue this one: it does not start
-    // with a digit, is no role line ("Local Counsel for …") and no address
-    // line of its own ("Wilmington, DE 19801" under a street, "Suite 900",
-    // "Second Floor"), puts no named street under a mixed-case line that
-    // does not run on ("… Perretti LLP" over "Headquarters Plaza", but "THE
-    // SHOPS AT" over "HEADQUARTERS PLAZA,"), and its first word would not
-    // fit after this line.
+    // with a digit, is no role line ("Local Counsel for …") unless this one
+    // ends on a conjunction ("Conflicts and" over "Bankruptcy Counsel for
+    // …"), is no address line of its own ("Wilmington, DE 19801"
+    // under a street, "Suite 900", "Second Floor"), puts no named street
+    // under a firm or a mixed-case line that does not run on ("… Perretti
+    // LLP" over "Headquarters Plaza", but "THE SHOPS AT" over "HEADQUARTERS
+    // PLAZA,"), and its first word would not fit after this line.
     let may_wrap = |row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
@@ -1802,11 +1810,12 @@ fn layout_block_rows(
             return false;
         };
         let (text, following) = (cells[row][col].trim(), cells[next][col].trim());
+        let run_on = runs_on(text, following);
         let caption_case = !text.chars().any(char::is_lowercase);
         !following.starts_with(|c: char| c.is_ascii_digit())
-            && !is_counsel_role(following)
+            && (ends_on_conjunction(text) || !is_counsel_role(following))
             && !is_own_address_line(following)
-            && !(is_address_line(following) && !caption_case && !runs_on(text, following))
+            && !(is_address_line(following) && !run_on && (!caption_case || ends_firm_name(text)))
             && line.right + 0.25 * line.font_size + word > limit(col, row)
     };
     // The wraps the text confirms at a block's edge, with how far each
@@ -2014,6 +2023,22 @@ fn counsel_role(line: &str) -> Option<bool> {
         } else {
             None
         }
+    })
+}
+
+/// A line that ends in a firm's or company's legal form ("Hyland &
+/// Perretti LLP", "STEVENS & LEE, P.C.").
+fn ends_firm_name(line: &str) -> bool {
+    const FORMS: &[&str] = &[
+        "llp", "llc", "lp", "pc", "pllc", "pa", "inc", "ltd", "plc", "corp", "gmbh",
+    ];
+    line.split_whitespace().last().is_some_and(|word| {
+        let form: String = word
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        FORMS.contains(&form.as_str())
     })
 }
 
@@ -4870,6 +4895,36 @@ mod layout_block_tests {
                  Counsel for Plaintiff Acme Inc.<br>Local Counsel for the Trustee",
                 "Theo Marchetti<br>Saoirse Abernathy<br>Quist Lindqvist LLP<br>\
                  Counsel for the Trustee",
+            ]]))
+        );
+    }
+
+    #[test]
+    fn a_role_label_or_a_party_may_wrap_onto_a_role_or_street_line() {
+        // A label that ends on "and" goes on into the role line; a party
+        // ending on title-case "At" goes on into its plaza; a capitals firm
+        // with a legal form does not.
+        let rows = [
+            ("Ida Fenwick", "Theo Marchetti"),
+            ("", "Saoirse Abernathy"),
+            ("FENWICK ROWE & ASSOCIATES LLP", "Quist Lindqvist LLP"),
+            ("HEADQUARTERS PLAZA", ""),
+            ("Port Avery, ZZ 00000", ""),
+            (
+                "Special Litigation, Conflicts and",
+                "Attorneys for The Shops At",
+            ),
+            ("Bankruptcy Counsel for the Trustee", "Headquarters Plaza"),
+            ("", "Second Floor"),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[[
+                "Ida Fenwick<br>FENWICK ROWE & ASSOCIATES LLP<br>HEADQUARTERS PLAZA<br>\
+                 Port Avery, ZZ 00000<br>\
+                 Special Litigation, Conflicts and Bankruptcy Counsel for the Trustee",
+                "Theo Marchetti<br>Saoirse Abernathy<br>Quist Lindqvist LLP<br>\
+                 Attorneys for The Shops At Headquarters Plaza<br>Second Floor",
             ]]))
         );
     }
