@@ -1692,11 +1692,39 @@ fn layout_block_rows(
         .iter()
         .map(|row| row.iter().map(|items| CellLine::of(items)).collect())
         .collect();
+    let filled = |cell: &String| !cell.trim().is_empty() && !is_caption_filler(cell);
+    // The blocks: runs of rows with a filled cell, between caption filler
+    // rows and blank lines. A blank line across every column ends a block
+    // too ("SIGNED by …" over a gap, then "Director | Director").
+    let mut pitches: Vec<f32> = rows
+        .windows(2)
+        .map(|pair| (pair[0] - pair[1]).abs())
+        .collect();
+    pitches.sort_by(f32::total_cmp);
+    let pitch = pitches.get(pitches.len() / 2).copied().unwrap_or(0.0);
+    let gap = |row: usize| (rows[row - 1] - rows[row]).abs() > 1.5 * pitch;
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut block_of: Vec<Option<usize>> = vec![None; cells.len()];
+    let mut row = 0;
+    while row < cells.len() {
+        if !cells[row].iter().any(filled) {
+            row += 1;
+            continue;
+        }
+        let start = row;
+        row += 1;
+        while row < cells.len() && cells[row].iter().any(filled) && !gap(row) {
+            row += 1;
+        }
+        block_of[start..row].fill(Some(spans.len()));
+        spans.push(start..row);
+    }
     // A column's lines all start at its left edge and stop short of its
-    // right one. The widest line of the block in any column measures it (a
-    // column cut short by the table's region keeps its full width), but no
-    // column reaches past the start of the next one when none of its lines
-    // does. A line run together with its caption parenthesis ("Smith,
+    // right one. The block's widest line in any column measures it (a
+    // column cut short by the table's region keeps its full width; another
+    // block's longer line says nothing about this block's), but no column
+    // reaches past the start of the next one when none of its lines does.
+    // A line run together with its caption parenthesis ("Smith,
     // Individually and )") reaches past the column and measures nothing.
     let left: Vec<f32> = (0..columns)
         .map(|col| {
@@ -1706,57 +1734,74 @@ fn layout_block_rows(
                 .fold(f32::INFINITY, f32::min)
         })
         .collect();
-    let measured = |col: usize| {
-        lines
-            .iter()
-            .zip(cells)
-            .filter(move |(_, texts)| !texts[col].trim().get(1..).unwrap_or("").contains(')'))
-            .filter_map(move |(row, _)| row[col])
+    let measured = |col: usize, row: usize| {
+        let line = lines[row][col]?;
+        (!cells[row][col].trim().get(1..).unwrap_or("").contains(')')).then_some(line)
     };
-    let width = (0..columns)
-        .flat_map(|col| {
-            let left = left[col];
-            measured(col).map(move |line| line.right - left)
-        })
-        .fold(0.0_f32, f32::max);
-    let limit: Vec<f32> = (0..columns)
-        .map(|col| {
-            let own = left[col] + width;
-            match left.get(col + 1) {
-                Some(&next)
-                    if lines
-                        .iter()
-                        .all(|row| row[col].is_none_or(|l| l.right < next)) =>
-                {
-                    let space = measured(col)
-                        .map(|l| 0.25 * l.font_size)
-                        .fold(0.0, f32::max);
-                    own.min(next - space)
+    let widest = |rows: std::ops::Range<usize>| {
+        let mut widest = 0.0_f32;
+        for row in rows {
+            for (col, &left) in left.iter().enumerate() {
+                if let Some(line) = measured(col, row) {
+                    widest = widest.max(line.right - left);
                 }
-                _ => own,
             }
+        }
+        widest
+    };
+    let table_width = widest(0..cells.len());
+    let block_width: Vec<f32> = spans
+        .iter()
+        .map(|span| {
+            Some(widest(span.clone()))
+                .filter(|&w| w > 0.0)
+                .unwrap_or(table_width)
         })
         .collect();
+    let width = |row: usize| block_of[row].map_or(table_width, |block| block_width[block]);
+    let cap: Vec<f32> = (0..columns)
+        .map(|col| match left.get(col + 1) {
+            Some(&next)
+                if lines
+                    .iter()
+                    .all(|row| row[col].is_none_or(|l| l.right < next)) =>
+            {
+                let space = (0..cells.len())
+                    .filter_map(|row| measured(col, row))
+                    .map(|l| 0.25 * l.font_size)
+                    .fold(0.0, f32::max);
+                next - space
+            }
+            _ => f32::INFINITY,
+        })
+        .collect();
+    let limit = |col: usize, row: usize| (left[col] + width(row)).min(cap[col]);
     // The widest line measures the column, so nothing fits after it by
-    // construction: it wraps by the geometry only when a third line ends at
-    // the same edge, and otherwise only when its words run on ("Trustee
-    // of", "Scherer,", "the" over "estate"). A line that starts with a
-    // digit starts a new line ("123 Oak Road" under a firm's name).
-    let at_edge =
-        |line: &CellLine, col: usize| line.right - left[col] >= width - 0.5 * line.font_size;
+    // construction: it wraps by the geometry only when another line at the
+    // same edge is a wrap its words confirm, and otherwise only when its
+    // own words run on ("Trustee of", "Scherer,", "the" over "estate"). A
+    // line that merely ends at the edge confirms nothing: names of one
+    // width ("Alexandra Morris", "Nathaniel Turner") all do. A line that
+    // starts with a digit starts a new line ("123 Oak Road" under a firm's
+    // name).
+    let at_edge = |line: &CellLine, col: usize, row: usize| {
+        line.right - left[col] >= width(row) - 0.5 * line.font_size
+    };
     let edge: Vec<(usize, usize)> = (0..columns)
         .flat_map(|col| {
             let lines = &lines;
             (0..cells.len()).filter_map(move |row| {
                 let line = lines[row][col]?;
                 let joined = cells[row][col].trim().get(1..).unwrap_or("").contains(')');
-                (!joined && at_edge(&line, col)).then_some((row, col))
+                let following = cells.get(row + 1)?[col].trim();
+                let confirmed = !following.is_empty()
+                    && !is_caption_filler(following)
+                    && runs_on(cells[row][col].trim(), following);
+                (!joined && confirmed && at_edge(&line, col, row)).then_some((row, col))
             })
         })
         .collect();
-    // Another line at the edge corroborates a wrap only within the same
-    // block: a later caption's name says nothing about this one.
-    let wraps = |block: &std::ops::Range<usize>, row: usize, next: usize, col: usize| -> bool {
+    let wraps = |row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
         };
@@ -1765,16 +1810,15 @@ fn layout_block_rows(
         };
         let (text, following) = (cells[row][col].trim(), cells[next][col].trim());
         if following.starts_with(|c: char| c.is_ascii_digit())
-            || line.right + 0.25 * line.font_size + word <= limit[col]
+            || line.right + 0.25 * line.font_size + word <= limit(col, row)
         {
             return false;
         }
         let corroborated = edge
             .iter()
-            .any(|&(r, c)| block.contains(&r) && (c != col || (r != row && r != next)));
-        corroborated || !at_edge(&line, col) || runs_on(text, following)
+            .any(|&(r, c)| c != col || (r != row && r != next));
+        corroborated || !at_edge(&line, col, row) || runs_on(text, following)
     };
-    let filled = |cell: &String| !cell.trim().is_empty() && !is_caption_filler(cell);
     let parenthesis = |cell: &String| cell.trim_start().starts_with(')');
     let parentheses = cells
         .iter()
@@ -1817,7 +1861,7 @@ fn layout_block_rows(
             let mut filled_cols = (0..columns).filter(|&col| filled(&cells[row][col]));
             if let (Some(col), None) = (filled_cols.next(), filled_cols.next()) {
                 if filled(&cells[row - 1][col])
-                    && !wraps(&block, row - 1, row, col)
+                    && !wraps(row - 1, row, col)
                     && words(&cells[row][col]) >= 2
                 {
                     alone[col] += 1;
@@ -1826,33 +1870,21 @@ fn layout_block_rows(
         }
         alone.iter().all(|&count| count >= 1) && alone.iter().sum::<usize>() >= 3
     };
-    // A blank line across every column ends a block too ("SIGNED by …"
-    // over a gap, then "Director | Director").
-    let mut pitches: Vec<f32> = rows
-        .windows(2)
-        .map(|pair| (pair[0] - pair[1]).abs())
-        .collect();
-    pitches.sort_by(f32::total_cmp);
-    let pitch = pitches.get(pitches.len() / 2).copied().unwrap_or(0.0);
-    let gap = |row: usize| (rows[row - 1] - rows[row]).abs() > 1.5 * pitch;
     let mut block_rows = Vec::new();
     let mut block_cells = Vec::new();
     let mut layout_rows = Vec::new();
     let mut joined_any = false;
     let mut row = 0;
     while row < cells.len() {
-        if !cells[row].iter().any(filled) {
+        let Some(block) = block_of[row] else {
             block_rows.push(rows[row]);
             block_cells.push(cells[row].clone());
             layout_rows.push(cells[row].iter().any(|cell| !cell.trim().is_empty()));
             row += 1;
             continue;
-        }
+        };
         let start = row;
-        row += 1;
-        while row < cells.len() && cells[row].iter().any(filled) && !gap(row) {
-            row += 1;
-        }
+        row = spans[block].end;
         // Only a block of a caption, or a counsel block, is one: any other
         // keeps its rows.
         let captioned = caption && cells[start..row].iter().flatten().any(parenthesis);
@@ -1862,7 +1894,6 @@ fn layout_block_rows(
             layout_rows.extend(std::iter::repeat_n(false, row - start));
             continue;
         }
-        let block = start..row;
         joined_any = true;
         let joined: Vec<String> = (0..columns)
             .map(|col| {
@@ -1878,7 +1909,7 @@ fn layout_block_rows(
                 let mut text = cells[kept[0]][col].clone();
                 for pair in kept.windows(2) {
                     let (above, below) = (pair[0], pair[1]);
-                    text.push_str(if below == above + 1 && wraps(&block, above, below, col) {
+                    text.push_str(if below == above + 1 && wraps(above, below, col) {
                         " "
                     } else {
                         "<br>"
@@ -1898,43 +1929,109 @@ fn layout_block_rows(
     Some((block_rows, block_cells, layout_rows))
 }
 
-/// A counsel block's role line: "Attorneys for the Debtor", "Counsel for
-/// Acme", "Of Counsel", "Solicitors for the Claimant".
+/// A counsel block's role line: "Attorneys for the Debtor", "Co-Counsel
+/// for Acme", "Of Counsel", "Solicitors for the Claimant". Whole words only:
+/// "Counsel formatting" is none.
 fn is_counsel_role(line: &str) -> bool {
     const ROLES: &[&str] = &[
-        "attorney for",
-        "attorneys for",
-        "counsel for",
-        "of counsel",
-        "solicitor for",
-        "solicitors for",
-        "barrister for",
-        "proctor for",
-        "proctors for",
+        "attorney",
+        "attorneys",
+        "counsel",
+        "solicitor",
+        "solicitors",
+        "barrister",
+        "barristers",
+        "proctor",
+        "proctors",
     ];
-    let lower = line.to_lowercase();
-    ROLES.iter().any(|role| {
-        lower.starts_with(role)
-            || lower
-                .match_indices(role)
-                .any(|(at, _)| lower[..at].ends_with(char::is_whitespace))
+    let words: Vec<String> = line
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .collect();
+    words.iter().enumerate().any(|(at, word)| {
+        // "co-counsel", "trial-attorneys": the role is the last part.
+        let role = word.rsplit('-').next().unwrap_or("");
+        let next = words.get(at + 1).map(String::as_str);
+        (ROLES.contains(&role) && next == Some("for"))
+            || (word == "of" && next == Some("counsel") && at + 2 == words.len())
     })
 }
 
-/// An address line: a street number and a name ("410 Harbor Row"), a
-/// suite, floor or post box, or a city ending in a US state and ZIP code
-/// ("Port Avery, ZZ 00000").
+/// An address line: a street number, a name and a street word ("410
+/// Harbor Row", "300 Delaware Avenue, Suite 800"), a numbered suite, floor
+/// or post box ("Suite 4", "Second Floor", "P.O. Box 12"), or a city
+/// ending in a US state and ZIP code ("Port Avery, ZZ 00000").
 fn is_address_line(line: &str) -> bool {
-    let mut words = line.split_whitespace();
-    let first = words.next().unwrap_or("");
-    let second = words.next().unwrap_or("");
-    let street_number = first.starts_with(|c: char| c.is_ascii_digit())
-        && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        && second.starts_with(char::is_alphabetic);
-    let lower = line.to_lowercase();
-    let unit = ["suite ", "ste. ", "p.o. box", "po box", "floor"]
-        .iter()
-        .any(|word| lower.starts_with(word) || lower.ends_with(word));
+    const STREETS: &[&str] = &[
+        "street",
+        "st",
+        "avenue",
+        "ave",
+        "road",
+        "rd",
+        "row",
+        "lane",
+        "ln",
+        "boulevard",
+        "blvd",
+        "drive",
+        "dr",
+        "place",
+        "pl",
+        "plaza",
+        "way",
+        "court",
+        "ct",
+        "square",
+        "sq",
+        "parkway",
+        "pkwy",
+        "highway",
+        "hwy",
+        "terrace",
+        "circle",
+        "alley",
+        "crescent",
+        "close",
+    ];
+    const ORDINALS: &[&str] = &[
+        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
+        "tenth", "eleventh", "twelfth", "ground", "upper", "lower", "top",
+    ];
+    let words: Vec<String> = line
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let numbered = |word: &str| word.starts_with(|c: char| c.is_ascii_digit());
+    let ordinal = |word: &str| {
+        ORDINALS.contains(&word)
+            || (numbered(word)
+                && ["st", "nd", "rd", "th"].iter().any(|end| {
+                    word.strip_suffix(end)
+                        .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+                }))
+    };
+    let street = words.len() >= 3
+        && numbered(&words[0])
+        && words[0]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && words[1].starts_with(char::is_alphabetic)
+        && words[2..]
+            .iter()
+            .any(|word| STREETS.contains(&word.as_str()));
+    let unit = words.windows(2).any(|pair| {
+        let (a, b) = (pair[0].as_str(), pair[1].as_str());
+        (matches!(a, "suite" | "ste" | "floor" | "box" | "unit") && numbered(b))
+            || (b == "floor" && ordinal(a))
+    });
     let tail: Vec<&str> = line.rsplitn(3, char::is_whitespace).collect();
     let zip = match tail.as_slice() {
         [code, state, ..] => {
@@ -1946,7 +2043,7 @@ fn is_address_line(line: &str) -> bool {
         }
         _ => false,
     };
-    street_number || unit || zip
+    street || unit || zip
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
@@ -4598,6 +4695,26 @@ mod layout_block_tests {
     }
 
     #[test]
+    fn a_counsel_block_without_addresses_has_its_roles() {
+        let rows = [
+            ("Ada Quill", "Bram Tolliver"),
+            ("Dana Hood", ""),
+            ("Quill Hood LLP", "Cass Ionescu"),
+            ("", "Tolliver Ionescu LLP"),
+            ("", "Wren Pell LLP"),
+            ("Co-Counsel for Acme", "Co-Counsel for the Estate"),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[[
+                "Ada Quill<br>Dana Hood<br>Quill Hood LLP<br>Co-Counsel for Acme",
+                "Bram Tolliver<br>Cass Ionescu<br>Tolliver Ionescu LLP<br>Wren Pell LLP<br>\
+                 Co-Counsel for the Estate",
+            ]]))
+        );
+    }
+
+    #[test]
     fn rows_of_records_are_no_layout_block() {
         // A description column that runs on to a second line, twice.
         let rows = [
@@ -4681,8 +4798,10 @@ mod layout_block_tests {
     fn a_sparse_table_of_phrases_is_no_counsel_block() {
         // Multi-word values, and lines alone in their row in both columns
         // that a wide header leaves room to wrap, but no role line and no
-        // address: a table, header and all.
-        let rows = [
+        // address: a table, header and all. Nor do phrases that only start
+        // like one ("Counsel formatting", "Floor coating", "10 Steel
+        // brackets").
+        let base = [
             (
                 "Component and part description",
                 "Processing status of the part",
@@ -4695,7 +4814,19 @@ mod layout_block_tests {
             ("", "Removed again"),
             ("Hex bolt", "Readily available"),
         ];
-        assert_eq!(blocks(&rows, 324.0), None);
+        let variants = [
+            None,
+            Some(("Counsel formatting", "Pending review")),
+            Some(("Floor covering", "Floor coating")),
+            Some(("10 Steel brackets", "20 Rubber gaskets")),
+        ];
+        for variant in variants {
+            let mut rows = base;
+            if let Some(row) = variant {
+                rows[1] = row;
+            }
+            assert_eq!(blocks(&rows, 324.0), None, "{variant:?}");
+        }
     }
 
     #[test]
@@ -4790,14 +4921,53 @@ mod layout_block_tests {
             ("", ")"),
             ("Alexandra Morrow", ")"),
         ];
+        for last in ["Alexandra Morrow", "Alexandra Morrow Jr."] {
+            // A wider line in the next block does not widen this block's
+            // column either.
+            let mut rows = rows;
+            rows[5].0 = last;
+            assert_eq!(
+                blocks(&rows, 324.0),
+                Some(strings(&[
+                    ["Alexandra Morris<br>Nathaniel Turner", ")"],
+                    ["", ")"],
+                    ["v.", ")"],
+                    ["", ")"],
+                    [last, ")"],
+                ])),
+                "{last}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_confirmed_wrap_in_another_block_corroborates_one_at_the_same_edge() {
+        // Both name lines reach the edge. The second's words run on ("…
+        // FERRANTELLO" over "and …"), so the column wraps there, and the
+        // first's next words ("Creditor Trust,") are its wrap too.
+        let rows = [
+            ("IMOGEN A. TALLOWAY, Trustee of FPA", ")"),
+            ("Creditor Trust,", ")"),
+            ("", ")"),
+            ("v.", ")"),
+            ("", ")"),
+            ("NORTHWIND REGIONAL CARE HEALTH", ")"),
+            ("SYSTEMS, INC., OTTO K. FERRANTELLO", ")"),
+            ("and LUCIA BRENNEMANN,", ")"),
+            ("", ")"),
+        ];
         assert_eq!(
             blocks(&rows, 324.0),
             Some(strings(&[
-                ["Alexandra Morris<br>Nathaniel Turner", ")"],
+                ["IMOGEN A. TALLOWAY, Trustee of FPA Creditor Trust,", ")"],
                 ["", ")"],
                 ["v.", ")"],
                 ["", ")"],
-                ["Alexandra Morrow", ")"],
+                [
+                    "NORTHWIND REGIONAL CARE HEALTH SYSTEMS, INC., OTTO K. FERRANTELLO and LUCIA BRENNEMANN,",
+                    ")"
+                ],
+                ["", ")"],
             ]))
         );
     }
@@ -4808,24 +4978,43 @@ mod layout_block_tests {
             "Attorneys for Acme",
             "Counsel for the Trustee",
             "Special Counsel for the Estate",
+            "Co-Counsel for Plaintiff",
             "Of Counsel",
         ] {
             assert!(is_counsel_role(line), "{line}");
         }
-        for line in ["Recounsel forms", "Pending review", "Counsel"] {
+        for line in [
+            "Recounsel forms",
+            "Counsel formatting",
+            "Pending review",
+            "Counsel",
+            "Of counsel fees",
+        ] {
             assert!(!is_counsel_role(line), "{line}");
         }
         for line in [
             "410 Harbor Row",
+            "300 Delaware Avenue, Suite 800",
+            "88 Quarry Street",
             "Port Avery, ZZ 00000",
             "Suite 4",
             "Second Floor",
+            "Floor 3",
             "P.O. Box 12",
             "Fenby, DE 19998-1234",
         ] {
             assert!(is_address_line(line), "{line}");
         }
-        for line in ["Steel bracket", "10", "Item 4", "Fully complete"] {
+        for line in [
+            "Steel bracket",
+            "10",
+            "Item 4",
+            "Fully complete",
+            "Floor covering",
+            "Floor coating",
+            "10 Steel brackets",
+            "20 Rubber gaskets",
+        ] {
             assert!(!is_address_line(line), "{line}");
         }
     }
