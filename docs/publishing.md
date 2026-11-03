@@ -1,5 +1,8 @@
 # Publishing
 
+> **lawkitt fork:** this fork does not publish. The publishing workflows below
+> were removed (see `docs/fork-ci.md`); this page describes upstream's process.
+
 Every pdf-inspector distribution uses one shared semantic version:
 
 - Rust crate: `pdf-inspector`
