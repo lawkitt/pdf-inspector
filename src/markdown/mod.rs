@@ -2592,7 +2592,7 @@ mod tests {
             cells: vec![],
             item_indices: (0..detection_items.len()).collect(),
             kind: crate::tables::TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         // Footer-only candidate: every item is furniture -> vetoed.

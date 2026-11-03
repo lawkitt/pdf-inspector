@@ -376,6 +376,9 @@ fn recover_unclaimed_header_row(table: &mut Table, items: &[TextItem], has_ragge
             .unwrap_or(top_row_y),
     );
     table.cells.insert(0, header_cells);
+    if !table.layout_rows.is_empty() {
+        table.layout_rows.insert(0, false);
+    }
     table.item_indices.extend(header_indices);
     table.item_indices.sort_unstable();
     table.item_indices.dedup();
