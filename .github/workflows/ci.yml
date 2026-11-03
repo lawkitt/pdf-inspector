@@ -1,3 +1,6 @@
+# lawkitt fork CI. Replaces upstream's ci.yml (Blacksmith runners and actions
+# this repository's Actions policy does not allow). Decisions, and what to do
+# when an upstream sync conflicts here: docs/fork-ci.md.
 name: CI
 
 on:
@@ -5,15 +8,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  # CI does not need test debug symbols. Disabling them trims link time and
-  # keeps the cross-platform Cargo caches substantially smaller.
+  # CI does not need test debug symbols; this trims link time and cache size.
   CARGO_PROFILE_TEST_DEBUG: 0
 
-# Superseded PR revisions provide no useful signal and otherwise compete with
-# the larger cross-platform matrix for runner and cache bandwidth.
+# Superseded PR revisions give no useful signal.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -22,63 +24,31 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
         with:
-          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
+          persist-credentials: false
+
+      # rustup is on every hosted runner; it installs the toolchain and
+      # components pinned in rust-toolchain.toml.
+      - name: Install Rust
+        shell: bash
+        run: rustup set profile minimal && rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: lint
 
       - name: Check package version sync
         run: python3 scripts/version.py --check
 
-      - name: Run tests
-        run: cargo test --verbose
-
-      - name: Test developer scripts
-        run: python3 -m unittest discover -s scripts/tests
-
-  fmt:
-    name: Format
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
-        with:
-          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
-          components: rustfmt
-
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-      - name: Check WASM formatting
-        run: cargo fmt --manifest-path wasm/Cargo.toml -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
-        with:
-          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
-          components: clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: clippy
 
       - name: Run default clippy
         run: cargo clippy -- -D warnings
@@ -86,88 +56,75 @@ jobs:
       - name: Run OCR clippy
         run: cargo clippy --features ocr -- -D warnings
 
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - os: macos-latest
-            runner: blacksmith-6vcpu-macos-15
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
-        with:
-          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
+        shell: bash
+        run: rustup set profile minimal && rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: build
+          key: test
 
-      - name: Build
-        run: cargo build --release --verbose
+      - name: Run tests
+        run: cargo test
 
+      - name: Test developer scripts
+        run: python3 -m unittest discover -s scripts/tests
+
+  # mdoc builds pdf-inspector with the ocr feature on macOS and Windows.
   ocr:
     name: OCR (${{ matrix.os }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            runner: blacksmith-8vcpu-ubuntu-2404
-          - os: macos-latest
-            runner: blacksmith-6vcpu-macos-15
-          - os: windows-latest
-            runner: blacksmith-8vcpu-windows-2025
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
-        with:
-          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
+        shell: bash
+        run: rustup set profile minimal && rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: ocr-${{ matrix.os }}
+          key: ocr
 
       - name: Test optional OCR feature
         run: cargo test --features ocr
 
+  # Real PDFium + ONNX Runtime + model run. Upstream's Node and Python binding
+  # steps are left out: mdoc does not use the bindings (docs/fork-ci.md).
   ocr-runtime:
     name: OCR runtime smoke
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
-        with:
-          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: latest
+        shell: bash
+        run: rustup set profile minimal && rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ocr-runtime
-          workspaces: |
-            . -> target
-            napi -> target
 
       - name: Install PDFium
         shell: bash
@@ -250,97 +207,3 @@ jobs:
         run: |
           export PDF_INSPECTOR_OCR_TEST_MODELS="$PDF_INSPECTOR_MODEL_CACHE/pp-ocrv6-small/oar-ocr-v0.7.0"
           cargo test --features ocr --test ocr_tests -- --nocapture
-
-      # The bindings use independent Cargo target directories. Build them at
-      # the same time so this smoke job is bounded by the slower binding build
-      # instead of paying for both release builds serially.
-      - name: Build Node and Python bindings
-        shell: bash
-        run: |
-          (
-            cd napi
-            bun install --frozen-lockfile
-            bunx napi build --platform --release
-          ) &
-          node_build_pid=$!
-
-          python -m pip install 'maturin>=1,<2'
-          maturin build --release --out "$RUNNER_TEMP/python-wheels"
-
-          wait "$node_build_pid"
-          python -m pip install "$RUNNER_TEMP"/python-wheels/*.whl
-
-      - name: Run Node OCR binding
-        shell: bash
-        run: |
-          node --input-type=module - <<'JS'
-          import { readFileSync } from 'node:fs'
-          import { processPdfWithOcr } from './napi/index.js'
-
-          const pdf = readFileSync('tests/fixtures/scan_with_native_header_text.pdf')
-          const result = await processPdfWithOcr(pdf, { offline: true })
-          if (JSON.stringify(result.pagesRoutedToOcr) !== '[1]') throw new Error('unexpected OCR route')
-          if (result.pagesRecommendingHosted.length !== 0) throw new Error('unexpected hosted recommendation')
-          if (!['Ocr', 'Fused'].includes(result.pages[0].provenance.source)) throw new Error('unexpected source')
-          if (!result.pages[0].markdown.trim()) throw new Error('empty OCR markdown')
-          JS
-
-      - name: Run Python OCR binding
-        shell: bash
-        run: |
-          python - <<'PY'
-          import pdf_inspector
-
-          result = pdf_inspector.process_pdf_with_ocr(
-              "tests/fixtures/scan_with_native_header_text.pdf",
-              offline=True,
-          )
-          assert result.pages_routed_to_ocr == [1]
-          assert result.pages_recommending_hosted == []
-          assert result.pages[0].provenance.source in {"ocr", "fused"}
-          assert result.pages[0].markdown.strip()
-          PY
-
-      # The wheel installed above is the release build of the Python bindings,
-      # so the binding test suite runs here instead of paying for a second
-      # release build in its own job.
-      - name: Run Python binding tests
-        shell: bash
-        run: |
-          python -m pip install 'pytest>=8,<10'
-          python -m pytest tests/test_python.py -q
-
-  wasm:
-    name: WebAssembly
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
-        with:
-          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
-          targets: wasm32-unknown-unknown
-          components: clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: |
-            wasm -> target
-          shared-key: wasm
-
-      - name: Check WebAssembly bindings
-        run: cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
-
-      - name: Check root package for WebAssembly
-        run: cargo check --target wasm32-unknown-unknown
-
-      - name: Lint WebAssembly bindings
-        run: cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
-
-      - name: Install wasm-pack
-        run: cargo install wasm-pack --version 0.15.0 --locked
-
-      - name: Test WebAssembly package
-        run: wasm-pack test --node --release wasm

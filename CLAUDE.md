@@ -64,6 +64,7 @@ src/
 - **Integration tests**: `tests/integration_tests.rs` with fixture PDFs in `tests/fixtures/`.
 - **Regression suite**: sibling repo `pdf-evals` with ~200 snapshot PDFs. Run `cargo build --release` then `bench.py test` in that repo before committing. While iterating, prefer a subset run (`bench.py test -q` for the quick set, or `-s <name>` for a named test set) and save the full `bench.py test` for the final pre-commit check.
 - **Semantic quality**: run `bench.py score` in `pdf-evals` for the semantic verdict (TEDS + MHS + reading order + char/word + list preservation, composited). Character-level diff alone misclassifies structural improvements (e.g., column-detection rewrites) as regressions — `score` is the tie-breaker. See `pdf-evals/CLAUDE.md` "Semantic scoring".
+- **CI (lawkitt fork)**: `.github/workflows/ci.yml` is fork-owned (hosted runners, no third-party setup actions, no publishing). See `docs/fork-ci.md` before editing workflows or syncing upstream.
 
 ## Debugging
 
