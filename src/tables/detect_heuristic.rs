@@ -1651,20 +1651,28 @@ impl CellLine {
 /// ampersand, a hyphen or a joining word, or the next line starts in lower
 /// case.
 fn runs_on(line: &str, next: &str) -> bool {
-    const JOINING: &[&str] = &["of", "and", "for", "the", "in", "at", "to", "by", "on"];
+    const JOINING: &[&str] = &[
+        "of", "and", "or", "for", "the", "in", "at", "to", "by", "on",
+    ];
     line.ends_with([',', '&', '-'])
-        || line
-            .rsplit(char::is_whitespace)
-            .next()
-            .is_some_and(|word| JOINING.contains(&word.to_lowercase().as_str()))
+        || last_word(line).is_some_and(|word| JOINING.contains(&word.as_str()))
         || next.starts_with(char::is_lowercase)
+}
+
+/// A line's last word in lower case, unless it is a state or province
+/// code after a city ("Klamath Falls, OR", "Toronto, ON").
+fn last_word(line: &str) -> Option<String> {
+    let mut words = line.split_whitespace().rev();
+    let last = words.next()?;
+    let state = last.len() == 2
+        && last.chars().all(|c| c.is_ascii_uppercase())
+        && words.next().is_some_and(|before| before.ends_with(','));
+    (!state).then(|| last.to_lowercase())
 }
 
 /// Whether a line ends on "and", "or" or "&": a list that goes on.
 fn ends_on_conjunction(line: &str) -> bool {
-    line.rsplit(char::is_whitespace)
-        .next()
-        .is_some_and(|word| matches!(word.to_lowercase().as_str(), "and" | "or" | "&"))
+    last_word(line).is_some_and(|word| matches!(word.as_str(), "and" | "or" | "&"))
 }
 
 /// Caption filler: a cell holding nothing but the parentheses (or section
@@ -4927,6 +4935,33 @@ mod layout_block_tests {
                  Attorneys for The Shops At Headquarters Plaza<br>Second Floor",
             ]]))
         );
+    }
+
+    #[test]
+    fn or_carries_a_label_on_but_a_state_code_does_not() {
+        let rows = [
+            ("Ida Fenwick", "Theo Marchetti"),
+            ("", "Saoirse Abernathy"),
+            ("Fenwick Rowe LLP", "Quist Lindqvist LLP"),
+            ("123 Oak Road", ""),
+            ("Klamath Falls, OR", ""),
+            ("Counsel for Acme", ""),
+            ("Special Litigation, Conflicts or", "Counsel for the Estate"),
+            ("Counsel for the Trustee", ""),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[[
+                "Ida Fenwick<br>Fenwick Rowe LLP<br>123 Oak Road<br>Klamath Falls, OR<br>\
+                 Counsel for Acme<br>Special Litigation, Conflicts or Counsel for the Trustee",
+                "Theo Marchetti<br>Saoirse Abernathy<br>Quist Lindqvist LLP<br>\
+                 Counsel for the Estate",
+            ]]))
+        );
+        assert!(!runs_on("Klamath Falls, OR", "Counsel for Acme"));
+        assert!(!ends_on_conjunction("Klamath Falls, OR"));
+        assert!(ends_on_conjunction("Special Litigation, Conflicts or"));
+        assert!(runs_on("THE SHOPS AT", "HEADQUARTERS PLAZA,"));
     }
 
     #[test]
