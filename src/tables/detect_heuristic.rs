@@ -1788,10 +1788,12 @@ fn layout_block_rows(
         line.right - left[col] >= width(row) - 0.5 * line.font_size
     };
     // Whether the next line could continue this one: it does not start
-    // with a digit, is no numbered address line of its own ("Wilmington, DE
-    // 19801" under a street, "Suite 900"), does not put a street under a
-    // firm ("… Perretti LLP" over "Headquarters Plaza"), and its first word
-    // would not fit after this line.
+    // with a digit, is no role line ("Local Counsel for …") and no address
+    // line of its own ("Wilmington, DE 19801" under a street, "Suite 900",
+    // "Second Floor"), puts no named street under a mixed-case line that
+    // does not run on ("… Perretti LLP" over "Headquarters Plaza", but "THE
+    // SHOPS AT" over "HEADQUARTERS PLAZA,"), and its first word would not
+    // fit after this line.
     let may_wrap = |row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
@@ -1800,9 +1802,11 @@ fn layout_block_rows(
             return false;
         };
         let (text, following) = (cells[row][col].trim(), cells[next][col].trim());
+        let caption_case = !text.chars().any(char::is_lowercase);
         !following.starts_with(|c: char| c.is_ascii_digit())
-            && !is_numbered_address_line(following)
-            && !(ends_firm_name(text) && is_address_line(following))
+            && !is_counsel_role(following)
+            && !is_own_address_line(following)
+            && !(is_address_line(following) && !caption_case && !runs_on(text, following))
             && line.right + 0.25 * line.font_size + word > limit(col, row)
     };
     // The wraps the text confirms at a block's edge, with how far each
@@ -1851,12 +1855,9 @@ fn layout_block_rows(
                     || (edge_reach - reach).abs() <= 0.5 * line.font_size)
         });
         // A role names its party, which runs on at the edge ("Attorneys for
-        // Avanti Corporate" over "Health Systems, Inc."), unless the next line
-        // is a role of its own. "Of Counsel" names no party.
-        corroborated
-            || !at_edge(&line, col, row)
-            || runs_on(text, following)
-            || (names_a_party(text) && !is_counsel_role(following))
+        // Avanti Corporate" over "Health Systems, Inc."). "Of Counsel" names
+        // no party.
+        corroborated || !at_edge(&line, col, row) || runs_on(text, following) || names_a_party(text)
     };
     let parenthesis = |cell: &String| cell.trim_start().starts_with(')');
     let parentheses = cells
@@ -2016,26 +2017,11 @@ fn counsel_role(line: &str) -> Option<bool> {
     })
 }
 
-/// A line that ends in a firm's or company's legal form ("Hyland &
-/// Perretti LLP", "Stevens & Lee, P.C.").
-fn ends_firm_name(line: &str) -> bool {
-    const FORMS: &[&str] = &[
-        "llp", "llc", "lp", "pc", "pllc", "pa", "inc", "ltd", "plc", "co", "corp", "gmbh",
-    ];
-    line.split_whitespace().last().is_some_and(|word| {
-        let form: String = word
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect::<String>()
-            .to_lowercase();
-        FORMS.contains(&form.as_str())
-    })
-}
-
-/// An address line with a number in it: a street number, a numbered
-/// suite, floor or box, or a state and ZIP code.
-fn is_numbered_address_line(line: &str) -> bool {
-    is_address_line(line) && line.chars().any(|c| c.is_ascii_digit())
+/// An address line that is a line of its own in any context: a street
+/// number, a suite, floor or box, or a state and ZIP code. A named street
+/// alone ("Headquarters Plaza") may also end a wrapped name.
+fn is_own_address_line(line: &str) -> bool {
+    address_line(line) == Some(true)
 }
 
 /// An address line: a street number, a name and a street word ("410
@@ -2045,6 +2031,12 @@ fn is_numbered_address_line(line: &str) -> bool {
 /// 12"), or a city ending in a US state and ZIP code ("Port Avery, ZZ
 /// 00000").
 fn is_address_line(line: &str) -> bool {
+    address_line(line).is_some()
+}
+
+/// The address line `line` is, if any: `Some(false)` for a named street
+/// alone, `Some(true)` for any other.
+fn address_line(line: &str) -> Option<bool> {
     const STREETS: &[&str] = &[
         "street",
         "st",
@@ -2131,7 +2123,11 @@ fn is_address_line(line: &str) -> bool {
         }
         _ => false,
     };
-    street || named_street || unit || zip
+    if street || unit || zip {
+        Some(true)
+    } else {
+        named_street.then_some(false)
+    }
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
@@ -4852,6 +4848,33 @@ mod layout_block_tests {
     }
 
     #[test]
+    fn a_role_or_an_address_line_never_continues_the_line_above() {
+        // Each next line's first word would not fit, yet a plaza under a
+        // firm, a floor under a city, and a role under a role are lines of
+        // their own.
+        let rows = [
+            ("Ida Fenwick", "Theo Marchetti"),
+            ("", "Saoirse Abernathy"),
+            ("Fenwick Rowe & Associates", "Quist Lindqvist LLP"),
+            ("Headquarters Plaza", ""),
+            ("King of Prussia, PA 19406", ""),
+            ("Second Floor", ""),
+            ("Counsel for Plaintiff Acme Inc.", "Counsel for the Trustee"),
+            ("Local Counsel for the Trustee", ""),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[[
+                "Ida Fenwick<br>Fenwick Rowe & Associates<br>Headquarters Plaza<br>\
+                 King of Prussia, PA 19406<br>Second Floor<br>\
+                 Counsel for Plaintiff Acme Inc.<br>Local Counsel for the Trustee",
+                "Theo Marchetti<br>Saoirse Abernathy<br>Quist Lindqvist LLP<br>\
+                 Counsel for the Trustee",
+            ]]))
+        );
+    }
+
+    #[test]
     fn a_wrapped_party_name_may_end_in_a_street_word() {
         let rows = [
             ("THE SHOPS AT", ")"),
@@ -5202,9 +5225,9 @@ mod layout_block_tests {
         assert!(names_a_party("Attorneys for Avanti Corporate"));
         assert!(!names_a_party("Jonathan Robert Reed, Of Counsel"));
         assert!(!names_a_party("Attorneys for"));
-        assert!(ends_firm_name("Hyland & Perretti LLP"));
-        assert!(ends_firm_name("Stevens & Lee, P.C."));
-        assert!(!ends_firm_name("THE SHOPS AT"));
+        assert!(is_own_address_line("Second Floor"));
+        assert!(is_own_address_line("Port Avery, ZZ 00000"));
+        assert!(!is_own_address_line("Headquarters Plaza"));
         for line in [
             "Recounsel forms",
             "Counsel formatting",
