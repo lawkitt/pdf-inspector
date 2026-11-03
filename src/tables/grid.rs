@@ -446,6 +446,9 @@ pub(crate) fn recover_header_row(
     // Prepend header row to the table
     table.rows.insert(0, *header_y);
     table.cells.insert(0, header_cells);
+    if !table.layout_rows.is_empty() {
+        table.layout_rows.insert(0, false);
+    }
     table.item_indices.extend(header_indices);
 }
 
@@ -686,7 +689,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         recover_header_row(&mut table, &all_items, 9.0);
@@ -706,7 +709,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![0, 1],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         let rows_before = table.rows.len();
@@ -732,7 +735,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         recover_header_row(&mut table, &all_items, 9.0);
@@ -754,7 +757,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         let rows_before = table.rows.len();
@@ -776,7 +779,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![1, 2],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         let rows_before = table.rows.len();
@@ -793,7 +796,7 @@ mod tests {
             cells: vec![],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         recover_header_row(&mut table, &all_items, 9.0);

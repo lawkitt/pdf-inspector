@@ -1545,11 +1545,19 @@ pub struct Table {
     pub item_indices: Vec<usize>,
     /// Data table vs TOC. Set by `Table::new` from `cells`.
     pub kind: TableKind,
-    /// A two-column layout block (a case caption or a counsel block) rather
-    /// than a grid of records: each row is a block of lines, each cell holds
-    /// a column's lines (`<br>` between them, a space where a line wraps),
-    /// and formatting never folds one row into another.
-    pub layout_block: bool,
+    /// For each row, whether it belongs to a two-column layout block (a case
+    /// caption or a counsel block) rather than a grid of records: such a row
+    /// is a block of lines, each cell holds a column's lines (`<br>` between
+    /// them, a space where a line wraps), and formatting never folds it into
+    /// another row or another row into it. Empty when no row does.
+    pub layout_rows: Vec<bool>,
+}
+
+impl Table {
+    /// Whether any row is a two-column layout block's.
+    pub fn has_layout_block(&self) -> bool {
+        self.layout_rows.contains(&true)
+    }
 }
 
 impl Table {
@@ -1571,7 +1579,7 @@ impl Table {
             cells,
             item_indices,
             kind,
-            layout_block: false,
+            layout_rows: Vec::new(),
         }
     }
 }
@@ -1734,7 +1742,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         let md = table_to_markdown(&table);
@@ -2517,7 +2525,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
 
         let md = table_to_markdown(&table);

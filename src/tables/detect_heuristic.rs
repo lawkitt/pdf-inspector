@@ -1591,15 +1591,15 @@ fn detect_table_in_region(
     let blocks = (table.kind == super::TableKind::Data)
         .then(|| layout_block_rows(&cell_items, &table.rows, &table.cells))
         .flatten();
-    if let Some((rows, cells)) = blocks {
+    if let Some((rows, cells, layout_rows)) = blocks {
         debug!(
-            "  layout block: {} rows of lines in {} blocks",
+            "  layout block: {} rows of lines in {} rows",
             table.rows.len(),
             rows.len()
         );
         table.rows = rows;
         table.cells = cells;
-        table.layout_block = true;
+        table.layout_rows = layout_rows;
     }
     Some(table)
 }
@@ -1674,13 +1674,16 @@ fn is_caption_filler(cell: &str) -> bool {
 /// between caption filler rows and blank lines becomes one row whose cells
 /// keep each column's lines together: a space where a line wraps (it reaches
 /// the column's edge and the next line's first word would not fit after
-/// it), `<br>` between separate lines. Filler rows stay as they are. `None`
-/// for any other table.
+/// it), `<br>` between separate lines. Filler rows stay as they are. Each
+/// row comes with whether it belongs to a layout block (a joined block or a
+/// filler row), so that formatting folds only the other rows. `None` when no
+/// block qualifies.
+#[allow(clippy::type_complexity)]
 fn layout_block_rows(
     cell_items: &[Vec<Vec<&TextItem>>],
     rows: &[f32],
     cells: &[Vec<String>],
-) -> Option<(Vec<f32>, Vec<Vec<String>>)> {
+) -> Option<(Vec<f32>, Vec<Vec<String>>, Vec<bool>)> {
     let columns = cells.first()?.len();
     if !(2..=3).contains(&columns) || cells.len() < 3 || cell_items.len() != cells.len() {
         return None;
@@ -1751,7 +1754,9 @@ fn layout_block_rows(
             })
         })
         .collect();
-    let wraps = |row: usize, next: usize, col: usize| -> bool {
+    // Another line at the edge corroborates a wrap only within the same
+    // block: a later caption's name says nothing about this one.
+    let wraps = |block: &std::ops::Range<usize>, row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
         };
@@ -1766,7 +1771,7 @@ fn layout_block_rows(
         }
         let corroborated = edge
             .iter()
-            .any(|&(r, c)| c != col || (r != row && r != next));
+            .any(|&(r, c)| block.contains(&r) && (c != col || (r != row && r != next)));
         corroborated || !at_edge(&line, col) || runs_on(text, following)
     };
     let filled = |cell: &String| !cell.trim().is_empty() && !is_caption_filler(cell);
@@ -1781,7 +1786,16 @@ fn layout_block_rows(
     // codes or numbers), each with a line that stands alone in its row
     // without wrapping the line above it, three such lines in all. Rows of
     // records continue only their description column, or hold single words.
+    // Word counts alone also fit a sparse table of short phrases, so a
+    // counsel block also needs what only counsel has: a role line
+    // ("Attorneys for …", "Counsel for …") or an address line in each
+    // column.
     let words = |cell: &str| cell.split_whitespace().count();
+    let counsel_evidence = |block: &std::ops::Range<usize>| {
+        let lines = |col: usize| cells[block.clone()].iter().map(move |row| row[col].trim());
+        lines(0).chain(lines(1)).any(is_counsel_role)
+            || (0..2).all(|col| lines(col).any(is_address_line))
+    };
     let counsel = |block: std::ops::Range<usize>| {
         let texts: Vec<&str> = cells[block.clone()]
             .iter()
@@ -1790,6 +1804,7 @@ fn layout_block_rows(
             .filter(|cell| !cell.is_empty())
             .collect();
         if columns != 2
+            || !counsel_evidence(&block)
             || texts.iter().any(|cell| {
                 cell.chars().any(|c| c.is_ascii_digit()) && !cell.chars().any(char::is_alphabetic)
             })
@@ -1802,7 +1817,7 @@ fn layout_block_rows(
             let mut filled_cols = (0..columns).filter(|&col| filled(&cells[row][col]));
             if let (Some(col), None) = (filled_cols.next(), filled_cols.next()) {
                 if filled(&cells[row - 1][col])
-                    && !wraps(row - 1, row, col)
+                    && !wraps(&block, row - 1, row, col)
                     && words(&cells[row][col]) >= 2
                 {
                     alone[col] += 1;
@@ -1822,12 +1837,14 @@ fn layout_block_rows(
     let gap = |row: usize| (rows[row - 1] - rows[row]).abs() > 1.5 * pitch;
     let mut block_rows = Vec::new();
     let mut block_cells = Vec::new();
+    let mut layout_rows = Vec::new();
     let mut joined_any = false;
     let mut row = 0;
     while row < cells.len() {
         if !cells[row].iter().any(filled) {
             block_rows.push(rows[row]);
             block_cells.push(cells[row].clone());
+            layout_rows.push(cells[row].iter().any(|cell| !cell.trim().is_empty()));
             row += 1;
             continue;
         }
@@ -1842,10 +1859,12 @@ fn layout_block_rows(
         if !captioned && !counsel(start..row) {
             block_rows.extend_from_slice(&rows[start..row]);
             block_cells.extend_from_slice(&cells[start..row]);
+            layout_rows.extend(std::iter::repeat_n(false, row - start));
             continue;
         }
+        let block = start..row;
         joined_any = true;
-        let block: Vec<String> = (0..columns)
+        let joined: Vec<String> = (0..columns)
             .map(|col| {
                 let kept: Vec<usize> = (start..row).filter(|&r| filled(&cells[r][col])).collect();
                 if kept.is_empty() {
@@ -1859,7 +1878,7 @@ fn layout_block_rows(
                 let mut text = cells[kept[0]][col].clone();
                 for pair in kept.windows(2) {
                     let (above, below) = (pair[0], pair[1]);
-                    text.push_str(if below == above + 1 && wraps(above, below, col) {
+                    text.push_str(if below == above + 1 && wraps(&block, above, below, col) {
                         " "
                     } else {
                         "<br>"
@@ -1870,12 +1889,64 @@ fn layout_block_rows(
             })
             .collect();
         block_rows.push(rows[start]);
-        block_cells.push(block);
+        block_cells.push(joined);
+        layout_rows.push(true);
     }
     if !joined_any {
         return None;
     }
-    Some((block_rows, block_cells))
+    Some((block_rows, block_cells, layout_rows))
+}
+
+/// A counsel block's role line: "Attorneys for the Debtor", "Counsel for
+/// Acme", "Of Counsel", "Solicitors for the Claimant".
+fn is_counsel_role(line: &str) -> bool {
+    const ROLES: &[&str] = &[
+        "attorney for",
+        "attorneys for",
+        "counsel for",
+        "of counsel",
+        "solicitor for",
+        "solicitors for",
+        "barrister for",
+        "proctor for",
+        "proctors for",
+    ];
+    let lower = line.to_lowercase();
+    ROLES.iter().any(|role| {
+        lower.starts_with(role)
+            || lower
+                .match_indices(role)
+                .any(|(at, _)| lower[..at].ends_with(char::is_whitespace))
+    })
+}
+
+/// An address line: a street number and a name ("410 Harbor Row"), a
+/// suite, floor or post box, or a city ending in a US state and ZIP code
+/// ("Port Avery, ZZ 00000").
+fn is_address_line(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let second = words.next().unwrap_or("");
+    let street_number = first.starts_with(|c: char| c.is_ascii_digit())
+        && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && second.starts_with(char::is_alphabetic);
+    let lower = line.to_lowercase();
+    let unit = ["suite ", "ste. ", "p.o. box", "po box", "floor"]
+        .iter()
+        .any(|word| lower.starts_with(word) || lower.ends_with(word));
+    let tail: Vec<&str> = line.rsplitn(3, char::is_whitespace).collect();
+    let zip = match tail.as_slice() {
+        [code, state, ..] => {
+            let code = code.split('-').next().unwrap_or("");
+            code.len() == 5
+                && code.chars().all(|c| c.is_ascii_digit())
+                && state.len() == 2
+                && state.chars().all(|c| c.is_ascii_uppercase())
+        }
+        _ => false,
+    };
+    street_number || unit || zip
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
@@ -4434,7 +4505,7 @@ mod layout_block_tests {
             .iter()
             .map(|(_, (left, right))| vec![left.to_string(), right.to_string()])
             .collect();
-        layout_block_rows(&grid, &ys, &cells).map(|(_, cells)| cells)
+        layout_block_rows(&grid, &ys, &cells).map(|(_, cells, _)| cells)
     }
 
     fn strings(rows: &[[&str; 2]]) -> Vec<Vec<String>> {
@@ -4498,7 +4569,7 @@ mod layout_block_tests {
     #[test]
     fn a_wrapped_caption_name_stays_in_one_cell() {
         let (table, markdown) = markdown(CAPTION_AND_COUNSEL);
-        assert!(table.layout_block, "{markdown}");
+        assert!(table.has_layout_block(), "{markdown}");
         assert!(
             markdown.contains(
                 "|NORTHWIND REGIONAL CARE HOLDING SERVICES, INC., OTTO K. FERRANT and LUCIA BRENNEMANN,|)|"
@@ -4521,7 +4592,7 @@ mod layout_block_tests {
         let rows: Vec<(&str, &str)> = CAPTION_AND_COUNSEL.iter().chain(COUNSEL).copied().collect();
         for rows in [&rows[..], COUNSEL] {
             let (table, markdown) = markdown(rows);
-            assert!(table.layout_block, "{markdown}");
+            assert!(table.has_layout_block(), "{markdown}");
             assert!(markdown.contains(COUNSEL_ROW), "{markdown}");
         }
     }
@@ -4607,6 +4678,56 @@ mod layout_block_tests {
     }
 
     #[test]
+    fn a_sparse_table_of_phrases_is_no_counsel_block() {
+        // Multi-word values, and lines alone in their row in both columns
+        // that a wide header leaves room to wrap, but no role line and no
+        // address: a table, header and all.
+        let rows = [
+            (
+                "Component and part description",
+                "Processing status of the part",
+            ),
+            ("Steel bracket", "Pending review"),
+            ("", "Approved later"),
+            ("Rubber gasket", "Fully complete"),
+            ("Replacement seal", ""),
+            ("Outer cover", "Recently installed"),
+            ("", "Removed again"),
+            ("Hex bolt", "Readily available"),
+        ];
+        assert_eq!(blocks(&rows, 324.0), None);
+    }
+
+    #[test]
+    fn a_table_after_a_caption_still_folds_its_continuations() {
+        // The caption's blocks never fold; the table's own continuation row
+        // still does.
+        let rows = [
+            ("ORRIN VALE and", ")"),
+            ("MIRA VALE,", ") Case No. 12-345"),
+            ("", ")"),
+            ("v.", ")"),
+            ("", ")"),
+            BLANK,
+            ("Part", "Description"),
+            ("Bracket", "Steel bracket"),
+            ("", "Powder coated"),
+            ("Bolt", "Hex bolt"),
+        ];
+        let (table, markdown) = markdown(&rows);
+        assert!(table.has_layout_block(), "{markdown}");
+        assert!(
+            markdown.contains("|Bracket|Steel bracket Powder coated|"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("||Powder coated|"), "{markdown}");
+        assert!(
+            markdown.contains("|ORRIN VALE and MIRA VALE,|) Case No. 12-345|"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
     fn a_table_after_a_caption_keeps_its_rows() {
         let rows = [
             ("ORRIN VALE and", ")"),
@@ -4655,5 +4776,57 @@ mod layout_block_tests {
                 ["", ")"],
             ]))
         );
+    }
+
+    #[test]
+    fn another_blocks_line_at_the_edge_corroborates_no_wrap() {
+        // A third name of the same width, in the next block, says nothing
+        // about the first block's two.
+        let rows = [
+            ("Alexandra Morris", ")"),
+            ("Nathaniel Turner", ")"),
+            ("", ")"),
+            ("v.", ")"),
+            ("", ")"),
+            ("Alexandra Morrow", ")"),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[
+                ["Alexandra Morris<br>Nathaniel Turner", ")"],
+                ["", ")"],
+                ["v.", ")"],
+                ["", ")"],
+                ["Alexandra Morrow", ")"],
+            ]))
+        );
+    }
+
+    #[test]
+    fn counsel_roles_and_addresses() {
+        for line in [
+            "Attorneys for Acme",
+            "Counsel for the Trustee",
+            "Special Counsel for the Estate",
+            "Of Counsel",
+        ] {
+            assert!(is_counsel_role(line), "{line}");
+        }
+        for line in ["Recounsel forms", "Pending review", "Counsel"] {
+            assert!(!is_counsel_role(line), "{line}");
+        }
+        for line in [
+            "410 Harbor Row",
+            "Port Avery, ZZ 00000",
+            "Suite 4",
+            "Second Floor",
+            "P.O. Box 12",
+            "Fenby, DE 19998-1234",
+        ] {
+            assert!(is_address_line(line), "{line}");
+        }
+        for line in ["Steel bracket", "10", "Item 4", "Fully complete"] {
+            assert!(!is_address_line(line), "{line}");
+        }
     }
 }

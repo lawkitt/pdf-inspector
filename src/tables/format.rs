@@ -292,24 +292,28 @@ fn ends_like_incomplete_phrase(cell: &str) -> bool {
 }
 
 /// A table's cells cleaned up for formatting: a layout block's rows are
-/// whole blocks already, so none folds into the row above it.
+/// whole blocks already, so none folds into the row above it, and no row
+/// folds into one of them.
 fn clean_table(table: &Table) -> (Vec<Vec<String>>, Vec<String>) {
-    clean_cells(&table.cells, !table.layout_block)
+    clean_cells(&table.cells, &table.layout_rows)
 }
 
 /// Clean up table cells: merge continuation rows, extract footnotes, remove empty rows
 #[cfg(test)]
 fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
-    clean_cells(cells, true)
+    clean_cells(cells, &[])
 }
 
-/// Clean up table cells: extract footnotes, remove empty rows and, when
-/// `fold_continuations`, merge continuation rows into the row above.
-fn clean_cells(cells: &[Vec<String>], fold_continuations: bool) -> (Vec<Vec<String>>, Vec<String>) {
+/// Clean up table cells: extract footnotes, remove empty rows and merge
+/// continuation rows into the row above, except where either is a layout
+/// block's row (`layout_rows`, by row; a missing entry is no layout row).
+fn clean_cells(cells: &[Vec<String>], layout_rows: &[bool]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut cleaned: Vec<Vec<String>> = Vec::new();
+    let mut cleaned_layout: Vec<bool> = Vec::new();
     let mut footnotes: Vec<String> = Vec::new();
 
-    for row in cells {
+    for (index, row) in cells.iter().enumerate() {
+        let layout_row = layout_rows.get(index).copied().unwrap_or(false);
         // Check if this row is empty
         if row.iter().all(|c| c.trim().is_empty()) {
             continue;
@@ -474,6 +478,7 @@ fn clean_cells(cells: &[Vec<String>], fold_continuations: bool) -> (Vec<Vec<Stri
             && !looks_like_section_label_row
             && !is_short_subheader;
 
+        let fold_continuations = !layout_row && cleaned_layout.last() != Some(&true);
         let is_continuation =
             fold_continuations && (is_classic_continuation || is_wrapped_continuation);
 
@@ -493,6 +498,7 @@ fn clean_cells(cells: &[Vec<String>], fold_continuations: bool) -> (Vec<Vec<Stri
         } else {
             // Regular row - add as new row
             cleaned.push(row.iter().map(|c| c.trim().to_string()).collect());
+            cleaned_layout.push(layout_row);
         }
     }
 
@@ -656,13 +662,42 @@ mod tests {
                 .contains("|Ida Fenwick<br>Fenwick & Rowe LLP|Theo Marchetti Saoirse Abernathy"),
             "an ordinary table folds the row: {markdown}"
         );
-        table.layout_block = true;
+        table.layout_rows = vec![false, true, true];
         let markdown = table_to_markdown(&table);
         assert_eq!(
             markdown,
             "|For the debtor|For the trustee|\n|---|---|\n\
              |Ida Fenwick<br>Fenwick & Rowe LLP|Theo Marchetti|\n\
              ||Saoirse Abernathy<br>Quist Lindqvist LLP|\n"
+        );
+    }
+
+    /// Only a layout block's rows stay unfolded: an ordinary row after them
+    /// still folds into the ordinary row above it.
+    #[test]
+    fn only_layout_block_rows_stay_unfolded() {
+        let cells: Vec<Vec<String>> = [
+            ["ORRIN VALE and MIRA VALE,", ") Case No. 12-345"],
+            ["", ")"],
+            ["Part", "Description"],
+            ["Bracket", "Steel bracket"],
+            ["", "Powder coated"],
+            ["Bolt", "Hex bolt"],
+        ]
+        .iter()
+        .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+        .collect();
+        let layout = [true, true, false, false, false, false];
+        let (cleaned, _) = clean_cells(&cells, &layout);
+        assert_eq!(
+            cleaned,
+            vec![
+                vec!["ORRIN VALE and MIRA VALE,", ") Case No. 12-345"],
+                vec!["", ")"],
+                vec!["Part", "Description"],
+                vec!["Bracket", "Steel bracket Powder coated"],
+                vec!["Bolt", "Hex bolt"],
+            ]
         );
     }
 
@@ -970,7 +1005,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("|Name|"));
@@ -987,7 +1022,7 @@ mod tests {
             cells: vec![vec!["Only".into(), "Row".into()]],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("|Only|"));
@@ -1005,7 +1040,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
         assert!(is_complete_data_table(&complete));
 
@@ -1026,7 +1061,7 @@ mod tests {
             cells: vec![],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
         assert_eq!(table_to_markdown(&table), "");
     }
@@ -1043,7 +1078,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("(1) Footnote text"));
@@ -1060,7 +1095,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("名前"));
@@ -1075,7 +1110,7 @@ mod tests {
             cells: vec![vec![]],
             item_indices: vec![],
             kind: TableKind::Data,
-            layout_block: false,
+            layout_rows: Vec::new(),
         };
         assert_eq!(table_to_markdown(&table), "");
     }
