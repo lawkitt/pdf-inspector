@@ -1788,7 +1788,8 @@ fn layout_block_rows(
         line.right - left[col] >= width(row) - 0.5 * line.font_size
     };
     // Whether the next line could continue this one: it does not start
-    // with a digit, and its first word would not fit after this line.
+    // with a digit, is no address line of its own ("Wilmington, DE 19801"
+    // under a street), and its first word would not fit after this line.
     let may_wrap = |row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
@@ -1796,9 +1797,9 @@ fn layout_block_rows(
         let Some(word) = after.first_word else {
             return false;
         };
-        !cells[next][col]
-            .trim()
-            .starts_with(|c: char| c.is_ascii_digit())
+        let following = cells[next][col].trim();
+        !following.starts_with(|c: char| c.is_ascii_digit())
+            && !is_address_line(following)
             && line.right + 0.25 * line.font_size + word > limit(col, row)
     };
     // The wraps the text confirms at a block's edge, with how far each
@@ -1834,15 +1835,24 @@ fn layout_block_rows(
             return false;
         };
         let (text, following) = (cells[row][col].trim(), cells[next][col].trim());
-        // A confirmed wrap of another line corroborates this one only at the
-        // same edge: a short "Office of" over "Justice," says nothing about
-        // two longer names. The next line's own wrap counts ("HOLDING" over
-        // "SERVICES, INC., … FERRANT" over "and LUCIA …").
+        // A confirmed wrap of another pair of lines corroborates this one at
+        // the same edge: anywhere in this block, whose edge both reach, and
+        // in another block only within half a font size of this line ("Office
+        // of" over "Justice," says nothing about two longer names). The next
+        // line's own wrap is no witness: "Nathaniel Smith," running on into
+        // "Individually" says nothing about the name above it.
         let reach = line.right - left[col];
         let corroborated = edge.iter().any(|&(r, c, edge_reach)| {
-            (c != col || r != row) && (edge_reach - reach).abs() <= 0.5 * line.font_size
+            (c != col || (r != row && r != next))
+                && (block_of[r] == block_of[row]
+                    || (edge_reach - reach).abs() <= 0.5 * line.font_size)
         });
-        corroborated || !at_edge(&line, col, row) || runs_on(text, following)
+        // A role names its party, which runs on at the edge ("Attorneys for
+        // Avanti Corporate" over "Health Systems, Inc.").
+        corroborated
+            || !at_edge(&line, col, row)
+            || runs_on(text, following)
+            || is_counsel_role(text)
     };
     let parenthesis = |cell: &String| cell.trim_start().starts_with(')');
     let parentheses = cells
@@ -1986,9 +1996,11 @@ fn is_counsel_role(line: &str) -> bool {
 }
 
 /// An address line: a street number, a name and a street word ("410
-/// Harbor Row", "300 Delaware Avenue, Suite 800"), a numbered suite, floor
-/// or post box ("Suite 4", "Second Floor", "P.O. Box 12"), or a city
-/// ending in a US state and ZIP code ("Port Avery, ZZ 00000").
+/// Harbor Row", "300 Delaware Avenue, Suite 800"), a name ending in an
+/// unambiguous street word ("One State Street", "Headquarters Plaza"), a
+/// numbered suite, floor or post box ("Suite 4", "Second Floor", "P.O. Box
+/// 12"), or a city ending in a US state and ZIP code ("Port Avery, ZZ
+/// 00000").
 fn is_address_line(line: &str) -> bool {
     const STREETS: &[&str] = &[
         "street",
@@ -2052,6 +2064,14 @@ fn is_address_line(line: &str) -> bool {
         && words[2..]
             .iter()
             .any(|word| STREETS.contains(&word.as_str()));
+    // "Court", "Place" or "Way" end too many other names to stand alone.
+    let named_street = words.len() >= 2
+        && words.last().is_some_and(|word| {
+            matches!(
+                word.as_str(),
+                "street" | "avenue" | "road" | "boulevard" | "lane" | "drive" | "plaza"
+            )
+        });
     let unit = words.windows(2).any(|pair| {
         let (a, b) = (pair[0].as_str(), pair[1].as_str());
         (matches!(a, "suite" | "ste" | "floor" | "box" | "unit") && numbered(b))
@@ -2068,7 +2088,7 @@ fn is_address_line(line: &str) -> bool {
         }
         _ => false,
     };
-    street || unit || zip
+    street || named_street || unit || zip
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
@@ -4656,7 +4676,7 @@ mod layout_block_tests {
         ("", ")"),
         ("v.", ") Adv. Proc. No. 31-00912"),
         ("", ")"),
-        ("NORTHWIND REGIONAL CARE HOLDING", ")"),
+        ("NORTHWIND REGIONAL HOLDING", ")"),
         ("SERVICES, INC., OTTO K. FERRANT", ")"),
         ("and LUCIA BRENNEMANN,", ")"),
         ("", ")"),
@@ -4694,7 +4714,7 @@ mod layout_block_tests {
         assert!(table.has_layout_block(), "{markdown}");
         assert!(
             markdown.contains(
-                "|NORTHWIND REGIONAL CARE HOLDING SERVICES, INC., OTTO K. FERRANT and LUCIA BRENNEMANN,|)|"
+                "|NORTHWIND REGIONAL HOLDING SERVICES, INC., OTTO K. FERRANT and LUCIA BRENNEMANN,|)|"
             ),
             "{markdown}"
         );
@@ -4735,6 +4755,33 @@ mod layout_block_tests {
                 "Ada Quill<br>Dana Hood<br>Quill Hood LLP<br>Co-Counsel for Acme",
                 "Bram Tolliver<br>Cass Ionescu<br>Tolliver Ionescu LLP<br>Wren Pell LLP<br>\
                  Co-Counsel for the Estate",
+            ]]))
+        );
+    }
+
+    #[test]
+    fn a_role_runs_on_and_an_address_line_stands_alone_at_one_edge() {
+        // The street and the role line are both the widest: the role's
+        // party runs on, the city under the street is a line of its own,
+        // and so is a plaza under a firm.
+        let rows = [
+            ("Ida Fenwick", "Theo Marchetti"),
+            ("Fenwick & Rowe LLP", "Saoirse Abernathy"),
+            ("", "Quist Lindqvist LLP"),
+            ("300 Delaware Avenue, Suite 800", "Headquarters Plaza"),
+            ("Port Avery, ZZ 00000", ""),
+            ("Second Floor", ""),
+            ("Attorneys for Avanti Corporate", "Counsel for the Trustee"),
+            ("Health Systems, Inc.", ""),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[[
+                "Ida Fenwick<br>Fenwick & Rowe LLP<br>300 Delaware Avenue, Suite 800<br>\
+                 Port Avery, ZZ 00000<br>Second Floor<br>\
+                 Attorneys for Avanti Corporate Health Systems, Inc.",
+                "Theo Marchetti<br>Saoirse Abernathy<br>Quist Lindqvist LLP<br>\
+                 Headquarters Plaza<br>Counsel for the Trustee",
             ]]))
         );
     }
@@ -4970,9 +5017,11 @@ mod layout_block_tests {
         // A comma over a street number is no wrap, and a short wrap in the
         // next block is at another edge: neither joins the two names.
         for (last, expected) in [
+            // Of the names' width, so only the digit keeps it from
+            // corroborating.
             (
-                ("Fenwick & Sons,", "123 Oak Road"),
-                "Fenwick & Sons,<br>123 Oak Road",
+                ("Fenwick & Jones,", "123 Oak Road"),
+                "Fenwick & Jones,<br>123 Oak Road",
             ),
             (("Office of", "Justice,"), "Office of Justice,"),
         ] {
@@ -4997,6 +5046,29 @@ mod layout_block_tests {
                 "{last:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_next_lines_own_wrap_corroborates_no_join() {
+        // Names of one width: the second runs on into "Individually", which
+        // says nothing about the first.
+        let rows = [
+            ("Alexandra Morris", ")"),
+            ("Nathaniel Smith,", ")"),
+            ("Individually", ")"),
+            ("", ")"),
+            ("v.", ")"),
+            ("", ")"),
+        ];
+        assert_eq!(
+            blocks(&rows, 324.0),
+            Some(strings(&[
+                ["Alexandra Morris<br>Nathaniel Smith, Individually", ")"],
+                ["", ")"],
+                ["v.", ")"],
+                ["", ")"],
+            ]))
+        );
     }
 
     #[test]
@@ -5061,6 +5133,8 @@ mod layout_block_tests {
             "Floor 3",
             "P.O. Box 12",
             "Fenby, DE 19998-1234",
+            "One State Street",
+            "Headquarters Plaza",
         ] {
             assert!(is_address_line(line), "{line}");
         }
@@ -5073,6 +5147,9 @@ mod layout_block_tests {
             "Floor coating",
             "10 Steel brackets",
             "20 Rubber gaskets",
+            "Superior Court",
+            "Street",
+            "Wall Street Journal",
         ] {
             assert!(!is_address_line(line), "{line}");
         }
