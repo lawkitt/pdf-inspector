@@ -1787,36 +1787,61 @@ fn layout_block_rows(
     let at_edge = |line: &CellLine, col: usize, row: usize| {
         line.right - left[col] >= width(row) - 0.5 * line.font_size
     };
-    let edge: Vec<(usize, usize)> = (0..columns)
-        .flat_map(|col| {
-            let lines = &lines;
-            (0..cells.len()).filter_map(move |row| {
-                let line = lines[row][col]?;
-                let joined = cells[row][col].trim().get(1..).unwrap_or("").contains(')');
-                let following = cells.get(row + 1)?[col].trim();
-                let confirmed = !following.is_empty()
-                    && !is_caption_filler(following)
-                    && runs_on(cells[row][col].trim(), following);
-                (!joined && confirmed && at_edge(&line, col, row)).then_some((row, col))
-            })
-        })
-        .collect();
-    let wraps = |row: usize, next: usize, col: usize| -> bool {
+    // Whether the next line could continue this one: it does not start
+    // with a digit, and its first word would not fit after this line.
+    let may_wrap = |row: usize, next: usize, col: usize| -> bool {
         let (Some(line), Some(after)) = (lines[row][col], lines[next][col]) else {
             return false;
         };
         let Some(word) = after.first_word else {
             return false;
         };
-        let (text, following) = (cells[row][col].trim(), cells[next][col].trim());
-        if following.starts_with(|c: char| c.is_ascii_digit())
-            || line.right + 0.25 * line.font_size + word <= limit(col, row)
-        {
+        !cells[next][col]
+            .trim()
+            .starts_with(|c: char| c.is_ascii_digit())
+            && line.right + 0.25 * line.font_size + word > limit(col, row)
+    };
+    // The wraps the text confirms at a block's edge, with how far each
+    // reaches from its column's left: its words run on into the next line
+    // of the same block, which could continue it.
+    let edge: Vec<(usize, usize, f32)> = (0..columns)
+        .flat_map(|col| {
+            let lines = &lines;
+            let (block_of, left, at_edge, may_wrap) = (&block_of, &left, &at_edge, &may_wrap);
+            (0..cells.len()).filter_map(move |row| {
+                let line = lines[row][col]?;
+                let joined = cells[row][col].trim().get(1..).unwrap_or("").contains(')');
+                let next = row + 1;
+                let confirmed = next < cells.len()
+                    && block_of[row].is_some()
+                    && block_of[next] == block_of[row]
+                    && filled(&cells[next][col])
+                    && may_wrap(row, next, col)
+                    && runs_on(cells[row][col].trim(), cells[next][col].trim());
+                (!joined && confirmed && at_edge(&line, col, row)).then_some((
+                    row,
+                    col,
+                    line.right - left[col],
+                ))
+            })
+        })
+        .collect();
+    let wraps = |row: usize, next: usize, col: usize| -> bool {
+        if !may_wrap(row, next, col) {
             return false;
         }
-        let corroborated = edge
-            .iter()
-            .any(|&(r, c)| c != col || (r != row && r != next));
+        let Some(line) = lines[row][col] else {
+            return false;
+        };
+        let (text, following) = (cells[row][col].trim(), cells[next][col].trim());
+        // A confirmed wrap of another line corroborates this one only at the
+        // same edge: a short "Office of" over "Justice," says nothing about
+        // two longer names. The next line's own wrap counts ("HOLDING" over
+        // "SERVICES, INC., … FERRANT" over "and LUCIA …").
+        let reach = line.right - left[col];
+        let corroborated = edge.iter().any(|&(r, c, edge_reach)| {
+            (c != col || r != row) && (edge_reach - reach).abs() <= 0.5 * line.font_size
+        });
         corroborated || !at_edge(&line, col, row) || runs_on(text, following)
     };
     let parenthesis = |cell: &String| cell.trim_start().starts_with(')');
@@ -4936,6 +4961,40 @@ mod layout_block_tests {
                     [last, ")"],
                 ])),
                 "{last}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_valid_wrap_at_the_same_edge_corroborates() {
+        // A comma over a street number is no wrap, and a short wrap in the
+        // next block is at another edge: neither joins the two names.
+        for (last, expected) in [
+            (
+                ("Fenwick & Sons,", "123 Oak Road"),
+                "Fenwick & Sons,<br>123 Oak Road",
+            ),
+            (("Office of", "Justice,"), "Office of Justice,"),
+        ] {
+            let rows = [
+                ("Alexandra Morris", ")"),
+                ("Nathaniel Turner", ")"),
+                ("", ")"),
+                ("v.", ")"),
+                ("", ")"),
+                (last.0, ")"),
+                (last.1, ")"),
+            ];
+            assert_eq!(
+                blocks(&rows, 324.0),
+                Some(strings(&[
+                    ["Alexandra Morris<br>Nathaniel Turner", ")"],
+                    ["", ")"],
+                    ["v.", ")"],
+                    ["", ")"],
+                    [expected, ")"],
+                ])),
+                "{last:?}"
             );
         }
     }
