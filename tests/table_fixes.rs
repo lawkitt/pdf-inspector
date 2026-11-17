@@ -356,3 +356,182 @@ fn wrapped_cells_stay_in_their_row_and_rows_stay_apart() {
         assert!(!heading.starts_with('|'), "{markdown}");
     }
 }
+
+/// A contract schedule whose row 4.19 starts at the foot of page 1 and
+/// continues at the top of page 2, borderless or ruled, with or without
+/// text around the table. Rows are a 12.5 pt line pitch apart within a row
+/// and 18.5 pt apart between rows.
+fn split_row_pages(ruled: bool, with_text: bool) -> [String; 2] {
+    const PITCH: f32 = 12.5;
+    let columns = [72.0, 160.0, 430.0, 540.0];
+    let cell = |column: usize, y: f32, lines: &[&str]| -> String {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(line, s)| {
+                text(
+                    "F1",
+                    10.0,
+                    columns[column] + 5.0,
+                    y - PITCH * line as f32,
+                    s,
+                )
+            })
+            .collect()
+    };
+    let rules = |edges: &[f32]| -> String {
+        let mut out: String = edges.iter().map(|y| hline(72.0, 540.0, *y)).collect();
+        for x in columns {
+            out += &vline(x, edges[edges.len() - 1], edges[0]);
+        }
+        out
+    };
+
+    let mut first = String::new();
+    if with_text {
+        first += &text("F2", 14.0, 72.0, 740.0, "Schedule of obligations");
+    }
+    let mut y = 690.0;
+    let mut edges = vec![y + 12.0];
+    for (column, header) in ["Clause", "Obligation", "Deadline"].iter().enumerate() {
+        first += &text("F2", 10.0, columns[column] + 5.0, y, header);
+    }
+    y -= PITCH + 6.0;
+    edges.push(y + PITCH - 3.0);
+    for row in 1..=18 {
+        first += &cell(0, y, &[&format!("4.{row}")]);
+        first += &cell(
+            1,
+            y,
+            &[
+                &format!("Party {row} delivers the goods listed in annex {row}"),
+                "to the agreed place of delivery.",
+            ],
+        );
+        first += &cell(2, y, &[&format!("{row} March")]);
+        y -= 2.0 * PITCH + 6.0;
+        edges.push(y + PITCH - 3.0);
+    }
+    first += &cell(0, y, &["4.19"]);
+    first += &cell(
+        1,
+        y,
+        &[
+            "The supplier remedies every reported defect",
+            "at its own cost and replaces any goods that",
+        ],
+    );
+    first += &cell(2, y, &["Within 30 days"]);
+    edges.push(y - PITCH - 4.0);
+    if ruled {
+        first += &rules(&edges);
+    }
+
+    let mut second = String::new();
+    let mut y = 740.0;
+    let mut edges = vec![752.0];
+    second += &cell(
+        1,
+        y,
+        &[
+            "cannot be repaired, and refunds the price",
+            "of any goods it cannot replace.",
+        ],
+    );
+    second += &cell(2, y, &["after the report"]);
+    y -= 2.0 * PITCH + 6.0;
+    edges.push(y + PITCH - 3.0);
+    for row in 20..=21 {
+        second += &cell(0, y, &[&format!("4.{row}")]);
+        second += &cell(
+            1,
+            y,
+            &[&format!("The buyer pays invoice number {row} in full.")],
+        );
+        second += &cell(2, y, &["14 days"]);
+        y -= PITCH + 6.0;
+        edges.push(y + PITCH - 3.0);
+    }
+    if ruled {
+        second += &rules(&edges);
+    }
+    if with_text {
+        second += &text(
+            "F1",
+            11.0,
+            72.0,
+            edges[edges.len() - 1] - 30.0,
+            "The parties may agree other deadlines in writing.",
+        );
+    }
+    [first, second]
+}
+
+const SPLIT_ROW_TEXT: [&str; 6] = [
+    "The supplier remedies every reported defect",
+    "at its own cost and replaces any goods that",
+    "Within 30 days",
+    "cannot be repaired, and refunds the price",
+    "of any goods it cannot replace.",
+    "after the report",
+];
+
+/// Upstream #588 (reported by beerendlauwers), on mdoc's path: each page
+/// is read on its own, so the split row is two rows, one per page. Neither
+/// part may be lost or doubled, and each must stay one coherent row of its
+/// page's table: the wrapped line at the foot of page 1 used to fall out of
+/// the table, and the fragment at the top of page 2 broke into a row per
+/// line.
+#[test]
+fn a_row_split_by_a_page_break_stays_whole_on_each_page() {
+    for ruled in [true, false] {
+        let pages = page_markdown(&make_pdf(&split_row_pages(ruled, true)));
+        let all = pages.concat();
+        for part in SPLIT_ROW_TEXT {
+            assert_eq!(
+                all.matches(part).count(),
+                1,
+                "{part:?}, ruled: {ruled}\n{all}"
+            );
+        }
+        assert_eq!(
+            table_rows(&pages[0]).last().copied(),
+            Some(
+                "|4.19|The supplier remedies every reported defect at its own cost and replaces any goods that|Within 30 days|"
+            ),
+            "ruled: {ruled}\n{}",
+            pages[0]
+        );
+        assert_eq!(
+            table_rows(&pages[1]),
+            [
+                "||cannot be repaired, and refunds the price of any goods it cannot replace.|after the report|",
+                "|4.20|The buyer pays invoice number 20 in full.|14 days|",
+                "|4.21|The buyer pays invoice number 21 in full.|14 days|",
+            ],
+            "ruled: {ruled}\n{}",
+            pages[1]
+        );
+    }
+}
+
+/// Upstream #588 where it was reported: whole-document conversion merges a
+/// table continued on a table-only page, and dropped that page's first row
+/// as a repeated header, losing the rest of the split row. The row is now
+/// joined back together.
+#[test]
+fn merging_a_continued_table_keeps_and_joins_the_split_row() {
+    let result = pdf_inspector::process_pdf_mem(&make_pdf(&split_row_pages(true, false)))
+        .expect("handmade PDF converts");
+    let markdown = result.markdown.unwrap_or_default();
+    for part in SPLIT_ROW_TEXT {
+        assert_eq!(markdown.matches(part).count(), 1, "{part:?}\n{markdown}");
+    }
+    assert!(
+        markdown.contains(
+            "|4.19|The supplier remedies every reported defect at its own cost and replaces any goods that cannot be repaired, and refunds the price of any goods it cannot replace.|Within 30 days after the report|"
+        ),
+        "{markdown}"
+    );
+    assert!(markdown.contains("|4.21|The buyer pays invoice number 21 in full.|14 days|"));
+}
