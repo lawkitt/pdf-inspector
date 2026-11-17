@@ -535,3 +535,102 @@ fn merging_a_continued_table_keeps_and_joins_the_split_row() {
     );
     assert!(markdown.contains("|4.21|The buyer pays invoice number 21 in full.|14 days|"));
 }
+
+/// Three pages of one inventory table under a running header; each page
+/// repeats the table's column-header row at its top, ruled or not.
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+fn continued_table_pages(ruled: bool) -> Vec<String> {
+    let columns = [72.0, 220.0, 350.0, 460.0];
+    let headers = ["Item code", "Description", "Quantity", "Unit price"];
+    let mut pages = Vec::new();
+    let mut item = 0;
+    for page in 0..3 {
+        let mut content = text(
+            "F1",
+            9.0,
+            72.0,
+            750.0,
+            "Northwind Quarterly Inventory Report",
+        );
+        let mut y = 700.0;
+        if page == 0 {
+            content += &text(
+                "F1",
+                11.0,
+                72.0,
+                720.0,
+                "Stock on hand at the end of the quarter, by warehouse item.",
+            );
+            y = 690.0;
+        }
+        let top = y + 14.0;
+        for (x, header) in columns.iter().zip(headers) {
+            content += &text("F2", 10.0, *x, y, header);
+        }
+        let mut baselines = vec![y];
+        for _ in 0..12 {
+            item += 1;
+            y -= 20.0;
+            baselines.push(y);
+            let cells = [
+                format!("NW-{}", 1000 + item),
+                format!("Widget model {item}"),
+                format!("{}", 10 + 7 * item % 90),
+                format!("{}.25", 3 + item),
+            ];
+            for (x, cell) in columns.iter().zip(&cells) {
+                content += &text("F1", 10.0, *x, y, cell);
+            }
+        }
+        if ruled {
+            content += &hline(66.0, 546.0, top);
+            for baseline in &baselines {
+                content += &hline(66.0, 546.0, baseline - 6.0);
+            }
+            for x in [66.0, 214.0, 344.0, 454.0, 546.0] {
+                content += &vline(x, baselines[12] - 6.0, top);
+            }
+        }
+        content += &text("F1", 9.0, 300.0, 40.0, &format!("{}", page + 1));
+        pages.push(content);
+    }
+    pages
+}
+
+/// lawkitt/mdoc#925 (M5 finding): mdoc's native pass strips repeated rows
+/// before it detects tables, so a continued table's column-header row,
+/// repeated at the top of every page, was taken for a running header and
+/// kept on page 1 only. It is the header of each page's table; the running
+/// header above it still goes after page 1.
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+#[test]
+fn a_continued_tables_header_row_stays_on_every_page() {
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    for ruled in [true, false] {
+        let result = process_pdf_with_ocr_mem(
+            &make_pdf(&continued_table_pages(ruled)),
+            OcrPdfOptions::new(),
+        )
+        .expect("native pass converts");
+        assert_eq!(result.pages.len(), 3);
+        for page in &result.pages {
+            assert_eq!(
+                table_rows(&page.markdown).first().copied(),
+                Some("|Item code|Description|Quantity|Unit price|"),
+                "ruled: {ruled}, page {}:\n{}",
+                page.page_number,
+                page.markdown
+            );
+        }
+        assert_eq!(
+            result
+                .markdown
+                .matches("Northwind Quarterly Inventory Report")
+                .count(),
+            1,
+            "ruled: {ruled}\n{}",
+            result.markdown
+        );
+    }
+}
