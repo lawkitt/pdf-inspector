@@ -168,6 +168,17 @@ pub struct PageImages {
     pub images: u32,
 }
 
+/// The form field names a single 1-indexed page leaves out of its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageFormFieldNames {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// How many AcroForm fields on the page contribute their value to the
+    /// text without their name: the name (`/T`, joined with its parents')
+    /// is the form's internal key, which the page never draws.
+    pub names: u32,
+}
+
 /// The shortest side, in points, an image must be drawn at to count in
 /// [`PageImages`]: about 1.4 mm.
 pub const MIN_COUNTED_IMAGE_SIDE_PT: f32 = 4.0;
@@ -575,6 +586,9 @@ pub struct PagesExtractionResult {
     /// order. Markdown carries no image content: at most a placeholder,
     /// with `MarkdownOptions::include_images`.
     pub images_by_page: Vec<PageImages>,
+    /// The requested pages with AcroForm fields whose names were left out
+    /// of the text (their values stay), with how many, in request order.
+    pub form_field_names_by_page: Vec<PageFormFieldNames>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -736,9 +750,14 @@ fn extract_pages_markdown_mem_impl(
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
     let mut images_by_page = Vec::new();
+    let mut form_field_names_by_page = Vec::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
+    let field_names_left_out = extractor::form_field_names_by_page(
+        &doc,
+        &lopdf_pages.iter().map(|(&num, &id)| (id, num)).collect(),
+    );
 
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
@@ -820,6 +839,12 @@ fn extract_pages_markdown_mem_impl(
             images_by_page.push(PageImages {
                 page: page_1idx,
                 images: signals.pictures,
+            });
+        }
+        if let Some(&names) = field_names_left_out.get(&page_1idx) {
+            form_field_names_by_page.push(PageFormFieldNames {
+                page: page_1idx,
+                names,
             });
         }
 
@@ -917,6 +942,7 @@ fn extract_pages_markdown_mem_impl(
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
             images_by_page,
+            form_field_names_by_page,
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]

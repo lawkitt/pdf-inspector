@@ -3,7 +3,7 @@
 use crate::text_utils::decode_pdf_text_string;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Object, ObjectId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::fonts::{resolve_array, resolve_dict};
 use super::get_number;
@@ -173,30 +173,56 @@ pub(crate) fn extract_link_uri(doc: &Document, annot_dict: &lopdf::Dictionary) -
 
 /// Extract form field values from AcroForm dictionary.
 /// Returns TextItems positioned at each field's Rect so they flow into the markdown pipeline.
+///
+/// An item carries the field's value only. The field's name (`/T`, joined
+/// with its parents' names) is not drawn on the page, so it stays out of
+/// the text; [`form_field_names_by_page`] counts the names left out.
 pub(crate) fn extract_form_fields(
     doc: &Document,
     page_map: &HashMap<ObjectId, u32>,
 ) -> Vec<TextItem> {
-    let mut items = Vec::new();
+    walk_acroform(doc, page_map).items
+}
+
+/// How many form field names each 1-indexed page leaves out of its text:
+/// one per field whose value [`extract_form_fields`] places on that page
+/// and whose (fully qualified) name is not empty.
+pub(crate) fn form_field_names_by_page(
+    doc: &Document,
+    page_map: &HashMap<ObjectId, u32>,
+) -> BTreeMap<u32, u32> {
+    walk_acroform(doc, page_map).names_left_out
+}
+
+/// What one walk of the AcroForm field tree finds: the value items, and per
+/// page how many field names were left out of them.
+#[derive(Default)]
+struct FormFields {
+    items: Vec<TextItem>,
+    names_left_out: BTreeMap<u32, u32>,
+}
+
+fn walk_acroform(doc: &Document, page_map: &HashMap<ObjectId, u32>) -> FormFields {
+    let mut found = FormFields::default();
 
     // Navigate: trailer -> /Root -> /AcroForm -> /Fields
     let root = match doc.trailer.get(b"Root") {
         Ok(root_ref) => match root_ref.as_reference() {
             Ok(r) => match doc.get_dictionary(r) {
                 Ok(d) => d,
-                Err(_) => return items,
+                Err(_) => return found,
             },
-            Err(_) => return items,
+            Err(_) => return found,
         },
-        Err(_) => return items,
+        Err(_) => return found,
     };
 
     let acroform = match root.get(b"AcroForm") {
         Ok(obj) => match resolve_dict(doc, obj) {
             Some(d) => d,
-            None => return items,
+            None => return found,
         },
-        Err(_) => return items,
+        Err(_) => return found,
     };
 
     // Borrow the array rather than cloning it: a crafted `/Fields` can be huge,
@@ -205,12 +231,12 @@ pub(crate) fn extract_form_fields(
     let fields = match acroform.get(b"Fields") {
         Ok(obj) => match resolve_array(doc, obj) {
             Some(arr) => arr,
-            None => return items,
+            None => return found,
         },
-        Err(_) => return items,
+        Err(_) => return found,
     };
     if fields.is_empty() {
-        return items;
+        return found;
     }
     let annotation_pages = annotation_page_map(doc, page_map);
 
@@ -235,14 +261,14 @@ pub(crate) fn extract_form_fields(
                 "",
                 page_map,
                 &annotation_pages,
-                &mut items,
+                &mut found,
                 &mut budget,
                 0,
             );
         }
     }
 
-    items
+    found
 }
 
 /// Map widget annotation objects back to the page whose `/Annots` array owns
@@ -273,14 +299,14 @@ fn annotation_page_map(
 
 /// Recursively walk the form field tree, extracting leaf field values.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn walk_form_fields(
+fn walk_form_fields(
     doc: &Document,
     field_id: ObjectId,
     parent_ft: Option<&[u8]>,
     parent_name: &str,
     page_map: &HashMap<ObjectId, u32>,
     annotation_pages: &HashMap<ObjectId, u32>,
-    items: &mut Vec<TextItem>,
+    found: &mut FormFields,
     budget: &mut FieldWalkBudget,
     depth: usize,
 ) {
@@ -350,7 +376,7 @@ pub(crate) fn walk_form_fields(
                         &full_name,
                         page_map,
                         annotation_pages,
-                        items,
+                        found,
                         budget,
                         depth + 1,
                     );
@@ -408,17 +434,13 @@ pub(crate) fn walk_form_fields(
             }
         }
         b"Btn" => {
-            // Checkbox/radio — value is a name
+            // Checkbox/radio — value is the on state's appearance name
+            // ("Yes", "1", an export name), which the page never shows: it
+            // shows a mark. Without the field name beside it the bare word
+            // would read as body text, so the item is the mark itself.
             match value.as_name() {
                 Ok(name) if name == b"Off" => return,
-                Ok(name) => {
-                    let name_str = String::from_utf8_lossy(name).to_string();
-                    if name_str == "Yes" || name_str == "1" {
-                        "Yes".to_string()
-                    } else {
-                        name_str
-                    }
-                }
+                Ok(_) => "\u{2611}".to_string(),
                 Err(_) => return,
             }
         }
@@ -449,14 +471,14 @@ pub(crate) fn walk_form_fields(
         .or_else(|| annotation_pages.get(&field_id).copied())
         .unwrap_or(1);
 
-    let text = if full_name.is_empty() {
-        value_str
-    } else {
-        format!("{}: {}", full_name, value_str)
-    };
+    // The name is the form's internal key, not something the page draws:
+    // only the value is visible, so only the value is text.
+    if !full_name.is_empty() {
+        *found.names_left_out.entry(page_num).or_default() += 1;
+    }
 
-    items.push(TextItem {
-        text,
+    found.items.push(TextItem {
+        text: value_str,
         x,
         y,
         width,
@@ -512,8 +534,110 @@ mod tests {
             "AcroForm" => dictionary! { "Fields" => vec![Object::Reference(widget_id)] },
         });
         doc.trailer.set("Root", Object::Reference(catalog_id));
-        let items = extract_form_fields(&doc, &HashMap::from([(page_id, 1)]));
-        assert_eq!(items[0].text, "Straße und Größe: Jürgen Groß");
+        let page_map = HashMap::from([(page_id, 1)]);
+        let items = extract_form_fields(&doc, &page_map);
+        // The value is the text; the (decoded) name stays out and is counted.
+        assert_eq!(items[0].text, "Jürgen Groß");
+        assert_eq!(
+            form_field_names_by_page(&doc, &page_map),
+            BTreeMap::from([(1, 1)])
+        );
+    }
+
+    /// A one-page document whose AcroForm lists `fields` (added by the
+    /// caller, each pointing at the returned page through `/P`).
+    fn form_doc(
+        fields: impl FnOnce(&mut Document, ObjectId) -> Vec<Object>,
+    ) -> (Document, ObjectId) {
+        let mut doc = Document::new();
+        let page_id = doc.add_object(dictionary! { "Type" => "Page" });
+        let fields = fields(&mut doc, page_id);
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! { "Fields" => fields },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
+    #[test]
+    fn field_names_stay_out_of_the_text_and_are_counted_per_page() {
+        let (doc, page_id) = form_doc(|doc, page| {
+            let widget = |doc: &mut Document, dict: lopdf::Dictionary| {
+                Object::Reference(doc.add_object(dict))
+            };
+            let named = widget(
+                doc,
+                dictionary! {
+                    "FT" => "Tx",
+                    "T" => Object::string_literal("txtClientName"),
+                    "V" => Object::string_literal("Иванов И. И."),
+                    "Rect" => vec![10.into(), 700.into(), 200.into(), 720.into()],
+                    "P" => Object::Reference(page),
+                },
+            );
+            // A kid's name joins its parent's: "contract.date" is one name.
+            let kid = doc.add_object(dictionary! {
+                "T" => Object::string_literal("date"),
+                "V" => Object::string_literal("01.02.2026"),
+                "Rect" => vec![10.into(), 650.into(), 200.into(), 670.into()],
+                "P" => Object::Reference(page),
+            });
+            let parent = widget(
+                doc,
+                dictionary! {
+                    "FT" => "Tx",
+                    "T" => Object::string_literal("contract"),
+                    "Kids" => vec![Object::Reference(kid)],
+                },
+            );
+            let checked = widget(
+                doc,
+                dictionary! {
+                    "FT" => "Btn",
+                    "T" => Object::string_literal("chkAgree"),
+                    "V" => Object::Name(b"Yes".to_vec()),
+                    "Rect" => vec![10.into(), 600.into(), 20.into(), 610.into()],
+                    "P" => Object::Reference(page),
+                },
+            );
+            let unchecked = widget(
+                doc,
+                dictionary! {
+                    "FT" => "Btn",
+                    "T" => Object::string_literal("chkDecline"),
+                    "V" => Object::Name(b"Off".to_vec()),
+                    "Rect" => vec![10.into(), 580.into(), 20.into(), 590.into()],
+                    "P" => Object::Reference(page),
+                },
+            );
+            // No name at all: nothing is left out.
+            let unnamed = widget(
+                doc,
+                dictionary! {
+                    "FT" => "Tx",
+                    "V" => Object::string_literal("Moscow"),
+                    "Rect" => vec![10.into(), 550.into(), 200.into(), 570.into()],
+                    "P" => Object::Reference(page),
+                },
+            );
+            vec![named, parent, checked, unchecked, unnamed]
+        });
+        let page_map = HashMap::from([(page_id, 1)]);
+        let texts: Vec<String> = extract_form_fields(&doc, &page_map)
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+        assert_eq!(texts, ["Иванов И. И.", "01.02.2026", "\u{2611}", "Moscow"]);
+        for text in &texts {
+            assert!(!text.contains("txt") && !text.contains("contract") && !text.contains("chk"));
+        }
+        // Three named fields put a value on the page; the unchecked box and
+        // the unnamed field leave no name out.
+        assert_eq!(
+            form_field_names_by_page(&doc, &page_map),
+            BTreeMap::from([(1, 3)])
+        );
     }
 
     #[test]
@@ -547,7 +671,11 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].page, 2);
-        assert_eq!(items[0].text, "customer: Alice");
+        assert_eq!(items[0].text, "Alice");
+        assert_eq!(
+            form_field_names_by_page(&doc, &page_map),
+            BTreeMap::from([(2, 1)])
+        );
     }
 
     #[test]

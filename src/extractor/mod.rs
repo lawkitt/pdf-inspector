@@ -122,6 +122,7 @@ impl PositionOptions {
         }
     }
 }
+pub(crate) use links::form_field_names_by_page;
 use links::{extract_form_fields, extract_page_links};
 pub(crate) use page_box::{visible_page_box, PageBox};
 

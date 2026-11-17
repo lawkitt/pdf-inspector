@@ -19,6 +19,14 @@ version and date. Earlier releases are described in their
   picture (a scan stored in strips), and draws under 4 pt on a side are left
   out. Markdown never carries image content, so a caller can tell its
   reader what the text leaves out. Markdown output is unchanged.
+- AcroForm fields contribute their value to the text without their name:
+  the name (`/T`, joined with its parents' names, such as
+  `txtClientName`) is the form's internal key, which the page never
+  draws. Per-page Markdown extraction and the OCR pipeline report how many
+  names each page left out (`form_field_names_by_page`, a list of
+  `PageFormFieldNames`). A checked box or selected radio button reads as
+  `☑` instead of its on-state name (`Yes`), which the page does not show
+  either; an unchecked one still adds nothing.
 
 ### Changed
 

@@ -11570,3 +11570,79 @@ fn test_inline_image_gray_control_still_extracts() {
     let extraction = extract_pages_markdown_mem(&pdf, None).expect("control case extracts");
     assert_eq!(extraction.pages.len(), 3);
 }
+
+/// One Letter page drawing `Client:` beside an AcroForm text field named
+/// `txtClientName` and a checked box named `chkAgree`.
+fn make_pdf_with_named_form_fields() -> Vec<u8> {
+    let content = b"BT /F1 12 Tf 72 700 Td (Client:) Tj ET";
+    let objects: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R 6 0 R] >> >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R /Annots [5 0 R 6 0 R] >>"
+            .into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (txtClientName) \
+         /V (Ivanov Ivan) /Rect [130 695 330 715] /P 3 0 R >>"
+            .into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Btn /T (chkAgree) \
+         /V /Yes /Rect [72 650 84 662] /P 3 0 R >>"
+            .into(),
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            std::str::from_utf8(content).unwrap()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn form_field_names_stay_out_of_the_markdown_and_are_counted() {
+    let pdf = make_pdf_with_named_form_fields();
+    let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
+    let markdown = &result.pages[0].markdown;
+    assert!(markdown.contains("Client:"), "{markdown}");
+    assert!(markdown.contains("Ivanov Ivan"), "{markdown}");
+    assert!(markdown.contains('\u{2611}'), "{markdown}");
+    assert!(!markdown.contains("txtClientName"), "{markdown}");
+    assert!(!markdown.contains("chkAgree"), "{markdown}");
+    assert!(!markdown.contains("Yes"), "{markdown}");
+    let names = vec![pdf_inspector::PageFormFieldNames { page: 1, names: 2 }];
+    assert_eq!(result.form_field_names_by_page, names);
+
+    // The OCR pipeline's native pass (what an app runs before asking for
+    // OCR) carries the same count and the same name-free text.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    {
+        use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+        let native = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native");
+        assert!(native.pages_routed_to_ocr.is_empty());
+        assert!(
+            native.markdown.contains("Ivanov Ivan"),
+            "{}",
+            native.markdown
+        );
+        assert!(!native.markdown.contains("txtClientName"));
+        assert_eq!(native.form_field_names_by_page, names);
+    }
+}
