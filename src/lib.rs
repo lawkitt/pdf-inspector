@@ -775,7 +775,6 @@ fn extract_pages_markdown_mem_impl(
             &chart_regions,
             page_count,
             &page_bounds,
-            FurnitureEvidence::RepetitionOrPageEdge,
         )
     } else {
         RepeatedHeaderFooter::default()
@@ -1083,24 +1082,13 @@ impl From<&TextItem> for HeaderFooterItemKey {
     }
 }
 
-/// Which evidence may remove page furniture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FurnitureEvidence {
-    /// Cross-page repetition on three or more pages, else per-page position
-    /// and typography (native text, whose font sizes are real).
-    RepetitionOrPageEdge,
-    /// Cross-page repetition only (OCR text, whose sizes are box heights).
-    RepetitionOnly,
-}
-
 /// Repeated header/footer items found by the document-wide pass.
 #[derive(Debug, Default)]
 pub(crate) struct RepeatedHeaderFooter {
     /// Items to leave out of the Markdown.
     pub(crate) items: HashSet<HeaderFooterItemKey>,
-    /// 1-indexed page -> rows removed as repeats of a line kept on an
-    /// earlier page. Page-edge removals on short documents are not repeats
-    /// and are not counted.
+    /// 1-indexed page -> rows removed as repeats of a row kept on an
+    /// earlier page.
     pub(crate) rows_by_page: BTreeMap<u32, u32>,
 }
 
@@ -1119,16 +1107,20 @@ impl RepeatedHeaderFooter {
     }
 }
 
+/// Running headers and footers proven by cross-page repetition alone: a row
+/// stays on the first page that shows it, and its exact repeats in the same
+/// place go, on three or more of `page_count` pages. Short documents have no
+/// such evidence and keep everything; the per-page typographic fallback that
+/// whole-document Markdown conversion applies to them would leave out even a
+/// first occurrence, with nothing to count.
 pub(crate) fn repeated_header_footer_items(
     items: &[TextItem],
     page_thresholds: &HashMap<u32, f32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     page_count: u32,
     page_bounds: &extractor::PageVerticalBounds,
-    evidence: FurnitureEvidence,
 ) -> RepeatedHeaderFooter {
-    let repetition = page_count >= 3;
-    if !repetition && evidence == FurnitureEvidence::RepetitionOnly {
+    if page_count < 3 {
         return RepeatedHeaderFooter::default();
     }
     let candidates = items
@@ -1173,7 +1165,7 @@ pub(crate) fn repeated_header_footer_items(
                 removed.items.insert(key);
             }
         }
-        if line_removed && repetition {
+        if line_removed {
             rows.insert((page, row));
         }
     }
@@ -1234,14 +1226,8 @@ mod ocr_header_footer_tests {
             thresholds.insert(page, 0.1);
         }
 
-        let repeated = repeated_header_footer_items(
-            &items,
-            &thresholds,
-            &HashMap::new(),
-            3,
-            &HashMap::new(),
-            FurnitureEvidence::RepetitionOrPageEdge,
-        );
+        let repeated =
+            repeated_header_footer_items(&items, &thresholds, &HashMap::new(), 3, &HashMap::new());
         assert_eq!(
             repeated.rows_by_page,
             BTreeMap::from([(2, 1), (3, 1)]),

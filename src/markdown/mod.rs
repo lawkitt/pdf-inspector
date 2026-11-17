@@ -1382,12 +1382,13 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
     output
 }
 
-/// Applies the document-wide repeated header/footer classifier to grouped lines.
+/// Applies the document-wide repeated header/footer classifier to grouped
+/// lines: cross-page repetition only, no per-page fallback.
 pub(crate) fn strip_repeated_header_footer_lines(
     lines: Vec<crate::types::TextLine>,
     page_count: u32,
 ) -> Vec<crate::types::TextLine> {
-    furniture::strip_header_footer_lines(lines, page_count)
+    furniture::strip_repeated_lines(lines, page_count)
 }
 
 /// Convert positioned text items to markdown with structure detection

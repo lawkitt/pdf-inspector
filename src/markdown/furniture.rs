@@ -282,8 +282,9 @@ fn folio_slot(collapsed: &str, leading: bool) -> Option<(String, u32)> {
 }
 
 /// Comparison keys for repetition. Two rows repeat only when their text is
-/// the same, numbers included, runs of whitespace aside: "Case 2-123" and
-/// "Case 2-124" are different rows. The one tolerance is a page number: a
+/// the same, letters, numbers, punctuation and case included: "Case 2-123"
+/// and "Case 2-124" are different rows. Whitespace is no part of the key,
+/// since OCR splits and joins words inconsistently ("Confi dential"). The one tolerance is a page number: a
 /// standalone number opening or closing the row that rises with the page
 /// (`value - page` the same on every page that shows the row), so "Annual
 /// Report 5" on page 5 and "Annual Report 6" on page 6 share a key.
@@ -317,22 +318,27 @@ impl ComparisonKeys {
         Self { folio_templates }
     }
 
-    fn key(&self, text: &str) -> String {
+    /// The row's key, and its length for the length floor: the
+    /// whitespace-collapsed text's characters, its page-number slot aside.
+    fn key(&self, text: &str) -> (String, usize) {
         let collapsed = normalize_whitespace(text);
+        let mut shown = collapsed.as_str();
+        let mut template = None;
         for leading in [false, true] {
-            if let Some((template, _)) = folio_slot(&collapsed, leading) {
-                if self.folio_templates.contains(&template) {
-                    return template;
+            if let Some((candidate, _)) = folio_slot(&collapsed, leading) {
+                if self.folio_templates.contains(&candidate) {
+                    template = Some(candidate);
+                    break;
                 }
             }
         }
-        collapsed
+        if let Some(template) = &template {
+            shown = template.as_str();
+        }
+        let chars = shown.replace(FOLIO, "").trim().chars().count();
+        let key = shown.chars().filter(|c| !c.is_whitespace()).collect();
+        (key, chars)
     }
-}
-
-/// A key's text length without its page-number slot, for the length floor.
-fn key_text_chars(key: &str) -> usize {
-    key.replace(FOLIO, "").trim().chars().count()
 }
 
 /// A parenthesized annotation marker: a short (≤3 chars) token of digits or
@@ -409,7 +415,7 @@ fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String)
 /// closing the row that rises with the page is the one tolerance, so headers
 /// like "Chapter 3 — Page 5" and "Chapter 3 — Page 6" are the same row. The
 /// first page that shows a repeated row keeps it.
-fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
+pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
     if lines.is_empty() || page_count < 3 {
         return lines;
     }
@@ -566,8 +572,8 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
         let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
         for (text, page, y) in rows {
-            let key = keys.key(text);
-            if key_text_chars(&key) < 10 || is_decorative_separator(&key) {
+            let (key, chars) = keys.key(text);
+            if chars < 10 || is_decorative_separator(&key) {
                 continue;
             }
             freq.entry(key.clone()).or_default().insert(*page);
@@ -649,7 +655,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if protected_bands.contains(&band_key(line)) {
             continue;
         }
-        let key = keys.key(&text);
+        let (key, _) = keys.key(&text);
         if candidates.contains(&key) {
             let first = first_page_individual.entry(key).or_insert(line.page);
             if line.page > *first {
@@ -672,7 +678,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         let (_, coalesced) = coalesced_band(&lines, indices);
-        let key = keys.key(&coalesced);
+        let (key, _) = keys.key(&coalesced);
         if band_candidates.contains(&key) {
             let first = first_page_band.entry(key).or_insert(page);
             if page < *first {
@@ -693,7 +699,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if is_structural_line(coalesced.trim()) {
             continue;
         }
-        let key = keys.key(&coalesced);
+        let (key, _) = keys.key(&coalesced);
         if band_candidates.contains(&key) {
             let first = first_page_band.get(&key).copied().unwrap_or(0);
             if page > first {
@@ -1811,5 +1817,20 @@ mod tests {
             4,
         );
         assert_eq!(header_pages(&result, "Annual Report of the Board").len(), 4);
+    }
+
+    #[test]
+    fn rows_that_differ_only_in_spacing_repeat() {
+        // OCR splits words inconsistently: whitespace is no part of a row.
+        let spellings = [
+            "",
+            "Confidential: Acme Holdings",
+            "Confi dential: Acme Holdings",
+        ];
+        let result = strip_repeated_lines(
+            headed_pages(4, |p| spellings[1 + (p as usize % 2)].into()),
+            4,
+        );
+        assert_eq!(header_pages(&result, "Acme Holdings"), [1]);
     }
 }

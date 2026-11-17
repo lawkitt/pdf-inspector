@@ -11807,3 +11807,52 @@ fn test_per_page_extraction_keeps_every_running_header() {
         .iter()
         .all(|page| page.markdown.contains("Case No. 2-123/2026")));
 }
+
+#[cfg(feature = "ocr")]
+#[test]
+fn test_two_page_native_footer_stays_on_both_pages() {
+    use lopdf::{dictionary, Document};
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    // A small footer set well apart from the body on both pages of a
+    // two-page document: no repetition evidence, so it stays on both
+    // pages in the pipeline mdoc runs, and nothing is counted.
+    let mut doc = Document::with_version("1.5");
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let pages_id = doc.new_object_id();
+    let mut kids = Vec::new();
+    for page in 1..=2u32 {
+        let mut content =
+            String::from("BT /F1 7 Tf 72 30 Td (Confidential draft of the agreement) Tj ET\n");
+        for line in 0..14u32 {
+            content.push_str(&format!(
+                "BT /F1 11 Tf 72 {} Td (Clause {line} of sheet {page}: the parties agree.) Tj ET\n",
+                700 - 16 * line
+            ));
+        }
+        kids.push(add_page(
+            &mut doc,
+            pages_id,
+            &content,
+            LETTER_BOX,
+            None,
+            &[("F1", font_id)],
+        ));
+    }
+    let pdf = finish_document(doc, pages_id, kids);
+    let result = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native pass");
+    assert_eq!(
+        result
+            .markdown
+            .matches("Confidential draft of the agreement")
+            .count(),
+        2,
+        "{}",
+        result.markdown
+    );
+    assert!(result.repeated_lines_by_page.is_empty());
+}

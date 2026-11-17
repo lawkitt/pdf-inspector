@@ -711,9 +711,6 @@ fn repeated_ocr_header_footer_spans(
     let Ok(page_count) = u32::try_from(full_pages.len()) else {
         return RepeatedOcrSpans::default();
     };
-    if page_count < 3 {
-        return RepeatedOcrSpans::default();
-    }
     let mut spans_by_item: HashMap<crate::HeaderFooterItemKey, Vec<(u32, usize)>> = HashMap::new();
     let mut items = Vec::new();
     for page in full_pages {
@@ -733,7 +730,6 @@ fn repeated_ocr_header_footer_spans(
         page_count,
         // As OCR Markdown conversion does: the calibrated folio bands.
         &HashMap::new(),
-        crate::FurnitureEvidence::RepetitionOnly,
     );
     let mut result = RepeatedOcrSpans {
         spans: BTreeMap::new(),
