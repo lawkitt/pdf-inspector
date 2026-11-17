@@ -10053,6 +10053,63 @@ fn test_live_header_over_dot_matrix_lettering_is_still_vector_text() {
     );
 }
 
+/// Twelve live header lines over `body`: the page of the rectangle
+/// exemption's counter-cases.
+fn make_header_over_paths_pdf(body: &str) -> Vec<u8> {
+    let mut content = String::from("BT /F1 12 Tf ");
+    for line in 0..12 {
+        content.push_str(&format!(
+            "1 0 0 1 72 {} Tm (Annual Report 2026) Tj ",
+            760 - line * 14
+        ));
+    }
+    content.push_str("ET\n");
+    content.push_str(body);
+    make_text_pdf(&content, "0 0 612 792")
+}
+
+/// Lettering built from larger rectangles (strokes 1.5 × 6 pt) plus one
+/// small decorative dot is vector text: the small rectangles that lie like
+/// rules must account for the paths exempted, and one dot does not.
+#[test]
+fn test_live_header_over_block_lettering_with_one_dot_is_still_vector_text() {
+    let mut body = String::from("300 50 0.5 0.5 re f\n");
+    for stroke in 0..20_000 {
+        let (x, y) = (40 + (stroke % 200) * 2, 100 + (stroke / 200) * 4);
+        body.push_str(&format!("{x} {y} 1.5 6 re f\n"));
+    }
+    let pages = extract_pages_markdown_mem(&make_header_over_paths_pdf(&body), None).unwrap();
+    assert!(pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_VECTOR_TEXT)
+    );
+}
+
+/// Repeated and densely overlapping small rectangles are not rules (they
+/// count once, or stack), and judging them stays linear: a hundred thousand
+/// copies of one dot, and twenty thousand dots inside a 3 pt square.
+#[test]
+fn test_repeated_or_overlapping_dots_are_not_rules() {
+    let repeated = "100 100 0.5 0.5 re f\n".repeat(100_000);
+    let mut overlapping = String::new();
+    for dot in 0..20_000 {
+        let (x, y) = (
+            100.0 + (dot % 30) as f32 * 0.1,
+            100.0 + (dot / 30 % 30) as f32 * 0.1,
+        );
+        overlapping.push_str(&format!("{x:.1} {y:.1} 0.5 0.5 re f\n"));
+    }
+    for body in [repeated, overlapping] {
+        let pages = extract_pages_markdown_mem(&make_header_over_paths_pdf(&body), None).unwrap();
+        assert!(pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
+        assert_eq!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_VECTOR_TEXT)
+        );
+    }
+}
+
 const MAC_ROMAN_HELVETICA: &str =
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /MacRomanEncoding >>";
 
