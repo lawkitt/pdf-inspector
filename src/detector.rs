@@ -1011,10 +1011,10 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // whose fill-in rules are dotted lines drawn as thousands of tiny shapes
     // next to a few repeated labels (upstream #361). The exemption holds
     // when the paths are mostly rectangles (each `re` and the paint after
-    // it), which outlined glyphs are not drawn with, however many dots
-    // there are; otherwise it is held to the same path operators per
-    // decoded character as the CID check, so a dozen live header lines over
-    // outlined body text stay vector text.
+    // it) that lie as dotted rules do, not stacked into lettering, however
+    // many dots there are; otherwise it is held to the same path operators
+    // per decoded character as the CID check, so a dozen live header lines
+    // over outlined body text stay vector text.
     let mut has_vector_text = path_ops >= 1000
         && path_ops > text_ops.saturating_mul(200)
         && (unique_alphanum_chars as usize) < VECTOR_TEXT_MIN_ALPHANUMERICS;
@@ -1023,7 +1023,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_vector_text = !(decoded.through_cid_cmap && decoded.is_page_text(path_ops))
             && !(has_decodable_text_fonts
                 && text_ops >= 10
-                && (rect_ops.saturating_mul(2) >= path_ops || decoded.outweighs_paths(path_ops)));
+                && ((rect_ops.saturating_mul(2) >= path_ops && executed.small_rects_form_rules)
+                    || decoded.outweighs_paths(path_ops)));
     }
 
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.

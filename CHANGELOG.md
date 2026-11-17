@@ -152,10 +152,10 @@ version and date. Earlier releases are described in their
   as thousands of tiny shapes is no longer taken for vector-outlined text:
   it kept no Markdown and was routed to OCR with reason `vector_text`. Text
   in a decodable font with ten or more text operators now exempts the page
-  when its paths are mostly rectangles (`re`), which outlined glyphs are not
-  drawn with, or when there are at most 100 path operators per decoded
-  character; a few live header lines over outlined body text still go to
-  OCR. ([#361](https://github.com/firecrawl/pdf-inspector/pull/361), ported:
+  when its paths are mostly small rectangles (`re`) lying in rows like the
+  dots of rules, not stacked like dot-matrix lettering, or when there are
+  at most 100 path operators per decoded character; a few live header lines
+  over outlined body text still go to OCR. ([#361](https://github.com/firecrawl/pdf-inspector/pull/361), ported:
   the exemption only, with the fork's rectangle and path-operator checks)
 - Per-page Markdown extraction and the OCR pipeline no longer recommend
   OCR for a blank page: one whose content paints no image, path, shading,

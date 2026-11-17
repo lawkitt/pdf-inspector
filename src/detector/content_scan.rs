@@ -63,6 +63,10 @@ pub(super) struct ExecutedContent {
     /// or is itself past `FORM_CONTENT_CACHE_MAX_BYTES` — from which point
     /// no form is followed and the evidence is incomplete.
     pub(super) form_bytes_exceeded: bool,
+    /// Whether the small rectangles the content draws lie the way the dots
+    /// of dotted rules do rather than the way dots of lettering do (see
+    /// [`small_rects_form_rules`]).
+    pub(super) small_rects_form_rules: bool,
 }
 
 /// The page's content streams read as one — the text render mode and the
@@ -336,6 +340,9 @@ struct ContentScanState<'a> {
     picture_boxes: Vec<UserBox>,
     /// The boxes in `picture_boxes`, by their coordinates' bits.
     picture_box_keys: HashSet<[u64; 4]>,
+    /// The centres, on the page, of the small rectangles (`re`) drawn, up
+    /// to `SMALL_RECTS_MAX`.
+    small_rect_centers: Vec<(f32, f32)>,
     /// The clip-only text whose clip was set at the current level and has
     /// not been painted through, a text object at a time; that of outer
     /// levels sits in `saved`.
@@ -422,6 +429,7 @@ impl<'a> ContentScanState<'a> {
             drew_image_on_page: false,
             picture_boxes: Vec::new(),
             picture_box_keys: HashSet::new(),
+            small_rect_centers: Vec::new(),
             clip_text: Vec::new(),
             pending_clip_text_ops: 0,
             clip_text_ops_open: 0,
@@ -661,6 +669,15 @@ impl<'a> ContentScanState<'a> {
     /// A rectangle of the path under construction (`re`), in user space.
     fn path_rect(&mut self, [x, y, w, h]: [f64; 4]) {
         if let Some(rect) = self.transformed_box([x, y, x + w, y + h]) {
+            if rect.x1 - rect.x0 <= SMALL_RECT_MAX_SIDE
+                && rect.y1 - rect.y0 <= SMALL_RECT_MAX_SIDE
+                && self.small_rect_centers.len() < SMALL_RECTS_MAX
+            {
+                self.small_rect_centers.push((
+                    ((rect.x0 + rect.x1) / 2.0) as f32,
+                    ((rect.y0 + rect.y1) / 2.0) as f32,
+                ));
+            }
             self.path_box = Some(self.path_box.map_or(rect, |path| path.union(&rect)));
         }
     }
@@ -1038,8 +1055,48 @@ impl<'a> ContentScanState<'a> {
             shows_only_a_hidden_text_layer: self.shows_only_a_hidden_text_layer(),
             form_bytes: self.executed_form_bytes,
             form_bytes_exceeded: self.form_bytes_exceeded,
+            small_rects_form_rules: small_rects_form_rules(&self.small_rect_centers),
         }
     }
+}
+
+/// The longest side, in points on the page, of a rectangle counted as a
+/// dot (see [`small_rects_form_rules`]).
+const SMALL_RECT_MAX_SIDE: f64 = 3.0;
+
+/// The most small rectangles a page's scan keeps; past it the verdict
+/// covers those kept.
+const SMALL_RECTS_MAX: usize = 100_000;
+
+/// Whether small rectangles lie like the dots of dotted rules: in rows with
+/// nothing stacked close above or below. Dots that build lettering (a dot
+/// matrix, block letters) have neighbours a dot pitch above or below; a
+/// dotted rule's nearest row is the next rule, a line apart. At most one
+/// dot in ten may have another within 1 pt across and 0.2–4 pt up or down.
+fn small_rects_form_rules(centers: &[(f32, f32)]) -> bool {
+    if centers.is_empty() {
+        return false;
+    }
+    let cell = |v: f32| v.floor() as i32;
+    let mut cells: HashMap<(i32, i32), Vec<(f32, f32)>> = HashMap::new();
+    for &(x, y) in centers {
+        cells.entry((cell(x), cell(y))).or_default().push((x, y));
+    }
+    let stacked = centers
+        .iter()
+        .filter(|&&(x, y)| {
+            (cell(x) - 1..=cell(x) + 1).any(|cx| {
+                (cell(y) - 5..=cell(y) + 5).any(|cy| {
+                    cells.get(&(cx, cy)).is_some_and(|dots| {
+                        dots.iter().any(|&(dx, dy)| {
+                            (dx - x).abs() <= 1.0 && (0.2..=4.0).contains(&(dy - y).abs())
+                        })
+                    })
+                })
+            })
+        })
+        .count();
+    stacked * 10 <= centers.len()
 }
 
 /// The most distinct image-draw boxes a page's scan keeps for
