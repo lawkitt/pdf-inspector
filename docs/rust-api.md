@@ -520,6 +520,42 @@ draws them, `rotation` reads `0` for text that renders horizontally, and
 region rects can be taken straight from a rendered page image. `/Rotate` is
 read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 
+## Annotations
+
+Annotations that carry text are reported beside the Markdown and never in it:
+`PagesExtractionResult::annotations` (from `extract_pages_markdown_mem`) and
+`vision::OcrPdfResult::annotations` (from `process_pdf_with_ocr_mem`, native
+extraction, whether or not a page was recognized) list the requested pages'
+sticky notes (`/Text`), FreeText boxes and text markup (`/Highlight`,
+`/Underline`, `/StrikeOut`, `/Squiggly`) that have a `/Contents` or rich text
+`/RC`, as `PdfAnnotation`s, in page order and then `/Annots` order.
+
+| Field | Meaning |
+|---|---|
+| `page` | 1-indexed page |
+| `kind` | `AnnotationKind`: `Text`, `FreeText`, `Highlight`, `Underline`, `StrikeOut`, `Squiggly` |
+| `author` | `/T`, trimmed; `None` when missing or empty |
+| `date` | `/M`, else `/CreationDate`, as written (normally `D:YYYYMMDDHHmmSS…`) |
+| `text` | `/Contents`, else `/RC` reduced to plain text (paragraphs and `<br>` as line breaks, entities decoded); lines end in `\n` |
+| `rect` | `/Rect` as an `AnnotationRect` (`x`, `y`, `width`, `height`) |
+| `quads` | markup only: the box around each `/QuadPoints` quad, in order |
+| `in_reply_to` | index in the same list of the annotation this one replies to (`/IRT`, unless `/RT /Group`); `None` when not a reply or the parent is not listed |
+| `resolved` | the latest review state recorded for it (a reply with `/State` under `/StateModel /Review`, latest by date, else by order) is `Accepted` or `Completed` |
+| `marked_text` | markup only: the page text under the quads, as whole words whose estimated middle lies within a quad; `None` when nothing is under them and on pages whose text needs OCR |
+
+Geometry uses the [coordinate frame](#coordinate-frame) of positioned items:
+PDF points from the visible page box's lower-left corner, `y` up. Neither
+`/Rotate` nor the synthetic turn of a predominantly rotated page is applied,
+so a box is where the page's own content would draw it, shifted by the box's
+corner. Popups are not entries (their text is their parent's), and neither is
+a review-state reply: it sets its parent's `resolved`. An annotation that
+cannot be read (no four-number `/Rect`, no text, not a dictionary) is skipped
+and never fails the extraction. The work is bounded: at most `MAX_ANNOTATIONS`
+(10,000) entries and 100,000 `/Annots` entries examined per extraction, text
+cut at `MAX_ANNOTATION_TEXT_CHARS` (32,768) characters, author and date at
+`MAX_ANNOTATION_AUTHOR_CHARS` (512) and `MAX_ANNOTATION_DATE_CHARS` (64), at
+most `MAX_ANNOTATION_QUADS` (1,000) quads, and at most 1 MiB of `/RC`.
+
 ## Processing modes
 
 | Mode | What it does | Returns |
@@ -584,7 +620,10 @@ Low-level detection functions are also available via the `detector` module (`det
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
-| `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
+| `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, the counts of what the Markdown leaves out (images_by_page, form_field_names_by_page, invisible_text_by_page), annotations, is_complex |
+| `PdfAnnotation` | An annotation that carries text, reported beside the Markdown: page, kind, author, date, text, rect, quads, in_reply_to, resolved, marked_text (see [Annotations](#annotations)) |
+| `AnnotationKind` | `Text` (sticky note), `FreeText`, `Highlight`, `Underline`, `StrikeOut`, `Squiggly` |
+| `AnnotationRect` | `x`, `y`, `width`, `height` in the visible-page-box frame, lower-left origin, `y` up |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |
 # Fork additions: explicit local OCR model and runtime selection
 

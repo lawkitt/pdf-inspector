@@ -53,6 +53,15 @@ version and date. Earlier releases are described in their
   rotated runs, runs in optional content, Type3 fonts or unread colour
   spaces, and runs under a translucent, blended or masked paint.
   `include_invisible` brings these runs back, as it does render-mode-3 text.
+- Per-page Markdown extraction and the OCR pipeline report the annotations
+  that carry text (`annotations`, a list of `PdfAnnotation`): sticky notes,
+  FreeText boxes and text markup with a comment, each with its page, kind,
+  author, date as written, text (`/Contents`, or `/RC` as plain text),
+  rectangle and quads in the visible-page-box frame, the reply it answers,
+  whether a review state resolved it, and the page text under its quads.
+  Popups and review-state replies are not entries; a malformed annotation
+  is skipped; counts and string sizes are bounded. Markdown output is
+  unchanged.
 
 ### Changed
 

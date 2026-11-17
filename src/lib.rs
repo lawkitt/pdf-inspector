@@ -55,6 +55,10 @@ pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
+pub use extractor::annotations::{
+    MAX_ANNOTATIONS, MAX_ANNOTATION_AUTHOR_CHARS, MAX_ANNOTATION_DATE_CHARS, MAX_ANNOTATION_QUADS,
+    MAX_ANNOTATION_TEXT_CHARS,
+};
 pub use extractor::geometry::PageRotation;
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_and_rotations_mem,
@@ -245,6 +249,86 @@ pub struct PageHiddenText {
 /// hidden: 6 of 255, about 2.4 %. 0.98 gray on white is hidden; 0.96 gray
 /// stays.
 pub const HIDDEN_TEXT_COLOUR_TOLERANCE: u8 = extractor::hidden_paint::SAME_COLOUR_TOLERANCE;
+/// What kind of annotation a [`PdfAnnotation`] is: its `/Subtype`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnnotationKind {
+    /// A sticky note (`/Text`): an icon whose text opens in a popup.
+    Text,
+    /// Text drawn on the page in a box (`/FreeText`).
+    FreeText,
+    /// Text markup: a highlight.
+    Highlight,
+    /// Text markup: an underline.
+    Underline,
+    /// Text markup: a strikethrough (`/StrikeOut`).
+    StrikeOut,
+    /// Text markup: a jagged underline (`/Squiggly`).
+    Squiggly,
+}
+
+/// A box on the page, in PDF points relative to the visible page box's
+/// lower-left corner, `y` growing upward: the frame of [`TextItem`] on an
+/// upright page. `/Rotate` is not applied, and neither is the synthetic turn
+/// of a page whose text is predominantly rotated, so the box is where the
+/// page's own content would draw it. `width` and `height` are never
+/// negative.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnotationRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// An annotation that carries text — a sticky note, a FreeText box, or
+/// text markup (highlight, underline, strikethrough, squiggly) with a
+/// comment — reported beside the Markdown, never in it.
+///
+/// Popups are not entries of their own: their text is their parent's.
+/// An annotation recording a review state (a `/Text` annotation with
+/// `/State` and `/IRT`) is not an entry either; it sets its parent's
+/// [`resolved`](Self::resolved). An annotation that cannot be read (no
+/// usable `/Rect`, no text, not a dictionary) is skipped. Counts and string
+/// lengths are bounded: [`MAX_ANNOTATIONS`], [`MAX_ANNOTATION_TEXT_CHARS`],
+/// [`MAX_ANNOTATION_AUTHOR_CHARS`], [`MAX_ANNOTATION_DATE_CHARS`],
+/// [`MAX_ANNOTATION_QUADS`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PdfAnnotation {
+    /// 1-indexed page number.
+    pub page: u32,
+    pub kind: AnnotationKind,
+    /// The author (`/T`), trimmed; `None` when missing or empty.
+    pub author: Option<String>,
+    /// `/M`, else `/CreationDate`, as written (normally a PDF date such as
+    /// `D:20261118093000+07'00'`); `None` when neither is a string.
+    pub date: Option<String>,
+    /// `/Contents`, else the rich text `/RC` reduced to plain text
+    /// (paragraphs and `<br>` as line breaks). Lines end in `\n`; never
+    /// empty.
+    pub text: String,
+    /// `/Rect`, normalized (see [`AnnotationRect`]).
+    pub rect: AnnotationRect,
+    /// For text markup, the box around each quad of `/QuadPoints`, in
+    /// order; empty for notes and FreeText and when the quads are unusable.
+    pub quads: Vec<AnnotationRect>,
+    /// The index, in the same list, of the annotation this one replies to
+    /// (`/IRT`, unless `/RT /Group`); `None` when it is not a reply or its
+    /// parent is not in the list (another kind, unreadable, or on a page
+    /// not requested). Following it always ends: a link that would close a
+    /// cycle is `None`.
+    pub in_reply_to: Option<usize>,
+    /// Whether the PDF records the annotation as resolved: its latest
+    /// review state (a reply with `/State` under `/StateModel /Review`,
+    /// latest by date, else by order) is `Accepted` or `Completed`. `false`
+    /// when there is none.
+    pub resolved: bool,
+    /// For text markup, the page text under the quads, read from the
+    /// extracted text runs: whole words whose estimated middle lies within
+    /// a quad (glyph positions inside a run are estimated), joined with
+    /// spaces. `None` for notes and FreeText, when nothing is under the
+    /// quads, and on pages whose text needs OCR.
+    pub marked_text: Option<String>,
+}
 
 /// The shortest side, in points, an image must be drawn at to count in
 /// [`PageImages`]: about 1.4 mm.
@@ -662,6 +746,10 @@ pub struct PagesExtractionResult {
     /// The requested pages that left hidden text out of their Markdown,
     /// with how much, in request order (see [`PageHiddenText`]).
     pub hidden_text_by_page: Vec<PageHiddenText>,
+    /// The annotations of the requested pages that carry text, in request
+    /// order and then the order of each page's `/Annots`. They are never in
+    /// the Markdown.
+    pub annotations: Vec<PdfAnnotation>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -770,7 +858,7 @@ fn extract_pages_markdown_mem_impl(
         (all_items, all_rects, all_lines),
         page_thresholds,
         gid_pages,
-        _page_rotations,
+        page_rotations,
         _,
         invisible_text_by_page,
         hidden_text,
@@ -834,6 +922,7 @@ fn extract_pages_markdown_mem_impl(
     let mut form_field_names_by_page = Vec::new();
     let mut invisible_text_pages = Vec::new();
     let mut hidden_text_by_page = Vec::new();
+    let mut annotations = extractor::annotations::Collector::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
@@ -856,6 +945,9 @@ fn extract_pages_markdown_mem_impl(
         }
 
         let page_1idx = page_0idx + 1;
+        if let Some(&page_id) = lopdf_pages.get(&page_1idx) {
+            annotations.add_page(&doc, page_1idx, page_id);
+        }
 
         // Partition items, removal decisions, and rects for this page only.
         let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
@@ -1028,6 +1120,7 @@ fn extract_pages_markdown_mem_impl(
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
+            annotations.mark_text_unreliable(page_1idx);
         }
 
         results.push(PageMarkdown {
@@ -1057,6 +1150,7 @@ fn extract_pages_markdown_mem_impl(
             form_field_names_by_page,
             invisible_text_by_page: invisible_text_pages,
             hidden_text_by_page,
+            annotations: annotations.finish(&all_items, &page_rotations),
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
