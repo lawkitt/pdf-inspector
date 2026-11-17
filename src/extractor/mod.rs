@@ -772,10 +772,12 @@ fn extract_positioned_text_impl(
         });
         if let Some((bx0, by0, bx1, by1)) = clip_box {
             const TOL: f32 = 6.0;
-            // A run is off the page when its baseline is outside the box, or
-            // its centre is and no part of it reaches into the box: a run the
-            // crop edge cuts through is partly visible and stays.
-            let off_box = |x: f32, y: f32, width: f32| {
+            // A run is off the page when no part of its height (baseline up
+            // to `height`) is within the box, or when its centre is out of
+            // the box and no part of its width reaches in: a run the crop
+            // edge cuts through, at a side or at the top or bottom, is
+            // partly visible and stays.
+            let off_box = |x: f32, y: f32, width: f32, height: f32| {
                 let cx = x + width / 2.0;
                 let (x0, x1) = if width < 0.0 {
                     (x + width, x)
@@ -783,10 +785,10 @@ fn extract_positioned_text_impl(
                     (x, x + width)
                 };
                 let reaches_in = x0 < bx1 && x1 > bx0;
-                !(y >= by0 - TOL && y <= by1 + TOL)
+                !(y + height.max(0.0) >= by0 - TOL && y <= by1 + TOL)
                     || (!(cx >= bx0 - TOL && cx <= bx1 + TOL) && !reaches_in)
             };
-            let outside = |it: &TextItem| off_box(it.x, it.y, it.width);
+            let outside = |it: &TextItem| off_box(it.x, it.y, it.width, it.height);
             // Only clip when the off-page material reads as coherent text
             // (neighboring-page paragraphs, or a single off-page phrase).
             // Curved/rotated display text leaves short glyph fragments with
@@ -821,9 +823,11 @@ fn extract_positioned_text_impl(
                 let before = items.len();
                 items.retain(|it| !outside(it));
                 // The runs left out take their CMap coverage with them; a
-                // run without a position (see `RunCoverage`) stays.
+                // run without a position (see `RunCoverage`) stays. A
+                // coverage position carries no height, so it is judged by
+                // its baseline.
                 run_coverage.retain(|run| match run.position {
-                    Some((x, y, width)) => !off_box(x, y, width),
+                    Some((x, y, width)) => !off_box(x, y, width, 0.0),
                     None => true,
                 });
                 if items.len() < before {

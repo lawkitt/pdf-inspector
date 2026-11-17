@@ -6915,6 +6915,18 @@ fn test_sparse_clipping_keeps_continuations_on_the_left() {
     assert!(text.contains("Prefix"), "{text}");
 }
 
+/// The same at the bottom edge: a large phrase whose baseline sits below
+/// the CropBox while its glyphs rise into it is partly visible and stays.
+#[test]
+fn test_sparse_clipping_keeps_runs_cut_by_the_bottom_edge() {
+    let content = "BT /F1 10 Tf 1 0 0 1 200 700 Tm (Body text inside the page) Tj \
+                   /F1 36 Tf 1 0 0 1 100 40 Tm (Rising words) Tj ET";
+    let pdf = make_text_pdf_with_boxes(content, "0 0 612 792", Some("50 50 562 742"));
+    let text = joined_item_text(&pdf);
+    assert!(text.contains("Body text inside the page"), "{text}");
+    assert!(text.contains("Rising words"), "{text}");
+}
+
 // ============================================================================
 // Image XObject emission
 // ============================================================================
