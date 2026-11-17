@@ -1220,6 +1220,15 @@ pub(crate) fn repeated_header_footer_items(
         .iter()
         .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
         .collect();
+    // A row a table holds is that table's own, not a running header, on
+    // every page that repeats it (a continued table's column-header row):
+    // the pages that would lose a line are checked for tables.
+    let pages: HashSet<u32> = line_rows
+        .iter()
+        .filter(|(_, _, _, _, keys)| keys.iter().any(|key| !kept_items.contains(key)))
+        .map(|(page, _, _, _, _)| *page)
+        .collect();
+    let in_tables = table_item_keys_on_pages(items, &pages);
     let mut removed = RepeatedHeaderFooter::default();
     // One visual row, however many lines it was grouped into: its removed
     // lines' text, left to right.
@@ -1229,7 +1238,7 @@ pub(crate) fn repeated_header_footer_items(
     for (page, row, left, text, keys) in line_rows {
         let mut line_removed = false;
         for key in keys {
-            if !kept_items.contains(&key) {
+            if !kept_items.contains(&key) && !in_tables.contains(&key) {
                 line_removed = true;
                 removed.items.insert(key);
             }
@@ -1330,6 +1339,137 @@ mod ocr_header_footer_tests {
                 500.0,
             ))));
         }
+    }
+}
+
+/// The items of `items` on `pages` that a table holds, by heuristic table
+/// detection on each page's text. A table continued over several pages
+/// repeats its column-header row at the top of each; on every page that row
+/// is the table's header, not a running header, so the repetition pass
+/// must not take it (lawkitt/mdoc#925). Whole-document conversion claims
+/// tables before it strips repeats; per-page extraction strips first, so
+/// the pages that lost a row are checked here.
+fn table_item_keys_on_pages(
+    items: &[TextItem],
+    pages: &HashSet<u32>,
+) -> HashSet<HeaderFooterItemKey> {
+    let mut keys = HashSet::new();
+    for &page in pages {
+        let page_items: Vec<TextItem> = items
+            .iter()
+            .filter(|item| {
+                item.page == page
+                    && matches!(
+                        item.item_type,
+                        types::ItemType::Text | types::ItemType::FormField
+                    )
+            })
+            .cloned()
+            .collect();
+        let base_size =
+            markdown::analysis::calculate_font_stats_from_items(&page_items).most_common_size;
+        for table in tables::detect_tables(&page_items, base_size, false) {
+            keys.extend(
+                table
+                    .item_indices
+                    .iter()
+                    .filter_map(|&index| page_items.get(index))
+                    .map(HeaderFooterItemKey::from),
+            );
+        }
+    }
+    keys
+}
+
+#[cfg(test)]
+mod repeated_table_header_tests {
+    use super::*;
+
+    fn item(page: u32, text: &str, x: f32, y: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height: 10.0,
+            font: "Test".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size: 10.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            layout_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: types::ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    /// A table continued over three pages repeats its column headers at the
+    /// top of each page under a running header. The running header goes
+    /// from pages 2 and 3; the column headers stay on every page.
+    #[test]
+    fn a_continued_tables_header_row_is_not_a_running_header() {
+        let columns = [72.0, 220.0, 350.0, 460.0];
+        let headers = ["Item code", "Description", "Quantity", "Unit price"];
+        let mut items = Vec::new();
+        let mut row = 0;
+        for page in 1..=3 {
+            items.push(item(
+                page,
+                "Northwind Quarterly Inventory Report",
+                72.0,
+                750.0,
+                180.0,
+            ));
+            for (x, text) in columns.iter().zip(headers) {
+                items.push(item(page, text, *x, 700.0, 55.0));
+            }
+            for line in 1..=12 {
+                row += 1;
+                let y = 700.0 - line as f32 * 20.0;
+                let cells = [
+                    format!("NW-{}", 1000 + row),
+                    format!("Widget model {row}"),
+                    format!("{}", 10 + row),
+                    format!("{}.25", 3 + row),
+                ];
+                for (x, text) in columns.iter().zip(&cells) {
+                    items.push(item(page, text, *x, y, 50.0));
+                }
+            }
+        }
+        let removed = repeated_header_footer_items(
+            &items,
+            &HashMap::new(),
+            &HashMap::new(),
+            3,
+            &HashMap::new(),
+        )
+        .items;
+        let removed_text: Vec<(u32, &str)> = items
+            .iter()
+            .filter(|item| removed.contains(&HeaderFooterItemKey::from(*item)))
+            .map(|item| (item.page, item.text.as_str()))
+            .collect();
+        assert_eq!(
+            removed_text,
+            [
+                (2, "Northwind Quarterly Inventory Report"),
+                (3, "Northwind Quarterly Inventory Report"),
+            ]
+        );
     }
 }
 
