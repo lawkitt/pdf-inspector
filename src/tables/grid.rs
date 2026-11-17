@@ -333,8 +333,8 @@ pub(crate) fn continues_cell_text(above: &str, below: &str) -> bool {
 /// baseline its own row, so a wrapped row came out as two. A row is such a
 /// line when the table's baselines fall into two spacings, line pitch and a
 /// looser row pitch, and the row sits at line pitch under the row above,
-/// fills fewer cells than it, only cells the row above fills too, holds no
-/// bare numbers, and at least half of its cells continue the text above
+/// fills fewer cells than it, only cells the row above fills too, has no
+/// cell that is a bare number, and at least half of its cells continue the text above
 /// (`continues_cell_text`). `rows` are the rows' baselines, top to bottom.
 pub(crate) fn wrapped_line_rows(rows: &[f32], cells: &[Vec<String>]) -> Vec<bool> {
     let mut wrapped = vec![false; rows.len()];
@@ -370,7 +370,7 @@ pub(crate) fn wrapped_line_rows(rows: &[f32], cells: &[Vec<String>]) -> Vec<bool
         if lines.is_empty()
             || lines.len() >= above.iter().filter(|cell| filled(cell)).count()
             || lines.iter().any(|&col| !above.get(col).is_some_and(filled))
-            || lines.iter().all(|&col| numeric(below[col].trim()))
+            || lines.iter().any(|&col| numeric(below[col].trim()))
         {
             continue;
         }
@@ -777,6 +777,16 @@ mod tests {
             row(&["Cost of sales", "60", "70"]),
             row(&["Operating expenses", "", ""]),
             row(&["Salaries", "20", "22"]),
+        ];
+        assert_eq!(wrapped_line_rows(&rows, &cells), [false; 4]);
+        // A record under the header at line pitch is data once it holds a
+        // number, however its words start.
+        let rows = [720.0, 708.0, 684.0, 660.0];
+        let cells = vec![
+            row(&["Product", "Quantity", "Description", "Notes"]),
+            row(&["widget", "12", "blue", ""]),
+            row(&["gadget", "7", "red", "new"]),
+            row(&["sprocket", "3", "green", "old"]),
         ];
         assert_eq!(wrapped_line_rows(&rows, &cells), [false; 4]);
         // Bare numbers under a row are data.
