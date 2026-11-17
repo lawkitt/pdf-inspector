@@ -2336,10 +2336,14 @@ fn merge_text_items_with_clips(
                 }
                 // Preserve the existing join behavior at non-bold style
                 // boundaries, including italic fragments within formulas.
-                // Strikes kept only as decorations (see
-                // `TextItem::layout_strikeout`) don't split a run.
+                // A merged run carries one decoration, so a strike that
+                // starts or ends here splits it, a strike kept only as a
+                // decoration (see `TextItem::layout_strikeout`) too:
+                // otherwise "Old" struck beside a live "New" reads as one
+                // struck "Old New", or loses its strike, by which comes first.
                 if next.is_italic != first.is_italic
                     || next.is_underline != first.is_underline
+                    || next.is_strikeout != first.is_strikeout
                     || next.layout_strikeout != first.layout_strikeout
                 {
                     break;
@@ -3406,6 +3410,38 @@ mod tests {
 
         let texts: Vec<_> = merged.iter().map(|item| item.text.as_str()).collect();
         assert_eq!(texts, vec!["•", "Distant item"]);
+    }
+
+    #[test]
+    fn a_kept_strike_does_not_spread_to_or_vanish_into_its_neighbour() {
+        // Strikes kept only as decorations (`layout_strikeout` false), beside
+        // a live word close enough to merge with: each word keeps its own
+        // decoration, whichever comes first.
+        for (old_struck, new_struck) in [(true, false), (false, true)] {
+            let mut old = make_merge_item("Old", 100.0, 20.0);
+            let mut new = make_merge_item("New", 123.0, 22.0);
+            old.is_strikeout = old_struck;
+            new.is_strikeout = new_struck;
+            let merged: Vec<_> = merge_text_items(vec![old, new])
+                .into_iter()
+                .map(|item| (item.text, item.is_strikeout))
+                .collect();
+            assert_eq!(
+                merged,
+                vec![
+                    ("Old".to_string(), old_struck),
+                    ("New".to_string(), new_struck)
+                ]
+            );
+        }
+        // Struck words merge with each other as before.
+        let mut a = make_merge_item("Old", 100.0, 20.0);
+        let mut b = make_merge_item("words", 123.0, 30.0);
+        a.is_strikeout = true;
+        b.is_strikeout = true;
+        let merged = merge_text_items(vec![a, b]);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].is_strikeout && !merged[0].layout_strikeout);
     }
 
     #[test]

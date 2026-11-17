@@ -91,6 +91,11 @@ version and date. Earlier releases are described in their
 - Multi-page OCR whose extra dispatch threads cannot start (the process is
   at its thread limit) runs the pages on the threads that did start, or on
   the calling thread, instead of panicking.
+- A strikethrough kept only as a decoration (repeated rules, a ruled
+  table) no longer spreads to the next word or vanishes when the two runs
+  merge: a run splits where its strike starts or ends, so `Old` struck
+  beside a live `New` reads `<s>Old</s> New`. This changes upstream 1.26.0's
+  merge rule (#663), which let such strikes run on.
 
 ## [1.26.1] - 2026-11-15
 
