@@ -1369,11 +1369,15 @@ fn table_item_keys_on_pages(
         let base_size =
             markdown::analysis::calculate_font_stats_from_items(&page_items).most_common_size;
         for table in tables::detect_tables(&page_items, base_size, false) {
+            let held: HashSet<usize> = table.item_indices.iter().copied().collect();
             keys.extend(
-                table
-                    .item_indices
-                    .iter()
+                held.iter()
                     .filter_map(|&index| page_items.get(index))
+                    .map(HeaderFooterItemKey::from),
+            );
+            keys.extend(
+                header_line_above(&page_items, &held, &table)
+                    .into_iter()
                     .map(HeaderFooterItemKey::from),
             );
         }
@@ -1381,21 +1385,89 @@ fn table_item_keys_on_pages(
     keys
 }
 
+/// The column-header line right above a detected table that the detector
+/// left out: header text set larger than the body is no candidate for its
+/// font passes, so the table starts at its first data row. The lowest line
+/// above that row, within two row pitches, counts as the header when its
+/// runs all sit over the table and over at least two of its columns, and
+/// over at least half of them.
+fn header_line_above<'a>(
+    items: &'a [TextItem],
+    held: &HashSet<usize>,
+    table: &tables::Table,
+) -> Vec<&'a TextItem> {
+    let (Some(&top), Some(&left)) = (table.rows.first(), table.columns.first()) else {
+        return Vec::new();
+    };
+    let right = held
+        .iter()
+        .filter_map(|&index| items.get(index))
+        .map(|item| item.x + item.width.max(0.0))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut gaps: Vec<f32> = table
+        .rows
+        .windows(2)
+        .map(|pair| (pair[0] - pair[1]).abs())
+        .collect();
+    gaps.sort_by(f32::total_cmp);
+    let Some(&pitch) = gaps.get(gaps.len() / 2) else {
+        return Vec::new();
+    };
+    let above: Vec<&TextItem> = items
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| {
+            !held.contains(index) && item.y > top + 1.0 && item.y <= top + 2.0 * pitch
+        })
+        .map(|(_, item)| item)
+        .collect();
+    let Some(line_y) = above.iter().map(|item| item.y).min_by(f32::total_cmp) else {
+        return Vec::new();
+    };
+    let line: Vec<&TextItem> = above
+        .into_iter()
+        .filter(|item| (item.y - line_y).abs() <= 2.0)
+        .collect();
+    let mut columns = HashSet::new();
+    for item in &line {
+        let center = item.x + item.width.max(0.0) / 2.0;
+        if center < left - 10.0 || center > right + 10.0 {
+            return Vec::new();
+        }
+        columns.insert(
+            table
+                .columns
+                .iter()
+                .filter(|&&start| start <= center + 10.0)
+                .count(),
+        );
+    }
+    if columns.len() >= 2 && columns.len() * 2 >= table.columns.len() {
+        line
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod repeated_table_header_tests {
     use super::*;
 
     fn item(page: u32, text: &str, x: f32, y: f32, width: f32) -> TextItem {
+        sized_item(page, text, x, y, width, 10.0)
+    }
+
+    fn sized_item(page: u32, text: &str, x: f32, y: f32, width: f32, size: f32) -> TextItem {
         TextItem {
             text: text.to_string(),
             x,
             y,
             width,
-            height: 10.0,
+            height: size,
             font: "Test".to_string(),
             font_tag: String::new(),
             legacy_symbol_rewrite: false,
-            font_size: 10.0,
+            font_size: size,
             page,
             is_bold: false,
             is_italic: false,
@@ -1418,9 +1490,16 @@ mod repeated_table_header_tests {
 
     /// A table continued over three pages repeats its column headers at the
     /// top of each page under a running header. The running header goes
-    /// from pages 2 and 3; the column headers stay on every page.
+    /// from pages 2 and 3; the column headers stay on every page, whether
+    /// they are set at the body size or larger.
     #[test]
     fn a_continued_tables_header_row_is_not_a_running_header() {
+        for header_size in [10.0, 12.0] {
+            continued_table_keeps_its_header(header_size);
+        }
+    }
+
+    fn continued_table_keeps_its_header(header_size: f32) {
         let columns = [72.0, 220.0, 350.0, 460.0];
         let headers = ["Item code", "Description", "Quantity", "Unit price"];
         let mut items = Vec::new();
@@ -1434,7 +1513,7 @@ mod repeated_table_header_tests {
                 180.0,
             ));
             for (x, text) in columns.iter().zip(headers) {
-                items.push(item(page, text, *x, 700.0, 55.0));
+                items.push(sized_item(page, text, *x, 700.0, 66.0, header_size));
             }
             for line in 1..=12 {
                 row += 1;
@@ -1468,7 +1547,8 @@ mod repeated_table_header_tests {
             [
                 (2, "Northwind Quarterly Inventory Report"),
                 (3, "Northwind Quarterly Inventory Report"),
-            ]
+            ],
+            "header size {header_size}"
         );
     }
 }
