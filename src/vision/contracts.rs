@@ -203,6 +203,10 @@ pub struct PageProvenance {
     pub timings: VisionTimings,
     /// Non-fatal warnings surfaced to downstream users.
     pub warnings: Vec<String>,
+    /// Running header or footer rows this page's content left out as exact
+    /// repeats of a row kept on an earlier page; see
+    /// [`PageRepeatedLines`](crate::PageRepeatedLines).
+    pub repeated_lines: u32,
     /// True when this lightweight local path detected a case better suited to
     /// Firecrawl's hosted document pipeline.
     pub hosted_recommended: bool,
