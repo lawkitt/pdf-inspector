@@ -537,9 +537,10 @@ fn merging_a_continued_table_keeps_and_joins_the_split_row() {
 }
 
 /// Three pages of one inventory table under a running header; each page
-/// repeats the table's column-header row at its top, ruled or not.
+/// repeats the table's column-header row at its top, ruled or not, set in
+/// `header_size` bold over a 10 pt body.
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
-fn continued_table_pages(ruled: bool) -> Vec<String> {
+fn continued_table_pages(ruled: bool, header_size: f32) -> Vec<String> {
     let columns = [72.0, 220.0, 350.0, 460.0];
     let headers = ["Item code", "Description", "Quantity", "Unit price"];
     let mut pages = Vec::new();
@@ -565,7 +566,7 @@ fn continued_table_pages(ruled: bool) -> Vec<String> {
         }
         let top = y + 14.0;
         for (x, header) in columns.iter().zip(headers) {
-            content += &text("F2", 10.0, *x, y, header);
+            content += &text("F2", header_size, *x, y, header);
         }
         let mut baselines = vec![y];
         for _ in 0..12 {
@@ -601,27 +602,36 @@ fn continued_table_pages(ruled: bool) -> Vec<String> {
 /// before it detects tables, so a continued table's column-header row,
 /// repeated at the top of every page, was taken for a running header and
 /// kept on page 1 only. It is the header of each page's table; the running
-/// header above it still goes after page 1.
+/// header above it still goes after page 1. A header set larger than the
+/// body stays out of the table on page 1 too (Markdown conversion reads it
+/// as a heading); what matters here is that every page keeps it.
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 #[test]
 fn a_continued_tables_header_row_stays_on_every_page() {
     use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
 
-    for ruled in [true, false] {
+    for (ruled, header_size) in [(true, 10.0), (false, 10.0), (true, 12.0), (false, 12.0)] {
         let result = process_pdf_with_ocr_mem(
-            &make_pdf(&continued_table_pages(ruled)),
+            &make_pdf(&continued_table_pages(ruled, header_size)),
             OcrPdfOptions::new(),
         )
         .expect("native pass converts");
         assert_eq!(result.pages.len(), 3);
         for page in &result.pages {
-            assert_eq!(
-                table_rows(&page.markdown).first().copied(),
-                Some("|Item code|Description|Quantity|Unit price|"),
-                "ruled: {ruled}, page {}:\n{}",
-                page.page_number,
-                page.markdown
+            let context = format!(
+                "ruled: {ruled}, header {header_size} pt, page {}:\n{}",
+                page.page_number, page.markdown
             );
+            for header in ["Item code", "Description", "Quantity", "Unit price"] {
+                assert_eq!(page.markdown.matches(header).count(), 1, "{context}");
+            }
+            if header_size == 10.0 {
+                assert_eq!(
+                    table_rows(&page.markdown).first().copied(),
+                    Some("|Item code|Description|Quantity|Unit price|"),
+                    "{context}"
+                );
+            }
         }
         assert_eq!(
             result
