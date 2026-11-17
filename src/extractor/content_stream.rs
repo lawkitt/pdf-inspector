@@ -23,6 +23,7 @@ use super::geometry::{
     advanced_tm, estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees,
     reading_direction, rise_adjusted, scaled_run_geometry, PageRotation, RunGeometry,
 };
+use super::invisible::{blank_show, InvisibleText};
 use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
 use super::word_gaps::{
@@ -502,20 +503,21 @@ pub(crate) fn extract_page_text_items(
         form_budget,
     )
     .map(
-        |(extraction, has_gid_fonts, rotation, skipped_invisible, _coverage)| {
-            (extraction, has_gid_fonts, rotation, skipped_invisible)
+        |(extraction, has_gid_fonts, rotation, invisible, _coverage)| {
+            (extraction, has_gid_fonts, rotation, invisible.any())
         },
     )
 }
 
-/// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible,
+/// Returns `(page_extraction, has_gid_fonts, page_rotation, invisible_text,
 /// run_coverage)` where `has_gid_fonts` indicates the page uses fonts with
 /// unresolvable gid-encoded glyphs, `page_rotation` says whether (and which
 /// way) the coordinate frame was turned so predominantly rotated text reads
 /// along +x — region boxes must follow it (see `PageRotation`) —
-/// `skipped_invisible` reports that invisible (Tr 3) text was present but
+/// `invisible_text` reports whether invisible (Tr 3) text was present but
 /// suppressed — callers can use it to decide whether an `include_invisible`
-/// retry could recover anything at all — and `run_coverage` gives, per run
+/// retry could recover anything at all — and in how many stretches (see
+/// [`InvisibleText`]) — and `run_coverage` gives, per run
 /// of text, the codes the run showed through its font's CMap and how many
 /// of them the CMap had no entry for, with the run's geometry in the
 /// items' frame so a caller that leaves runs out can leave their codes
@@ -528,7 +530,16 @@ pub(crate) fn extract_page_text_items_with_options(
     options: TextExtractionOptions,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
-) -> Result<(PageExtraction, bool, PageRotation, bool, Vec<RunCoverage>), PdfError> {
+) -> Result<
+    (
+        PageExtraction,
+        bool,
+        PageRotation,
+        InvisibleText,
+        Vec<RunCoverage>,
+    ),
+    PdfError,
+> {
     let include_invisible = options.include_invisible;
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
@@ -677,7 +688,7 @@ pub(crate) fn extract_page_text_items_with_options(
                 (Vec::new(), Vec::new(), Vec::new()),
                 false,
                 PageRotation::Upright,
-                false,
+                InvisibleText::default(),
                 Vec::new(),
             ));
         }
@@ -703,7 +714,7 @@ pub(crate) fn extract_page_text_items_with_options(
                 (Vec::new(), Vec::new(), Vec::new()),
                 false,
                 PageRotation::Upright,
-                false,
+                InvisibleText::default(),
                 Vec::new(),
             ));
         }
@@ -712,9 +723,10 @@ pub(crate) fn extract_page_text_items_with_options(
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
-                                          // Invisible (Tr 3) text was present but suppressed — reported to callers
-                                          // so an include_invisible retry is attempted only when it can recover.
-    let mut skipped_invisible = false;
+                                          // Invisible (Tr 3) text that was present but suppressed — reported to
+                                          // callers so an include_invisible retry is attempted only when it can
+                                          // recover, and counted for callers that report what was left out.
+    let mut invisible_text = InvisibleText::default();
     let mut line_width: f32 = 1.0;
     let mut text_paint = TextPaint::default();
     // The fill colour is graphics state too: white text on the page shows
@@ -1096,13 +1108,13 @@ pub(crate) fn extract_page_text_items_with_options(
                     // For Mixed/template PDFs, include_invisible=true extracts
                     // the OCR text layer that sits behind scanned images.
                     if text_rendering_mode == 3 && !include_invisible {
-                        if op
+                        if let Some(raw) = op
                             .operands
                             .first()
                             .and_then(get_operand_bytes)
-                            .is_some_and(|raw| !raw.is_empty())
+                            .filter(|raw| !raw.is_empty())
                         {
-                            skipped_invisible = true;
+                            invisible_text.skip(items.len(), blank_show(raw));
                         }
                         let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
                         text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
@@ -1281,7 +1293,8 @@ pub(crate) fn extract_page_text_items_with_options(
                                 .iter()
                                 .any(|el| get_operand_bytes(el).is_some_and(|raw| !raw.is_empty()))
                         {
-                            skipped_invisible = true;
+                            let blank = array.iter().filter_map(get_operand_bytes).all(blank_show);
+                            invisible_text.skip(items.len(), blank);
                         }
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
@@ -1948,13 +1961,13 @@ pub(crate) fn extract_page_text_items_with_options(
                         text_rendering_mode,
                     );
                 }
-                if text_rendering_mode == 3
-                    && !include_invisible
-                    && show_operand
+                if text_rendering_mode == 3 && !include_invisible {
+                    if let Some(raw) = show_operand
                         .and_then(get_operand_bytes)
-                        .is_some_and(|raw| !raw.is_empty())
-                {
-                    skipped_invisible = true;
+                        .filter(|raw| !raw.is_empty())
+                    {
+                        invisible_text.skip(items.len(), blank_show(raw));
+                    }
                 }
                 if let Some(show_operand) = show_operand.filter(|_| {
                     !((text_rendering_mode == 3 && !include_invisible) || suppress_glyph_extraction)
@@ -2191,7 +2204,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         &mut rtl_logical_runs,
                                         &mut rtl_visual_runs,
                                         &mut form_runs,
-                                        &mut skipped_invisible,
+                                        &mut invisible_text,
                                     );
                                     // Form runs vote on page rotation like
                                     // page-stream runs — once per show
@@ -2368,7 +2381,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                 // are kept, and the skip is reported so the
                                 // invisible-text retry can recover the span.
                                 if hidden && !include_invisible {
-                                    skipped_invisible = true;
+                                    invisible_text.skip(items.len(), false);
                                 } else {
                                     rotation_votes.cast_direction(reading_direction(
                                         &combined,
@@ -2878,7 +2891,7 @@ pub(crate) fn extract_page_text_items_with_options(
         (items, rects, lines),
         has_gid_fonts,
         page_rotation,
-        skipped_invisible,
+        invisible_text,
         run_coverage,
     ))
 }

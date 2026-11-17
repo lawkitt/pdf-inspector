@@ -11646,3 +11646,44 @@ fn form_field_names_stay_out_of_the_markdown_and_are_counted() {
         assert_eq!(native.form_field_names_by_page, names);
     }
 }
+
+#[test]
+fn invisible_text_stays_out_and_is_counted_in_stretches() {
+    let pages = [
+        // 1: `3 Tr` set in one text object carries into the next (one
+        // stretch), visible text ends it, a later hidden run is a second.
+        "BT /F1 12 Tf 72 700 Td (Visible one) Tj ET\n\
+         BT 3 Tr 72 680 Td (SECRET-A) Tj ET\n\
+         BT 72 660 Td [(SECRET-B)] TJ ET\n\
+         BT 0 Tr 72 640 Td (Visible two) Tj ET\n\
+         BT 3 Tr 72 620 Td (SECRET-C) Tj ( ) Tj ET",
+        // 2: text only.
+        "BT /F1 12 Tf 72 700 Td (Only words) Tj ET",
+        // 3: hidden spaces only: nothing counted.
+        "BT /F1 12 Tf 3 Tr 72 700 Td (   ) Tj 0 Tr 0 -20 Td (Shown) Tj ET",
+        // 4: hidden inside q/Q; Q restores the visible mode.
+        "q BT /F1 12 Tf 3 Tr 72 700 Td (SECRET-D) Tj ET Q\n\
+         BT /F1 12 Tf 72 680 Td (After) Tj ET",
+    ];
+    let pdf = make_pdf_with_image_pages(&pages);
+    let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
+    let page = |page, stretches| pdf_inspector::PageInvisibleText { page, stretches };
+    assert_eq!(result.invisible_text_by_page, vec![page(1, 2), page(4, 1)]);
+    for markdown in result.pages.iter().map(|page| &page.markdown) {
+        assert!(!markdown.contains("SECRET"), "{markdown}");
+    }
+    assert!(result.pages[0].markdown.contains("Visible two"));
+    assert!(result.pages[2].markdown.contains("Shown"));
+    assert!(result.pages[3].markdown.contains("After"));
+    // A page selection reports only the selected pages.
+    let selected = extract_pages_markdown_mem(&pdf, Some(&[1, 3])).expect("extract");
+    assert_eq!(selected.invisible_text_by_page, vec![page(4, 1)]);
+
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    {
+        use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+        let native = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native");
+        assert_eq!(native.invisible_text_by_page, vec![page(1, 2), page(4, 1)]);
+        assert!(!native.markdown.contains("SECRET"));
+    }
+}

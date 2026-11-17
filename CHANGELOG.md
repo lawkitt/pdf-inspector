@@ -31,6 +31,12 @@ version and date. Earlier releases are described in their
   every list check, as a Latin one does: a Russian clause label alone on
   its line (`б)`) no longer falls back to prose. All 33 lowercase Russian
   letters are covered; `т.` and `г.` before a dot stay abbreviations.
+- Per-page Markdown extraction and the OCR pipeline report the invisible
+  (render mode 3) text each page leaves out (`invisible_text_by_page`, a
+  list of `PageInvisibleText`), in stretches: invisible text with nothing
+  kept between its parts counts once, across text objects and form
+  XObjects; text of spaces only counts nothing. The text stays out of the
+  Markdown as before.
 
 ### Changed
 

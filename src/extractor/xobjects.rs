@@ -1,6 +1,7 @@
 //! Form XObject and image XObject extraction.
 
 use super::fonts::{font_style, FontStyle};
+use super::invisible::{blank_show, InvisibleText};
 use super::text_paint::{PaintResources, TextPaint};
 use crate::text_utils::{effective_font_size, expand_ligatures};
 use crate::tounicode::FontCMaps;
@@ -210,7 +211,7 @@ pub(crate) struct ExtractedText {
     /// Invisible (Tr 3) text was present but suppressed — the same signal
     /// the page parser reports, so a hidden OCR layer drawn through a form
     /// still earns the `include_invisible` retry.
-    pub(crate) skipped_invisible: bool,
+    pub(crate) invisible: InvisibleText,
 }
 
 impl ExtractedText {
@@ -222,7 +223,7 @@ impl ExtractedText {
             rtl_logical_runs: Vec::new(),
             rtl_visual_runs: Vec::new(),
             run_rotations: Vec::new(),
-            skipped_invisible: false,
+            invisible: InvisibleText::default(),
         }
     }
 
@@ -239,14 +240,14 @@ impl ExtractedText {
         rtl_logical_runs: &mut Vec<usize>,
         rtl_visual_runs: &mut Vec<usize>,
         run_rotations: &mut Vec<f32>,
-        skipped_invisible: &mut bool,
+        invisible: &mut InvisibleText,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         rtl_logical_runs.extend(self.rtl_logical_runs.into_iter().map(|c| c + base));
         rtl_visual_runs.extend(self.rtl_visual_runs.into_iter().map(|c| c + base));
         run_rotations.extend(self.run_rotations);
-        *skipped_invisible |= self.skipped_invisible;
+        invisible.absorb(self.invisible, base);
         debug_assert_eq!(self.items.len(), self.item_coverage.len());
         items.extend(self.items);
         item_coverage.extend(self.item_coverage);
@@ -369,7 +370,7 @@ fn extract_form_xobject_text_inner(
     let rtl_logical_runs = &mut extracted.rtl_logical_runs;
     let rtl_visual_runs = &mut extracted.rtl_visual_runs;
     let run_rotations = &mut extracted.run_rotations;
-    let skipped_invisible = &mut extracted.skipped_invisible;
+    let invisible_text = &mut extracted.invisible;
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict, parent_fonts);
@@ -610,7 +611,7 @@ fn extract_form_xobject_text_inner(
                                         rtl_logical_runs,
                                         rtl_visual_runs,
                                         run_rotations,
-                                        skipped_invisible,
+                                        invisible_text,
                                     );
                                 }
                             }
@@ -810,10 +811,10 @@ fn extract_form_xobject_text_inner(
                         }
                     }
                     let invisible = text_rendering_mode == 3 && !include_invisible;
-                    if invisible
-                        && get_operand_bytes(show_operand).is_some_and(|raw| !raw.is_empty())
+                    if let Some(raw) =
+                        get_operand_bytes(show_operand).filter(|raw| invisible && !raw.is_empty())
                     {
-                        *skipped_invisible = true;
+                        invisible_text.skip(items.len(), blank_show(raw));
                     }
                     if crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
                         || invisible
@@ -1039,7 +1040,8 @@ fn extract_form_xobject_text_inner(
                                 .iter()
                                 .any(|el| get_operand_bytes(el).is_some_and(|raw| !raw.is_empty()))
                         {
-                            *skipped_invisible = true;
+                            let blank = array.iter().filter_map(get_operand_bytes).all(blank_show);
+                            invisible_text.skip(items.len(), blank);
                         }
                         let hidden =
                             crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)

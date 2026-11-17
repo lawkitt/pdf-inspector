@@ -179,6 +179,21 @@ pub struct PageFormFieldNames {
     pub names: u32,
 }
 
+/// The invisible text a single 1-indexed page leaves out of its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageInvisibleText {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// How many stretches of invisible text (text render mode 3, which a
+    /// viewer does not paint) the page's text leaves out. A stretch is
+    /// invisible text with nothing kept between its parts: consecutive
+    /// invisible text-showing operators count once, across text objects and
+    /// form XObjects, and visible text or an image between them starts a
+    /// new one. Text of spaces only counts nothing. A scan's hidden OCR
+    /// layer is typically one stretch.
+    pub stretches: u32,
+}
+
 /// The shortest side, in points, an image must be drawn at to count in
 /// [`PageImages`]: about 1.4 mm.
 pub const MIN_COUNTED_IMAGE_SIDE_PT: f32 = 4.0;
@@ -589,6 +604,9 @@ pub struct PagesExtractionResult {
     /// The requested pages with AcroForm fields whose names were left out
     /// of the text (their values stay), with how many, in request order.
     pub form_field_names_by_page: Vec<PageFormFieldNames>,
+    /// The requested pages whose text leaves out invisible (render mode 3)
+    /// text, with how many stretches, in request order.
+    pub invisible_text_by_page: Vec<PageInvisibleText>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -688,16 +706,18 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
-        if let Some(required_pages) = required_pages.as_ref() {
-            extractor::extract_positioned_text_for_document_analysis(
-                &doc,
-                &font_cmaps,
-                required_pages,
-            )?
-        } else {
-            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
-        };
+    let (
+        (all_items, all_rects, all_lines),
+        page_thresholds,
+        gid_pages,
+        _page_rotations,
+        _,
+        invisible_text_by_page,
+    ) = if let Some(required_pages) = required_pages.as_ref() {
+        extractor::extract_positioned_text_for_document_analysis(&doc, &font_cmaps, required_pages)?
+    } else {
+        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
+    };
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
@@ -751,6 +771,7 @@ fn extract_pages_markdown_mem_impl(
     let mut ocr_reasons_by_page = BTreeMap::new();
     let mut images_by_page = Vec::new();
     let mut form_field_names_by_page = Vec::new();
+    let mut invisible_text_pages = Vec::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
@@ -839,6 +860,12 @@ fn extract_pages_markdown_mem_impl(
             images_by_page.push(PageImages {
                 page: page_1idx,
                 images: signals.pictures,
+            });
+        }
+        if let Some(&stretches) = invisible_text_by_page.get(&page_1idx) {
+            invisible_text_pages.push(PageInvisibleText {
+                page: page_1idx,
+                stretches,
             });
         }
         if let Some(&names) = field_names_left_out.get(&page_1idx) {
@@ -943,6 +970,7 @@ fn extract_pages_markdown_mem_impl(
             ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
             images_by_page,
             form_field_names_by_page,
+            invisible_text_by_page: invisible_text_pages,
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -4759,7 +4787,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4834,6 +4862,7 @@ fn process_document(
             gid_encoded_pages,
             _page_rotations,
             cmap_coverage,
+            _invisible_text_by_page,
         )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
