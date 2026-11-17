@@ -67,13 +67,37 @@ In commit order. Each commit message names the PR and its authors.
   (`б)` with its text on the next line) or one before a digit fell back to
   prose. A lowercase letter of any script before `)` now passes like a
   Latin one; a non-Latin letter before `.` does not (`т.`, `г.`).
+- **Invisible text is counted.** Per-page Markdown extraction and the OCR
+  pipeline report `invisible_text_by_page` (`PageInvisibleText { page,
+  stretches }`): the stretches of render-mode-3 text each page leaves out,
+  in the same unit as AnyDoc's hidden-text count (invisible text with
+  nothing kept between its parts counts once; blank text counts nothing).
+  The extractor counts where it already skipped the text; the
+  `include_invisible` retry decision is unchanged.
+
+### Fixes from the Codex review
+
+- **Kept strikes and the word merge (fork divergence from upstream
+  #663).** Upstream 1.26.0 merged runs whose strikes were kept only as
+  decorations without comparing `is_strikeout`, so a struck `Old` beside
+  a live `New` came out `<s>Old New</s>`, or lost its strike when the
+  fragments came the other way round. The merge now also splits where
+  `is_strikeout` changes. Layout evidence still ignores kept strikes.
+  Re-check this rule at the next upstream merge.
+- **#540 dispatch threads.** A dispatch thread that cannot start is
+  skipped (the others take its pages, or the calling thread takes them all)
+  instead of panicking.
+- **#626 inline images.** The comment pre-pass reads unfiltered inline
+  image data by its declared length, as lopdf does, instead of ending it at
+  a whitespace-delimited `EI` that the pixel bytes may happen to spell.
 
 ## Verification on Apple Silicon macOS (10 cores), 2026-11-18
 
 - `cargo fmt --check`, `cargo clippy -- -D warnings` (default and
   `--features ocr`), `cargo test` and `cargo test --features ocr` pass
-  after every commit (OCR run at the head: 1,842 library tests, 300
-  integration tests, plus the binary, renderer and doc tests).
+  after every commit (at the head: 1,848 library and 301 integration
+  tests with `--features ocr`, 1,731 library and 301 integration tests
+  without, plus the binary, renderer and doc tests).
 - **mdoc corpus, before/after.** The offline `ocr_corpus` example was
   built at the fork baseline `727f322` and at this sync's head and run on
   mdoc's `tests/fixtures/ocr-upstream` (12 public pages, four native
@@ -82,7 +106,7 @@ In commit order. Each commit message names the PR and its authors.
   `pp-ocr-cyrillic` models (SHA-256 checked), confidence 0, 150 dpi,
   offline. mdoc's `tools/ocr-upstream/compare.py` reports 18 captures and
   0 changed outputs: all 54 artifacts (prepared Markdown, raw recognition,
-  provenance) are byte-identical.
+  provenance) are byte-identical. The same holds after the review fixes.
 - **Native (Off) Markdown** of mdoc's import fixture PDFs (`text.pdf`,
   `handmade-mixed.pdf`, `handmade-partly-scanned.pdf`,
   `handmade-scanned.pdf`), through the call mdoc makes
@@ -130,9 +154,10 @@ semantic scores are unverified.
 
 ## Not in this sync
 
-- #598 now keeps invisible (`3 Tr`) text out of the Markdown, but the fork
-  does not yet count it the way it counts form field names and pictures.
-  An import note that wants to count invisible text needs that count first
-  (mdoc#925 decision 9).
+- #317 collapses identical overlays only after the extractor's word merge.
+  Two copies of a narrow glyph painted at the same spot can merge into one
+  item first (`ii`) and survive, as they did before the port. Collapsing
+  them in the merge would change the positioned output #317 keeps faithful
+  to the source.
 - The phase 2 items in mdoc#925 (white text, headers and footers, tables,
   OCR on scans) rebase onto this sync.
