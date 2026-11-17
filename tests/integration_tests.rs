@@ -12596,3 +12596,65 @@ fn blank_page_signal_follows_executed_painting() {
     let result = extract_pages_markdown_mem(&drawn_image, None).unwrap();
     assert!(result.pages[0].needs_ocr);
 }
+
+/// A page with empty content and one stamp annotation whose normal
+/// appearance shows text, with annotation flags `flags`.
+fn make_page_with_stamp_annotation_pdf(flags: i64) -> Vec<u8> {
+    let appearance = "BT /Helv 12 Tf 10 10 Td (APPROVED 2026-11-18) Tj ET";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> \
+         /Contents 4 0 R /Annots [5 0 R] >>"
+            .to_string(),
+        "<< /Length 0 >>\nstream\n\nendstream".to_string(),
+        format!(
+            "<< /Type /Annot /Subtype /Stamp /Rect [100 600 300 640] /F {flags} /AP << /N 6 0 R >> >>"
+        ),
+        format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 200 40] /Resources << /Font << \
+             /Helv << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Length {} >>\n\
+             stream\n{appearance}\nendstream",
+            appearance.len()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// A page whose own content paints nothing but which shows an annotation's
+/// appearance (a stamp, a signature widget's signer and date) is not blank:
+/// it still goes to OCR when it extracts empty. A hidden annotation shows
+/// nothing, so that page stays blank.
+#[test]
+fn blank_page_signal_counts_visible_annotation_appearances() {
+    let shown = make_page_with_stamp_annotation_pdf(4);
+    let result = extract_pages_markdown_mem(&shown, None).unwrap();
+    // The extractor reads no annotation appearance, so the page is empty.
+    assert!(result.pages[0].markdown.trim().is_empty());
+    assert!(result.pages[0].needs_ocr, "{:?}", result.pages[0]);
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+
+    let hidden = make_page_with_stamp_annotation_pdf(4 | 2);
+    let result = extract_pages_markdown_mem(&hidden, None).unwrap();
+    assert!(result.pages[0].markdown.trim().is_empty());
+    assert!(!result.pages[0].needs_ocr, "{:?}", result.pages[0]);
+}

@@ -2302,8 +2302,53 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> PageOcrSign
         has_vector_text: analysis.has_vector_text,
         has_invisible_text_layer: analysis.has_invisible_text_layer,
         pictures: analysis.pictures,
-        has_painted_content: analysis.paints_page,
+        has_painted_content: analysis.paints_page || page_shows_annotation_appearance(doc, page_id),
     }
+}
+
+/// Whether a page shows an annotation's appearance: an annotation with a
+/// normal appearance (`/AP /N`) that is neither hidden nor `NoView` (flag
+/// bits 2 and 6) and is not a pop-up. Renderers draw these over the page —
+/// a signature widget's signer and date, a stamp — even when the page's
+/// own content paints nothing.
+fn page_shows_annotation_appearance(doc: &Document, page_id: ObjectId) -> bool {
+    const HIDDEN: i64 = 1 << 1;
+    const NO_VIEW: i64 = 1 << 5;
+    let resolve = |object: &Object| match object {
+        Object::Reference(id) => doc.get_object(*id).ok().cloned(),
+        other => Some(other.clone()),
+    };
+    let Ok(page) = doc.get_dictionary(page_id) else {
+        return false;
+    };
+    let Some(Object::Array(annotations)) = page.get(b"Annots").ok().and_then(resolve) else {
+        return false;
+    };
+    annotations.iter().filter_map(resolve).any(|annotation| {
+        let Object::Dictionary(annotation) = annotation else {
+            return false;
+        };
+        if annotation.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Popup".as_slice()) {
+            return false;
+        }
+        let flags = annotation.get(b"F").and_then(Object::as_i64).unwrap_or(0);
+        if flags & (HIDDEN | NO_VIEW) != 0 {
+            return false;
+        }
+        let Some(Object::Dictionary(appearance)) = annotation.get(b"AP").ok().and_then(resolve)
+        else {
+            return false;
+        };
+        appearance
+            .get(b"N")
+            .ok()
+            .and_then(resolve)
+            .is_some_and(|normal| match normal {
+                Object::Stream(_) => true,
+                Object::Dictionary(states) => !states.is_empty(),
+                _ => false,
+            })
+    })
 }
 
 /// The per-page signals [`page_ocr_signals`] shares between classification
@@ -2320,10 +2365,10 @@ pub(crate) struct PageOcrSignals {
     pub(crate) has_invisible_text_layer: bool,
     /// The pictures the page shows (see `PageImages`).
     pub(crate) pictures: u32,
-    /// The content the page executes paints something: an image, a path, a
+    /// The page paints something: its content executes an image, a path, a
     /// shading, a text-showing operator or a form (see
-    /// `PageAnalysis::paints_page`). A page painting nothing has nothing for
-    /// OCR to read.
+    /// `PageAnalysis::paints_page`), or it shows an annotation's appearance.
+    /// A page painting nothing has nothing for OCR to read.
     pub(crate) has_painted_content: bool,
 }
 

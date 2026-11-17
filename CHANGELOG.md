@@ -159,9 +159,10 @@ version and date. Earlier releases are described in their
   the exemption only, with the fork's rectangle and path-operator checks)
 - Per-page Markdown extraction and the OCR pipeline no longer recommend
   OCR for a blank page: one whose content paints no image, path, shading,
-  text or form and that yields no text items. Images and forms the page's
-  resources bind but its content never draws do not count. A page that
-  paints something but extracts empty still goes to OCR. ([#339](https://github.com/firecrawl/pdf-inspector/pull/339),
+  text or form, that shows no visible annotation appearance, and that
+  yields no text items. Images and forms the page's resources bind but its
+  content never draws do not count. A page that paints something but
+  extracts empty still goes to OCR. ([#339](https://github.com/firecrawl/pdf-inspector/pull/339),
   ported)
 - Per-page Markdown extraction keeps a page carrying one unmappable glyph:
   a single U+FFFD (a `≤` or ballot box from a symbol font without a
