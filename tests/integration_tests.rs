@@ -6598,6 +6598,108 @@ fn test_image_emission_does_not_change_default_markdown() {
     );
 }
 
+/// A two-page PDF. Page 1 draws `Im0` twice, apart; `Im1` as a 2 pt square;
+/// `Im1` again as two strips that meet, like a scan stored in strips; and
+/// the form `Fm0`, whose own resources name a third image `Im2`, over the
+/// second `Im0`. Page 2 draws text only.
+fn make_pdf_with_counted_images() -> Vec<u8> {
+    let image = "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8";
+    let page_one = "BT /F1 12 Tf 100 700 Td (Pictures) Tj ET\n\
+                    q 200 0 0 100 50 500 cm /Im0 Do Q\n\
+                    q 200 0 0 100 50 300 cm /Im0 Do Q\n\
+                    q 2 0 0 2 400 400 cm /Im1 Do Q\n\
+                    q 100 0 0 50 400 650 cm /Im1 Do Q\n\
+                    q 100 0 0 50 400 600.5 cm /Im1 Do Q\n\
+                    q 1 0 0 1 100 350 cm /Fm0 Do Q";
+    let form = "q 100 0 0 100 0 0 cm /Im2 Do Q";
+    let page_two = "BT /F1 12 Tf 100 700 Td (Only words) Tj ET";
+    let objects: Vec<(String, Option<&[u8]>)> = vec![
+        ("<< /Type /Catalog /Pages 2 0 R >>".into(), None),
+        (
+            "<< /Type /Pages /Kids [3 0 R 9 0 R] /Count 2 >>".into(),
+            None,
+        ),
+        (
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> \
+             /XObject << /Im0 6 0 R /Im1 7 0 R /Fm0 8 0 R >> >> /Contents 4 0 R >>"
+                .into(),
+            None,
+        ),
+        (String::new(), Some(page_one.as_bytes())),
+        (
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            None,
+        ),
+        (image.into(), Some(&[128u8][..])),
+        (image.into(), Some(&[64u8][..])),
+        (
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+             /Resources << /XObject << /Im2 11 0 R >> >>"
+                .into(),
+            Some(form.as_bytes()),
+        ),
+        (
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 10 0 R >>"
+                .into(),
+            None,
+        ),
+        (String::new(), Some(page_two.as_bytes())),
+        (image.into(), Some(&[32u8][..])),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, (dict, stream)) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        match stream {
+            Some(bytes) => {
+                pdf.extend_from_slice(
+                    format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).as_bytes(),
+                );
+                pdf.extend_from_slice(bytes);
+                pdf.extend_from_slice(b"\nendstream");
+            }
+            None => pdf.extend_from_slice(dict.as_bytes()),
+        }
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn per_page_markdown_counts_the_images_each_page_draws() {
+    let pdf = make_pdf_with_counted_images();
+    let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
+    // The first `Im0`; the second with `Im2` drawn over it through the form;
+    // the two strips. The 2 pt `Im1` is a rule, not a picture. Page 2 draws
+    // none.
+    assert_eq!(
+        result.images_by_page,
+        vec![pdf_inspector::PageImages { page: 1, images: 3 }]
+    );
+    assert!(result.pages[0].markdown.contains("Pictures"));
+    assert!(!result.pages[0].markdown.contains("Image:"));
+    // A page selection counts only the selected pages.
+    let second = extract_pages_markdown_mem(&pdf, Some(&[1])).expect("extract");
+    assert!(second.images_by_page.is_empty());
+}
+
 #[test]
 fn test_markdown_options_default_has_include_images_false() {
     // Explicit assertion so anyone flipping this back catches it in CI.

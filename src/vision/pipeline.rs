@@ -202,6 +202,10 @@ pub struct OcrPdfResult {
     pub pages_recommending_hosted: Vec<u32>,
     /// Original machine-readable OCR reasons for selected pages.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// Selected pages that draw images, with how many, from native
+    /// extraction. The Markdown carries no image content, whether or not a
+    /// page was recognized: OCR reads text drawn in an image, not the image.
+    pub images_by_page: Vec<crate::PageImages>,
     /// Selected pages where deterministic table detection found tables.
     pub pages_with_tables: Vec<u32>,
     /// Selected pages where deterministic layout found multiple columns.
@@ -499,6 +503,7 @@ pub fn process_pdf_with_ocr_mem(
         pages_routed_to_ocr: routed,
         pages_recommending_hosted,
         ocr_reasons_by_page: native.ocr_reasons_by_page,
+        images_by_page: native.images_by_page,
         pages_with_tables: pages_with_tables.clone(),
         pages_with_columns: native.pages_with_columns,
         is_complex: native.is_complex || !pages_with_tables.is_empty(),

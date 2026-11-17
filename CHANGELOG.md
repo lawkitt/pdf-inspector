@@ -9,6 +9,16 @@ version and date. Earlier releases are described in their
 
 ## Unreleased
 
+### Added
+
+- Per-page Markdown extraction and the OCR pipeline report the pictures each
+  page shows (`images_by_page`, a list of `PageImages`): the image XObjects
+  its content draws, directly or through forms, with draws that overlap or
+  touch counted as one picture (a scan stored in strips) and images drawn
+  under 4 pt on a side left out. Markdown never carries image content, so a
+  caller can tell its reader what the text leaves out. Markdown output is
+  unchanged.
+
 ### Changed
 
 - A word hyphenated at a line wrap inside one paragraph is joined without

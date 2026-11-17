@@ -150,6 +150,27 @@ pub struct PageOcrReasons {
     pub reasons: Vec<String>,
 }
 
+/// The pictures a single 1-indexed page draws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageImages {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// The pictures the page shows: image XObjects its content draws,
+    /// directly or through form XObjects, with draws that overlap or touch
+    /// counted as one picture (a scan stored in strips or tiles, an image
+    /// over a background). An image drawn smaller than
+    /// [`MIN_COUNTED_IMAGE_SIDE_PT`] on a side (a rule or spacer) is left out.
+    pub images: u32,
+}
+
+/// The shortest side, in points, an image must be drawn at to count in
+/// [`PageImages`]: about 1.4 mm.
+pub const MIN_COUNTED_IMAGE_SIDE_PT: f32 = 4.0;
+
+/// The widest gap, in points, between image draws that [`PageImages`]
+/// still counts as one picture: strips of a scan can leave a sliver.
+pub const TOUCHING_IMAGES_GAP_PT: f32 = 1.0;
+
 /// A font whose ToUnicode CMap (or, for a font without one, the embedded
 /// program's own cmap table) had no entry for some of the codes the document
 /// shows through it, and what became of those codes.
@@ -545,6 +566,10 @@ pub struct PagesExtractionResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// The requested pages that draw images, with how many, in request
+    /// order. Markdown carries no image content: at most a placeholder,
+    /// with `MarkdownOptions::include_images`.
+    pub images_by_page: Vec<PageImages>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -694,6 +719,7 @@ fn extract_pages_markdown_mem_impl(
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
+    let mut images_by_page = Vec::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
@@ -723,6 +749,14 @@ fn extract_pages_markdown_mem_impl(
             })
             .map(|(item, remove)| (item.clone(), *remove))
             .unzip();
+
+        let images = counted_images(&page_items);
+        if images > 0 {
+            images_by_page.push(PageImages {
+                page: page_1idx,
+                images,
+            });
+        }
 
         let page_rects: Vec<PdfRect> = all_rects
             .iter()
@@ -867,6 +901,7 @@ fn extract_pages_markdown_mem_impl(
             pages_with_columns: complexity.pages_with_columns,
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
+            images_by_page,
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -891,6 +926,58 @@ fn extract_pages_markdown_mem_impl(
             None
         },
     })
+}
+
+/// The pictures among a page's items: image draws at least
+/// [`MIN_COUNTED_IMAGE_SIDE_PT`] on each side, with draws whose boxes overlap
+/// or come within [`TOUCHING_IMAGES_GAP_PT`] of each other joined into one.
+fn counted_images(items: &[TextItem]) -> u32 {
+    let mut boxes: Vec<[f32; 4]> = items
+        .iter()
+        .filter(|item| {
+            matches!(item.item_type, types::ItemType::Image)
+                && [item.x, item.y, item.width, item.height]
+                    .iter()
+                    .all(|value| value.is_finite())
+                && item.width.abs() >= MIN_COUNTED_IMAGE_SIDE_PT
+                && item.height.abs() >= MIN_COUNTED_IMAGE_SIDE_PT
+        })
+        .map(|item| {
+            let x = item.x.min(item.x + item.width);
+            let y = item.y.min(item.y + item.height);
+            [x, y, x + item.width.abs(), y + item.height.abs()]
+        })
+        .collect();
+    boxes.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    // Union-find over boxes in left-edge order: a box can only touch the
+    // boxes that start before its right edge does (plus the gap).
+    let mut parent: Vec<usize> = (0..boxes.len()).collect();
+    fn root(parent: &mut [usize], mut at: usize) -> usize {
+        while parent[at] != at {
+            parent[at] = parent[parent[at]];
+            at = parent[at];
+        }
+        at
+    }
+    let mut pictures = boxes.len();
+    for (index, a) in boxes.iter().enumerate() {
+        for (offset, b) in boxes[index + 1..].iter().enumerate() {
+            if b[0] > a[2] + TOUCHING_IMAGES_GAP_PT {
+                break;
+            }
+            if b[1] <= a[3] + TOUCHING_IMAGES_GAP_PT && a[1] <= b[3] + TOUCHING_IMAGES_GAP_PT {
+                let (ra, rb) = (
+                    root(&mut parent, index),
+                    root(&mut parent, index + 1 + offset),
+                );
+                if ra != rb {
+                    parent[rb] = ra;
+                    pictures -= 1;
+                }
+            }
+        }
+    }
+    u32::try_from(pictures).unwrap_or(u32::MAX)
 }
 
 /// Image regions large enough to plausibly contain rasterized document
