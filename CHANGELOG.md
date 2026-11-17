@@ -64,6 +64,12 @@ version and date. Earlier releases are described in their
   and that guess, and a code it maps to a control character
   reads as U+FFFD.
   ([#621](https://github.com/firecrawl/pdf-inspector/pull/621), ported)
+- OCR (`--ocr auto`/`--ocr force`, and the Rust, Python and Node OCR APIs)
+  no longer risks hanging at 0% CPU on multi-page scans. Page recognition
+  across OCR workers now dispatches through each worker's own dedicated
+  single-thread pool instead of a shared rayon pool, closing a
+  self-deadlock.
+  ([#540](https://github.com/firecrawl/pdf-inspector/pull/540), ported)
 
 ## [1.26.1] - 2026-11-15
 
