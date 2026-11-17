@@ -206,6 +206,13 @@ pub struct OcrPdfResult {
     /// extraction. The Markdown carries no image content, whether or not a
     /// page was recognized: OCR reads text drawn in an image, not the image.
     pub images_by_page: Vec<crate::PageImages>,
+    /// Selected pages with AcroForm fields whose names were left out of the
+    /// text (their values stay), with how many, from native extraction.
+    pub form_field_names_by_page: Vec<crate::PageFormFieldNames>,
+    /// Selected pages whose native text leaves out invisible (render mode 3)
+    /// text, with how many stretches. A page routed to OCR is read from its
+    /// rendering, which does not paint that text either.
+    pub invisible_text_by_page: Vec<crate::PageInvisibleText>,
     /// Selected pages where deterministic table detection found tables.
     pub pages_with_tables: Vec<u32>,
     /// Selected pages where deterministic layout found multiple columns.
@@ -504,6 +511,8 @@ pub fn process_pdf_with_ocr_mem(
         pages_recommending_hosted,
         ocr_reasons_by_page: native.ocr_reasons_by_page,
         images_by_page: native.images_by_page,
+        form_field_names_by_page: native.form_field_names_by_page,
+        invisible_text_by_page: native.invisible_text_by_page,
         pages_with_tables: pages_with_tables.clone(),
         pages_with_columns: native.pages_with_columns,
         is_complex: native.is_complex || !pages_with_tables.is_empty(),
@@ -1250,6 +1259,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: crate::types::ItemType::Text,

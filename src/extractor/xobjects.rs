@@ -1,12 +1,13 @@
 //! Form XObject and image XObject extraction.
 
 use super::fonts::{font_style, FontStyle};
+use super::invisible::{blank_show, InvisibleText};
 use super::text_paint::{PaintResources, TextPaint};
 use crate::text_utils::{effective_font_size, expand_ligatures};
 use crate::tounicode::FontCMaps;
 use crate::types::{attach_run_coverage, BoldSource, ItemCoverage, ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::content_stream::{estimated_string_advance_ts, PendingSpace};
 use super::fonts::{
@@ -96,6 +97,7 @@ impl FormWalkBudget {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum XObjectType {
     Image,
     Form(ObjectId),
@@ -133,6 +135,7 @@ pub(crate) fn get_page_xobjects(
 fn get_form_xobjects(
     doc: &Document,
     form_dict: &lopdf::Dictionary,
+    parent_xobjects: &HashMap<String, XObjectType>,
 ) -> HashMap<String, XObjectType> {
     let mut xobject_types = HashMap::new();
 
@@ -143,7 +146,7 @@ fn get_form_xobjects(
             res_ref.as_dict().ok()
         }
     } else {
-        return xobject_types;
+        return parent_xobjects.clone();
     };
 
     if let Some(resources) = resources {
@@ -208,7 +211,7 @@ pub(crate) struct ExtractedText {
     /// Invisible (Tr 3) text was present but suppressed — the same signal
     /// the page parser reports, so a hidden OCR layer drawn through a form
     /// still earns the `include_invisible` retry.
-    pub(crate) skipped_invisible: bool,
+    pub(crate) invisible: InvisibleText,
 }
 
 impl ExtractedText {
@@ -220,7 +223,7 @@ impl ExtractedText {
             rtl_logical_runs: Vec::new(),
             rtl_visual_runs: Vec::new(),
             run_rotations: Vec::new(),
-            skipped_invisible: false,
+            invisible: InvisibleText::default(),
         }
     }
 
@@ -237,14 +240,14 @@ impl ExtractedText {
         rtl_logical_runs: &mut Vec<usize>,
         rtl_visual_runs: &mut Vec<usize>,
         run_rotations: &mut Vec<f32>,
-        skipped_invisible: &mut bool,
+        invisible: &mut InvisibleText,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         rtl_logical_runs.extend(self.rtl_logical_runs.into_iter().map(|c| c + base));
         rtl_visual_runs.extend(self.rtl_visual_runs.into_iter().map(|c| c + base));
         run_rotations.extend(self.run_rotations);
-        *skipped_invisible |= self.skipped_invisible;
+        invisible.absorb(self.invisible, base);
         debug_assert_eq!(self.items.len(), self.item_coverage.len());
         items.extend(self.items);
         item_coverage.extend(self.item_coverage);
@@ -259,6 +262,9 @@ pub(crate) fn extract_form_xobject_text(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    parent_fonts: &BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    parent_xobjects: &HashMap<String, XObjectType>,
+    parent_paint_resources: &PaintResources,
     include_invisible: bool,
     inherited_render_mode: i32,
     inherited_text_rise: f32,
@@ -275,6 +281,9 @@ pub(crate) fn extract_form_xobject_text(
         page_num,
         font_cmaps,
         parent_ctm,
+        parent_fonts,
+        parent_xobjects,
+        parent_paint_resources,
         include_invisible,
         inherited_render_mode,
         inherited_text_rise,
@@ -295,6 +304,9 @@ fn extract_form_xobject_text_inner(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    parent_fonts: &BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    parent_xobjects: &HashMap<String, XObjectType>,
+    parent_paint_resources: &PaintResources,
     include_invisible: bool,
     inherited_render_mode: i32,
     inherited_text_rise: f32,
@@ -358,11 +370,11 @@ fn extract_form_xobject_text_inner(
     let rtl_logical_runs = &mut extracted.rtl_logical_runs;
     let rtl_visual_runs = &mut extracted.rtl_visual_runs;
     let run_rotations = &mut extracted.run_rotations;
-    let skipped_invisible = &mut extracted.skipped_invisible;
+    let invisible_text = &mut extracted.invisible;
 
     // Get fonts from the Form's Resources
-    let form_fonts = get_form_fonts(doc, &stream.dict);
-    let paint_resources = PaintResources::form(doc, &stream.dict);
+    let form_fonts = get_form_fonts(doc, &stream.dict, parent_fonts);
+    let paint_resources = PaintResources::form(doc, &stream.dict, parent_paint_resources);
     // Unknown font resources may be Type3; infer stroke weight only for
     // positively resolved ordinary text fonts.
     let paintable_fonts: std::collections::HashSet<String> = form_fonts
@@ -445,7 +457,7 @@ fn extract_form_xobject_text_inner(
     }
 
     // Build XObject map from the Form's own Resources for nested Do
-    let form_xobjects = get_form_xobjects(doc, &stream.dict);
+    let form_xobjects = get_form_xobjects(doc, &stream.dict, parent_xobjects);
 
     // Apply the Form XObject's own Matrix (if any) to the parent CTM
     let form_matrix = if let Ok(matrix_obj) = stream.dict.get(b"Matrix") {
@@ -578,6 +590,9 @@ fn extract_form_xobject_text_inner(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        &form_fonts,
+                                        &form_xobjects,
+                                        &paint_resources,
                                         include_invisible,
                                         text_rendering_mode,
                                         text_rise,
@@ -596,7 +611,7 @@ fn extract_form_xobject_text_inner(
                                         rtl_logical_runs,
                                         rtl_visual_runs,
                                         run_rotations,
-                                        skipped_invisible,
+                                        invisible_text,
                                     );
                                 }
                             }
@@ -627,6 +642,7 @@ fn extract_form_xobject_text_inner(
                                     render_mode: None,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    layout_strikeout: false,
                                     rotation: 0.0,
                                     advance_known: true,
                                     item_type: ItemType::Image,
@@ -680,7 +696,9 @@ fn extract_form_xobject_text_inner(
                 // it neither emits items nor votes on page rotation — unless
                 // the caller asked for the hidden layer.
                 if let Some(mode) = op.operands.first().and_then(get_number) {
-                    text_rendering_mode = mode as i32;
+                    if mode.fract() == 0.0 && (0.0..=7.0).contains(&mode) {
+                        text_rendering_mode = mode as i32;
+                    }
                 }
             }
             "Tz" => {
@@ -793,10 +811,10 @@ fn extract_form_xobject_text_inner(
                         }
                     }
                     let invisible = text_rendering_mode == 3 && !include_invisible;
-                    if invisible
-                        && get_operand_bytes(show_operand).is_some_and(|raw| !raw.is_empty())
+                    if let Some(raw) =
+                        get_operand_bytes(show_operand).filter(|raw| invisible && !raw.is_empty())
                     {
-                        *skipped_invisible = true;
+                        invisible_text.skip(items.len(), blank_show(raw));
                     }
                     if crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
                         || invisible
@@ -960,6 +978,7 @@ fn extract_form_xobject_text_inner(
                                 render_mode: Some(paint.render_mode),
                                 is_underline: false,
                                 is_strikeout: false,
+                                layout_strikeout: false,
                                 rotation: geometry.rotation,
                                 advance_known: geometry.advance_known,
                                 item_type: ItemType::Text,
@@ -1021,7 +1040,8 @@ fn extract_form_xobject_text_inner(
                                 .iter()
                                 .any(|el| get_operand_bytes(el).is_some_and(|raw| !raw.is_empty()))
                         {
-                            *skipped_invisible = true;
+                            let blank = array.iter().filter_map(get_operand_bytes).all(blank_show);
+                            invisible_text.skip(items.len(), blank);
                         }
                         let hidden =
                             crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
@@ -1459,6 +1479,7 @@ fn extract_form_xobject_text_inner(
                                     render_mode: Some(paint.render_mode),
                                     is_underline: false,
                                     is_strikeout: false,
+                                    layout_strikeout: false,
                                     rotation: geometry.rotation,
                                     advance_known: geometry.advance_known,
                                     item_type: ItemType::Text,
@@ -1505,8 +1526,9 @@ fn extract_form_xobject_text_inner(
 pub(crate) fn get_form_fonts<'a>(
     doc: &'a Document,
     form_dict: &'a lopdf::Dictionary,
-) -> std::collections::BTreeMap<Vec<u8>, &'a lopdf::Dictionary> {
-    let mut fonts = std::collections::BTreeMap::new();
+    parent_fonts: &BTreeMap<Vec<u8>, &'a lopdf::Dictionary>,
+) -> BTreeMap<Vec<u8>, &'a lopdf::Dictionary> {
+    let mut fonts = BTreeMap::new();
 
     // Get Resources from Form dictionary
     let resources = if let Ok(res_ref) = form_dict.get(b"Resources") {
@@ -1516,7 +1538,7 @@ pub(crate) fn get_form_fonts<'a>(
             res_ref.as_dict().ok()
         }
     } else {
-        return fonts;
+        return parent_fonts.clone();
     };
 
     let Some(resources) = resources else {
@@ -1645,6 +1667,9 @@ mod tests {
             1,
             &FontCMaps::from_doc(doc),
             &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            &BTreeMap::new(),
+            &HashMap::new(),
+            &PaintResources::default(),
             false,
             0,
             0.0,
@@ -2148,6 +2173,229 @@ BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
         (items, skipped_invisible)
     }
 
+    fn form_stream(content: &[u8], resources: Option<Dictionary>) -> Stream {
+        let mut dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        };
+        if let Some(resources) = resources {
+            dict.set("Resources", Object::Dictionary(resources));
+        }
+        Stream::new(dict, content.to_vec())
+    }
+
+    fn page_with_resources(
+        mut doc: Document,
+        page_content: &[u8],
+        resources: Dictionary,
+    ) -> (Document, ObjectId) {
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            page_content.to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => Object::Dictionary(resources),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1,
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
+    #[test]
+    fn form_without_resources_inherits_caller_font() {
+        let mut doc = Document::new();
+        let cmap_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Test def\n/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 beginbfchar\n<41> <0050>\nendbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend".to_vec(),
+        )));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+        let form_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /F1 12 Tf <41> Tj ET",
+            None,
+        )));
+        let (doc, page_id) = page_with_resources(
+            doc,
+            b"/Fm Do",
+            dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                "XObject" => dictionary! { "Fm" => Object::Reference(form_id) },
+            },
+        );
+
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["P"]
+        );
+    }
+
+    #[test]
+    fn nested_forms_without_resources_inherit_caller_xobject_and_font() {
+        let mut doc = Document::new();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let inner_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /F1 12 Tf (Nested inherited text) Tj ET",
+            None,
+        )));
+        let outer_id = doc.add_object(Object::Stream(form_stream(b"/Inner Do", None)));
+        let (doc, page_id) = page_with_resources(
+            doc,
+            b"/Outer Do",
+            dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                "XObject" => dictionary! {
+                    "Outer" => Object::Reference(outer_id),
+                    "Inner" => Object::Reference(inner_id),
+                },
+            },
+        );
+
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Nested inherited text"]
+        );
+    }
+
+    #[test]
+    fn form_with_resources_does_not_resolve_missing_parent_font() {
+        let mut doc = Document::new();
+        let cmap_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Test def\n/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 beginbfchar\n<41> <0050>\nendbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend".to_vec(),
+        )));
+        let parent_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+        let local_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let form_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /F1 12 Tf <41> Tj ET",
+            Some(dictionary! {
+                "Font" => dictionary! { "Local" => Object::Reference(local_font_id) },
+            }),
+        )));
+        let (doc, page_id) = page_with_resources(
+            doc,
+            b"/Fm Do",
+            dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(parent_font_id) },
+                "XObject" => dictionary! { "Fm" => Object::Reference(form_id) },
+            },
+        );
+
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["A"]
+        );
+    }
+
+    #[test]
+    fn form_with_resources_does_not_resolve_missing_parent_xobject() {
+        let mut doc = Document::new();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let inner_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /F1 12 Tf (Unreachable) Tj ET",
+            Some(dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            }),
+        )));
+        let outer_id = doc.add_object(Object::Stream(form_stream(
+            b"/Inner Do",
+            Some(dictionary! { "XObject" => dictionary! {} }),
+        )));
+        let (doc, page_id) = page_with_resources(
+            doc,
+            b"/Outer Do",
+            dictionary! {
+                "XObject" => dictionary! {
+                    "Outer" => Object::Reference(outer_id),
+                    "Inner" => Object::Reference(inner_id),
+                },
+            },
+        );
+
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert!(items.is_empty(), "{items:?}");
+    }
+
+    #[test]
+    fn form_type3_scaling_applies_to_tj_and_tj_array() {
+        let mut doc = Document::new();
+        let type3_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontMatrix" => vec![1.into(), 0.into(), 0.into(), (-1).into(), 0.into(), 0.into()],
+            "FontBBox" => vec![0.into(), (-156).into(), 0.into(), 3.into()],
+        });
+        let form_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /T3 0.12 Tf (A) Tj 0 -20 Td [(B)] TJ ET",
+            Some(dictionary! {
+                "Font" => dictionary! { "T3" => Object::Reference(type3_font_id) },
+            }),
+        )));
+        let (doc, page_id) = page_with_resources(
+            doc,
+            b"/Fm Do",
+            dictionary! {
+                "XObject" => dictionary! { "Fm" => Object::Reference(form_id) },
+            },
+        );
+
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert!(items
+            .iter()
+            .all(|item| (item.font_size - 19.08).abs() < 0.01));
+    }
+
     #[test]
     fn form_inherits_the_pages_text_rendering_mode() {
         // `3 Tr` set by the page stream before `Do`: the form's text is an
@@ -2190,6 +2438,45 @@ BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
     fn paint_of(items: &[TextItem], text: &str) -> (Option<[u8; 3]>, Option<[u8; 3]>, Option<u8>) {
         let item = find(items, text);
         (item.fill_color, item.stroke_color, item.render_mode)
+    }
+
+    #[test]
+    fn form_paint_resources_inherit_only_when_resources_are_absent() {
+        let mut doc = Document::new();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let inherited_id = doc.add_object(Object::Stream(form_stream(
+            b"/Tone cs 1 0 0 sc BT /F1 12 Tf (Inherited) Tj ET",
+            None,
+        )));
+        let outer_id = doc.add_object(Object::Stream(form_stream(b"/Inherited Do", None)));
+        let isolated_id = doc.add_object(Object::Stream(form_stream(
+            b"/Tone cs 1 0 0 sc BT /F1 12 Tf (Isolated) Tj ET",
+            Some(dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                "ColorSpace" => dictionary! { "Other" => "DeviceRGB" },
+            }),
+        )));
+        let (doc, page_id) = page_with_resources(
+            doc,
+            b"/Outer Do /Isolated Do",
+            dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                "XObject" => dictionary! {
+                    "Outer" => Object::Reference(outer_id),
+                    "Inherited" => Object::Reference(inherited_id),
+                    "Isolated" => Object::Reference(isolated_id),
+                },
+                "ColorSpace" => dictionary! { "Tone" => "DeviceRGB" },
+            },
+        );
+
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert_eq!(paint_of(&items, "Inherited").0, Some([255, 0, 0]));
+        assert_eq!(paint_of(&items, "Isolated").0, None);
     }
 
     #[test]

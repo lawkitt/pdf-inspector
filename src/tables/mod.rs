@@ -341,6 +341,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             render_mode: item.render_mode,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            layout_strikeout: item.layout_strikeout,
             rotation: item.rotation,
             advance_known: item.advance_known,
             item_type: item.item_type.clone(),
@@ -374,6 +375,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             render_mode: item.render_mode,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            layout_strikeout: item.layout_strikeout,
             rotation: item.rotation,
             advance_known: item.advance_known,
             item_type: item.item_type.clone(),
@@ -402,7 +404,11 @@ pub(crate) enum TableDetectionMode {
 /// purely by text alignment — common in exam/reference tables.
 ///
 /// Requires ≥3 columns, ≥3 rows, and ≥40% cell fill rate.
-pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Option<Table> {
+pub(crate) fn try_build_table_from_columns(
+    items: &[TextItem],
+    page: u32,
+    page_bounds: &crate::extractor::PageVerticalBounds,
+) -> Option<Table> {
     use crate::extractor::{
         detect_columns, group_into_lines_with_thresholds, is_newspaper_layout, ColumnRegion,
     };
@@ -520,6 +526,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
                     bucket.clone(),
                     &thresholds,
                     &std::collections::HashSet::new(),
+                    page_bounds,
                 )
             })
             .collect();
@@ -1600,7 +1607,8 @@ mod tests {
         }
         let columns = crate::extractor::detect_columns(&grid, 1, false);
         assert!(columns.len() >= 4, "columns detected: {}", columns.len());
-        let plain = try_build_table_from_columns(&grid, 1).expect("grid is a table");
+        let plain = try_build_table_from_columns(&grid, 1, &std::collections::HashMap::new())
+            .expect("grid is a table");
         assert_eq!(plain.cells.len(), 5);
 
         let mut head = make_item("Running head", 60.0, 613.0, 8.0);
@@ -1609,7 +1617,8 @@ mod tests {
         head.height = 100.0;
         let mut with_head = grid.clone();
         with_head.push(head);
-        let table = try_build_table_from_columns(&with_head, 1).expect("still a table");
+        let table = try_build_table_from_columns(&with_head, 1, &std::collections::HashMap::new())
+            .expect("still a table");
         assert_eq!(table.cells.len(), 5, "{:?}", table.cells);
         assert!(
             table.cells.iter().flatten().all(|c| !c.contains("Running")),
@@ -1643,6 +1652,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -1673,6 +1683,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -1800,7 +1811,8 @@ mod tests {
             make_char("MPa", 514.7, 374.6, 10.0, 18.4),
         ];
 
-        let table = try_build_table_from_columns(&items, 1).unwrap();
+        let table =
+            try_build_table_from_columns(&items, 1, &std::collections::HashMap::new()).unwrap();
         let md = table_to_markdown(&table);
 
         assert!(

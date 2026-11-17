@@ -19,6 +19,24 @@ version and date. Earlier releases are described in their
   picture (a scan stored in strips), and draws under 4 pt on a side are left
   out. Markdown never carries image content, so a caller can tell its
   reader what the text leaves out. Markdown output is unchanged.
+- AcroForm fields contribute their value to the text without their name:
+  the name (`/T`, joined with its parents' names, such as
+  `txtClientName`) is the form's internal key, which the page never
+  draws. Per-page Markdown extraction and the OCR pipeline report how many
+  names each page left out (`form_field_names_by_page`, a list of
+  `PageFormFieldNames`). A checked box or selected radio button reads as
+  `☑` instead of its on-state name (`Yes`), which the page does not show
+  either; an unchecked one still adds nothing.
+- A lowercase letter of any script before `)` counts as a list label in
+  every list check, as a Latin one does: a Russian clause label alone on
+  its line (`б)`) no longer falls back to prose. All 33 lowercase Russian
+  letters are covered; `т.` and `г.` before a dot stay abbreviations.
+- Per-page Markdown extraction and the OCR pipeline report the invisible
+  (render mode 3) text each page leaves out (`invisible_text_by_page`, a
+  list of `PageInvisibleText`), in stretches: invisible text with nothing
+  kept between its parts counts once, across text objects and form
+  XObjects; text of spaces only counts nothing. The text stays out of the
+  Markdown as before.
 
 ### Changed
 
@@ -51,6 +69,99 @@ version and date. Earlier releases are described in their
   tight list, none at the start or end, also across the pages of the OCR
   pipeline. A paragraph after a list item or table no longer reads as its
   lazy continuation or another row.
+
+### Fixed
+
+- A simple font's ToUnicode CMap of fewer than ten entries keeps its say
+  for the codes the embedded program does not read. Such a CMap yields to
+  the program's own reading, and its entries were then dropped, so a code
+  whose glyph the program does not name read as its byte value: a
+  heading set by macOS Quartz in a small subset of Times New Roman Bold
+  read `CÔNG TY` as `CÔ!G TY` and `phẩm` as `ph'm`. The CMap's entry is
+  now read before the base encoding, an unreadable `/Differences` name
+  and that guess, and a code it maps to a control character
+  reads as U+FFFD.
+  ([#621](https://github.com/firecrawl/pdf-inspector/pull/621), ported)
+- OCR (`--ocr auto`/`--ocr force`, and the Rust, Python and Node OCR APIs)
+  no longer risks hanging at 0% CPU on multi-page scans. Page recognition
+  across OCR workers now dispatches through each worker's own dedicated
+  single-thread pool instead of a shared rayon pool, closing a
+  self-deadlock.
+  ([#540](https://github.com/firecrawl/pdf-inspector/pull/540), ported)
+- Multi-page OCR whose extra dispatch threads cannot start (the process is
+  at its thread limit) runs the pages on the threads that did start, or on
+  the calling thread, instead of panicking.
+- A strikethrough kept only as a decoration (repeated rules, a ruled
+  table) no longer spreads to the next word or vanishes when the two runs
+  merge: a run splits where its strike starts or ends, so `Old` struck
+  beside a live `New` reads `<s>Old</s> New`. This changes upstream 1.26.0's
+  merge rule (#663), which let such strikes run on.
+- The content-stream comment pre-pass reads unfiltered inline image data
+  by its declared length, as lopdf does, so pixel bytes that happen to
+  spell ` EI %` no longer end the image early and lose the rest of the line
+  as a comment. Images lopdf cannot size still end at a whitespace-delimited
+  `EI`.
+
+## [1.26.1] - 2026-11-15
+
+Changes since 1.26.0.
+
+### Fixed
+
+- A word space painted as its own run is kept when the next word is
+  kerned back over it, and after closing punctuation as well as after a
+  word: `Regulations (CFR) and` painted as `(CFR`, `)`, a space and
+  `and` no longer reads `(CFR)and`, and a struck `(CFR)` no longer
+  spreads to the next word in consumers that style whole words. The test
+  is the gap the junction leaves, not the width of the space run, so wide
+  gaps are still left to gap detection.
+  ([#666](https://github.com/firecrawl/pdf-inspector/pull/666))
+
+
+## [1.26.0] - 2026-11-13
+
+Changes since 1.25.2.
+
+### Added
+
+- `TextItem::layout_strikeout`, the strikeout that layout heuristics read.
+  It equals `is_strikeout` except on the strikethroughs recovered below,
+  which are emitted as `<s>` but leave run merging and heuristic table
+  detection as they were without them. Code that builds a `TextItem`
+  literal sets it, normally to the same value as `is_strikeout`.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
+
+### Fixed
+
+- Strikethrough rules of similar width repeated down a page, as on a
+  tracked-changes page that strikes several whole lines, are kept. The
+  repeated-ruling filter only rescued a rule that underlines the text it
+  fits, so every such strike was dropped as a table ruling.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
+- Text inside a detected table keeps its strikethrough. Clearing the
+  decorations of table text exists for underlines, which a cell's bottom
+  border imitates; no border runs through a cell's glyphs, and a
+  tracked-changes page whose rules read as a grid lost every strike.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
+- A word hyphenated across a line break inside a struck run rejoins across
+  the reopened `<s>` tag.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
+- A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
+  comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
+  read through the Windows variant of the standard glyph order. That
+  variant leaves out the Macintosh no-break space (172) and `apple` (210)
+  and has the euro sign in the place of the currency sign, so the two
+  orders diverge from glyph 172 on, and the Macintosh order read those
+  glyphs as their neighbours: `“N/A”` as `—N/A“`, `company’s` as
+  `company‘s` and en dashes as `œ`. The font's
+  own advances choose the variant, since an accented letter advances like
+  its base letter.
+  ([#618](https://github.com/firecrawl/pdf-inspector/pull/618))
+- A glyph in such a subset past the standard order that paints nothing but
+  advances reads as a space. Word justifies lines with Arial's en and em
+  spaces, which came out as U+FFFD between every word
+  (`Proposer�Legal�Name`) and sent the pages to OCR as garbled text.
+  ([#618](https://github.com/firecrawl/pdf-inspector/pull/618))
 
 ## [1.25.2] - 2026-09-28
 

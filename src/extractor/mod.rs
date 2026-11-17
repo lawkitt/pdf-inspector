@@ -9,6 +9,7 @@ pub(crate) mod content_stream;
 pub(crate) mod display_frame;
 pub(crate) mod fonts;
 pub(crate) mod geometry;
+pub(crate) mod invisible;
 mod layout;
 mod links;
 pub(crate) mod page_box;
@@ -122,6 +123,7 @@ impl PositionOptions {
         }
     }
 }
+pub(crate) use links::form_field_names_by_page;
 use links::{extract_form_fields, extract_page_links};
 pub(crate) use page_box::{visible_page_box, PageBox};
 
@@ -233,7 +235,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages, _page_rotations, _cmap_coverage) =
+    let (extraction, _thresholds, _gid_pages, _page_rotations, _cmap_coverage, _invisible) =
         extract_positioned_text_from_doc_in_page_box(
             &doc,
             &font_cmaps,
@@ -342,8 +344,14 @@ pub fn extract_text_with_positions_and_rotations_mem_with_options(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations, _cmap_coverage) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, options)?;
+    let (
+        (mut items, _rects, _lines),
+        _thresholds,
+        _gid_pages,
+        page_rotations,
+        _cmap_coverage,
+        _invisible,
+    ) = extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, options)?;
     if options.frame == PositionFrame::Display {
         display_frame::document_items_to_display_frame(&doc, &mut items, &page_rotations);
     }
@@ -432,7 +440,7 @@ pub(crate) fn extract_page_text_items_in_page_box_with_options(
         lines,
         has_gid_fonts,
         coords_rotated,
-        skipped_invisible,
+        skipped_invisible: skipped_invisible.any(),
         page_box,
     })
 }
@@ -449,17 +457,31 @@ pub(crate) type PageThresholds = HashMap<u32, f32>;
 /// are upright.
 pub(crate) type PageRotations = HashMap<u32, geometry::PageRotation>;
 
+/// Per extracted page (1-indexed) that left invisible (Tr 3) text out, how
+/// many stretches it left out (see `invisible::InvisibleText`); pages that
+/// left none out are absent.
+pub(crate) type InvisibleTextByPage = HashMap<u32, u32>;
+
 /// What a document-level extraction returns: the text, rectangles and lines
 /// of the extracted pages, their join thresholds, the pages with gid-encoded
-/// fonts, their frame rotations and, per font, the two-byte codes shown
-/// through the font's CMap and how many of them the CMap had no entry for.
+/// fonts, their frame rotations, per font the two-byte codes shown through
+/// the font's CMap and how many of them the CMap had no entry for, and the
+/// invisible text each page left out.
 pub(crate) type DocumentExtraction = (
     PageExtraction,
     PageThresholds,
     HashSet<u32>,
     PageRotations,
     CMapCoverageByFont,
+    InvisibleTextByPage,
 );
+
+/// Per-page `(y0, y1)` extent of the visible box, so the folio bands can be
+/// measured from the page's real top edge. Ordered bottom-then-top. The alias
+/// is documentation, not enforcement — a swapped pair still type-checks, and
+/// what saves it is that a negative height fails the guard in
+/// `layout::page_number_bands` and falls back to the calibrated constants.
+pub(crate) type PageVerticalBounds = HashMap<u32, (f32, f32)>;
 
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 ///
@@ -562,6 +584,7 @@ fn extract_positioned_text_with_folio_context_impl(
         mut gid_encoded_pages,
         mut page_rotations,
         cmap_coverage,
+        invisible_text_by_page,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -570,13 +593,18 @@ fn extract_positioned_text_with_folio_context_impl(
         None,
         CoordinateFrame::UserSpace,
     )?;
-    if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
+    if !layout::needs_document_page_number_context(
+        &selected_items,
+        doc.get_pages().len(),
+        &page_vertical_bounds(doc),
+    ) {
         return Ok((
             (selected_items, selected_rects, selected_lines),
             page_thresholds,
             gid_encoded_pages,
             page_rotations,
             cmap_coverage,
+            invisible_text_by_page,
         ));
     }
 
@@ -595,6 +623,9 @@ fn extract_positioned_text_with_folio_context_impl(
         context_gid_pages,
         context_rotations,
         _context_coverage,
+        // Like their coverage, the context pages' invisible text is no part
+        // of what the selected pages left out.
+        _context_invisible,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -618,6 +649,7 @@ fn extract_positioned_text_with_folio_context_impl(
         gid_encoded_pages,
         page_rotations,
         cmap_coverage,
+        invisible_text_by_page,
     ))
 }
 
@@ -662,6 +694,7 @@ fn extract_positioned_text_impl(
     let mut page_rotations: PageRotations = HashMap::new();
     // Visible page box per extracted page, for the form-field shift below.
     let mut page_boxes: HashMap<u32, PageBox> = HashMap::new();
+    let mut invisible_text_by_page = InvisibleTextByPage::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -686,7 +719,7 @@ fn extract_positioned_text_impl(
             (mut items, mut rects, mut lines),
             has_gid_fonts,
             coords_rotated,
-            _skipped_invisible,
+            invisible_text,
             mut run_coverage,
         ) = match page_result {
             Ok(extraction) => extraction,
@@ -699,6 +732,9 @@ fn extract_positioned_text_impl(
             }
             Err(error) => return Err(error),
         };
+        if invisible_text.stretches() > 0 {
+            invisible_text_by_page.insert(*page_num, invisible_text.stretches());
+        }
         if coords_rotated != geometry::PageRotation::Upright {
             page_rotations.insert(*page_num, coords_rotated);
         }
@@ -897,6 +933,7 @@ fn extract_positioned_text_impl(
         gid_encoded_pages,
         page_rotations,
         cmap_coverage,
+        invisible_text_by_page,
     ))
 }
 
@@ -908,7 +945,7 @@ fn suppress_table_underlines(
 ) {
     if !items
         .iter()
-        .any(|item| item.is_underline || item.is_strikeout)
+        .any(|item| item.is_underline || item.layout_strikeout)
     {
         return;
     }
@@ -958,10 +995,15 @@ fn suppress_table_underlines(
         }
     }
 
+    // A cell's bottom border sits in the underline window, but no border
+    // crosses the middle of a cell's glyphs, so a strikethrough inside a
+    // table (a struck value, or a redline page whose rules read as a grid)
+    // is kept as a decoration. It stays out of layout evidence, which never
+    // saw strikes inside ruled tables.
     for index in table_item_indices {
         if let Some(item) = items.get_mut(index) {
             item.is_underline = false;
-            item.is_strikeout = false;
+            item.layout_strikeout = false;
         }
     }
 }
@@ -1503,7 +1545,7 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
         if next.is_bold != first.is_bold
             || next.is_italic != first.is_italic
             || next.is_underline != first.is_underline
-            || next.is_strikeout != first.is_strikeout
+            || next.layout_strikeout != first.layout_strikeout
         {
             break;
         }
@@ -2294,9 +2336,15 @@ fn merge_text_items_with_clips(
                 }
                 // Preserve the existing join behavior at non-bold style
                 // boundaries, including italic fragments within formulas.
+                // A merged run carries one decoration, so a strike that
+                // starts or ends here splits it, a strike kept only as a
+                // decoration (see `TextItem::layout_strikeout`) too:
+                // otherwise "Old" struck beside a live "New" reads as one
+                // struck "Old New", or loses its strike, by which comes first.
                 if next.is_italic != first.is_italic
                     || next.is_underline != first.is_underline
                     || next.is_strikeout != first.is_strikeout
+                    || next.layout_strikeout != first.layout_strikeout
                 {
                     break;
                 }
@@ -2484,6 +2532,7 @@ fn merge_text_items_with_clips(
                 render_mode: first.render_mode,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
+                layout_strikeout: first.layout_strikeout,
                 rotation: first.rotation,
                 advance_known: first.advance_known,
                 item_type: first.item_type.clone(),
@@ -2505,6 +2554,22 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
         Object::Real(r) => Some(*r),
         _ => None,
     }
+}
+
+/// Vertical extent (y0, y1) of each page's visible box, for measuring the
+/// page-number bands from the page's real top edge. The box is the same one
+/// [`visible_page_box`] resolves for the positioned-item frame — `CropBox ∩
+/// MediaBox` with page-tree inheritance — but the values stay in raw PDF user
+/// space, because the markdown pipeline the bands serve never leaves it.
+/// Pages without a resolvable box are absent, which keeps the calibrated
+/// absolute bands for them.
+pub(crate) fn page_vertical_bounds(doc: &Document) -> PageVerticalBounds {
+    doc.get_pages()
+        .into_iter()
+        .filter_map(|(page_num, page_id)| {
+            visible_page_box(doc, page_id).map(|page_box| (page_num, (page_box.y0, page_box.y1)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2685,6 +2750,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -3198,7 +3264,10 @@ mod tests {
             match style {
                 0 => first.is_italic = true,
                 1 => first.is_underline = true,
-                _ => first.is_strikeout = true,
+                _ => {
+                    first.is_strikeout = true;
+                    first.layout_strikeout = true;
+                }
             }
             let merged = merge_text_items(vec![first, make_merge_item("Body", 125.2, 24.0)]);
             assert_eq!(merged.len(), 2);
@@ -3344,7 +3413,39 @@ mod tests {
     }
 
     #[test]
-    fn suppress_table_underlines_clears_line_detected_table_items() {
+    fn a_kept_strike_does_not_spread_to_or_vanish_into_its_neighbour() {
+        // Strikes kept only as decorations (`layout_strikeout` false), beside
+        // a live word close enough to merge with: each word keeps its own
+        // decoration, whichever comes first.
+        for (old_struck, new_struck) in [(true, false), (false, true)] {
+            let mut old = make_merge_item("Old", 100.0, 20.0);
+            let mut new = make_merge_item("New", 123.0, 22.0);
+            old.is_strikeout = old_struck;
+            new.is_strikeout = new_struck;
+            let merged: Vec<_> = merge_text_items(vec![old, new])
+                .into_iter()
+                .map(|item| (item.text, item.is_strikeout))
+                .collect();
+            assert_eq!(
+                merged,
+                vec![
+                    ("Old".to_string(), old_struck),
+                    ("New".to_string(), new_struck)
+                ]
+            );
+        }
+        // Struck words merge with each other as before.
+        let mut a = make_merge_item("Old", 100.0, 20.0);
+        let mut b = make_merge_item("words", 123.0, 30.0);
+        a.is_strikeout = true;
+        b.is_strikeout = true;
+        let merged = merge_text_items(vec![a, b]);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].is_strikeout && !merged[0].layout_strikeout);
+    }
+
+    #[test]
+    fn suppress_table_underlines_clears_underlines_but_keeps_strikeouts() {
         let mut items = vec![
             make_merge_item("H1", 125.0, 20.0),
             make_merge_item("H2", 225.0, 20.0),
@@ -3358,6 +3459,7 @@ mod tests {
         for item in &mut items {
             item.is_underline = true;
             item.is_strikeout = true;
+            item.layout_strikeout = true;
         }
         let lines = vec![
             make_line(100.0, 500.0, 300.0, 500.0),
@@ -3371,7 +3473,16 @@ mod tests {
         suppress_table_underlines(&mut items, &[], &lines, 1);
 
         assert!(items.iter().all(|item| !item.is_underline));
-        assert!(items.iter().all(|item| !item.is_strikeout));
+        assert!(items.iter().all(|item| item.is_strikeout));
+        assert!(items.iter().all(|item| !item.layout_strikeout));
+
+        for item in &mut items {
+            item.layout_strikeout = true;
+        }
+        suppress_table_underlines(&mut items, &[], &lines, 1);
+        assert!(items
+            .iter()
+            .all(|item| item.is_strikeout && !item.layout_strikeout));
     }
 
     #[test]
@@ -3398,6 +3509,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -3425,6 +3537,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -3452,6 +3565,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -3603,6 +3717,7 @@ mod tests {
                     page_items,
                     &HashMap::new(),
                     &HashSet::new(),
+                    &HashMap::new(),
                     &HashMap::new(),
                 ),
             );
@@ -3877,6 +3992,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(lines.len(), 1);
@@ -3900,6 +4016,7 @@ mod tests {
             items,
             &HashMap::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -4249,6 +4366,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4276,6 +4394,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4303,6 +4422,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4341,6 +4461,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4368,6 +4489,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4395,6 +4517,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4435,6 +4558,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4482,6 +4606,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4530,6 +4655,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4557,6 +4683,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4584,6 +4711,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4619,6 +4747,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -4769,6 +4898,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4796,6 +4926,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4833,6 +4964,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4860,6 +4992,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4913,6 +5046,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4970,6 +5104,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -5027,6 +5162,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -5077,6 +5213,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -5353,7 +5490,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, page_rotations, _) =
+        let ((items, _, _), _, _, page_rotations, _, _) =
             extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
         assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
         let field = items

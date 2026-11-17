@@ -200,6 +200,109 @@ fn make_recurring_contextual_folio_pdf() -> Vec<u8> {
     pdf
 }
 
+/// Three A4 pages carrying digit-only body content in both margins.
+///
+/// Shaped as contents entries rather than a grid, because table detection is
+/// handed the unfiltered items and hands the digits back: a fixture whose rows
+/// look tabular passes on every build and proves nothing. Each digit also sits
+/// far from its label, past the same-line context gap that rescues a digit
+/// standing beside words — the gap that makes the upstream issue's own repro
+/// pass unchanged.
+///
+/// The contents number at y=740 is inside the US-Letter top band (720) and
+/// outside A4's (769.89). The body digit at y=103 is the mirror case: outside
+/// the calibrated bottom band, inside a bottom band scaled up by A4's height
+/// (106.3). Each page carries its own pair, because lines that repeat
+/// verbatim across pages are collapsed as running material and only the first
+/// would survive to be checked.
+///
+/// The real folio is the digit at y=800, and it is written as a running head
+/// beside words on purpose: `markdown::postprocess` deletes an isolated
+/// digit-only line without consulting the bands at all, so a folio standing
+/// alone would be stripped whatever the geometry decided and would prove
+/// nothing about it.
+fn make_a4_margin_body_digits_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>",
+    );
+    for page_index in 0usize..3 {
+        let page_id = 3 + page_index * 2;
+        let content_id = page_id + 1;
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            page_id,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /Font << /F1 9 0 R >> >> /Contents {content_id} 0 R >>"
+            ),
+        );
+        let page_number = page_index + 1;
+        let contents_number = 20 + page_number;
+        let body_digit = 90 + page_number;
+        let heading = ["Introduction", "Methods", "Results"][page_index];
+        let footing = ["alpha", "beta", "gamma"][page_index];
+        let content = format!(
+            "BT /F1 9 Tf \
+             1 0 0 1 72 740 Tm ({heading}) Tj 1 0 0 1 500 740 Tm ({contents_number}) Tj \
+             1 0 0 1 72 400 Tm (Body prose {footing} carrying no digits) Tj \
+             1 0 0 1 72 103 Tm (Risk indicator {footing}) Tj 1 0 0 1 500 103 Tm ({body_digit}) Tj \
+             1 0 0 1 72 800 Tm ({page_number}) Tj 1 0 0 1 110 800 Tm (Company report) Tj ET"
+        );
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            content_id,
+            &format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                content.len(),
+                content
+            ),
+        );
+    }
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        9,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
 fn make_pdf_with_malformed_unselected_page() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
@@ -284,6 +387,31 @@ fn make_minimal_text_pdf() -> Vec<u8> {
     )
 }
 
+#[test]
+fn exact_duplicate_overlay_is_emitted_once_in_markdown() {
+    let content = "BT /F1 10 Tf 1 0 0 1 40 692 Tm (Purchase $19.95) Tj 1 0 0 1 40 692 Tm (Purchase $19.95) Tj 1 0 0 1 40 650 Tm (Purchase $19.95) Tj ET";
+    let pdf = make_text_pdf(content, "0 0 612 792");
+
+    let result = extract_pages_markdown_mem(&pdf, None).expect("overlay PDF should parse");
+    let markdown = &result.pages[0].markdown;
+    assert_eq!(
+        markdown.matches("Purchase $19.95").count(),
+        2,
+        "an exact overlay must collapse without removing text at another position: {markdown}"
+    );
+
+    let positioned = extract_text_with_positions_mem(&pdf)
+        .expect("positioned extraction should keep source operations");
+    assert_eq!(
+        positioned
+            .iter()
+            .filter(|item| item.text.contains("Purchase $19.95"))
+            .count(),
+        3,
+        "the positioned API must keep all source paint operations"
+    );
+}
+
 fn make_digit_run_repro_pdf() -> Vec<u8> {
     let content = r#"BT
 /F1 12 Tf
@@ -356,6 +484,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         render_mode: None,
         is_underline: false,
         is_strikeout: false,
+        layout_strikeout: false,
         rotation: 0.0,
         advance_known: true,
         item_type: ItemType::Text,
@@ -394,6 +523,7 @@ fn make_text_item_with_font(
         render_mode: None,
         is_underline: false,
         is_strikeout: false,
+        layout_strikeout: false,
         rotation: 0.0,
         advance_known: true,
         item_type: ItemType::Text,
@@ -3030,8 +3160,11 @@ fn test_image_drawn_off_the_page_does_not_cover_it() {
     let detected = detect_pdf_type_mem(&buf).unwrap();
     assert_eq!(detected.pdf_type, PdfType::TextBased);
     assert!(detected.pages_needing_ocr.is_empty());
+    // The layer is render mode 3, so it is not shown even when the image
+    // misses the page. Detection still says the image is not a covering scan.
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
-    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.is_empty());
 
     let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
         image_dx: -100,
@@ -3375,8 +3508,9 @@ fn test_invisible_text_layer_is_the_first_reason_on_both_surfaces() {
         .any(|reason| reason == OCR_REASON_VECTOR_TEXT));
 }
 
-/// Invisible text with no image under it is not a scan: the page stays a
-/// text page and its layer is served, as before.
+/// Invisible text with no image under it is not a scan: detection keeps the
+/// page a text page. The layer is render mode 3, so extraction does not
+/// serve it, and the empty markdown recommends OCR.
 #[test]
 fn test_invisible_text_without_an_image_stays_text() {
     let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
@@ -3388,10 +3522,11 @@ fn test_invisible_text_without_an_image_stays_text() {
     assert!(detected.pages_needing_ocr.is_empty());
     let processed = process_pdf_mem(&buf).unwrap();
     assert_eq!(processed.pdf_type, PdfType::TextBased);
-    assert!(processed.pages_needing_ocr.is_empty());
+    assert_eq!(processed.pages_needing_ocr, vec![1]);
+    assert!(processed.markdown.as_deref().unwrap_or("").is_empty());
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
-    assert!(!pages.pages[0].needs_ocr);
-    assert!(!pages.pages[0].markdown.is_empty());
+    assert!(pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.is_empty());
 }
 
 /// A visible caption over the covering image means the page shows text of
@@ -3399,7 +3534,7 @@ fn test_invisible_text_without_an_image_stays_text() {
 #[test]
 fn test_visible_caption_over_covering_image_stays_text() {
     let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
-        caption: Some("Figure 1. A photograph"),
+        caption: Some("Figure 1. A photograph of the courtyard taken from the north gate."),
         ..SCAN_WITH_INVISIBLE_LAYER
     }]);
     let detected = detect_pdf_type_mem(&buf).unwrap();
@@ -5234,6 +5369,74 @@ fn test_extract_pages_markdown_uses_document_wide_folio_context() {
             "recurring contextual folio survived on page {}: {}",
             index + 1,
             page.markdown
+        );
+    }
+}
+
+/// Numbers as the Markdown presents them, so a table cell and a bare word
+/// compare the same way. Splitting on whitespace alone would leave `|14|`.
+fn number_tokens(markdown: &str) -> Vec<&str> {
+    markdown
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '.')
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+#[test]
+fn test_extract_pages_markdown_keeps_a4_body_digits_in_both_margins() {
+    let pdf = make_a4_margin_body_digits_pdf();
+    let result = extract_pages_markdown_mem(&pdf, None).unwrap();
+
+    assert_eq!(result.pages.len(), 3);
+    for (index, page) in result.pages.iter().enumerate() {
+        let tokens = number_tokens(&page.markdown);
+        let page_number = (index + 1).to_string();
+        let contents_number = (21 + index).to_string();
+        let body_digit = (91 + index).to_string();
+        assert!(
+            tokens.contains(&contents_number.as_str()),
+            "A4 contents entry below the top margin of page {page_number} lost \
+             its number to the folio filter: {}",
+            page.markdown
+        );
+        assert!(
+            tokens.contains(&body_digit.as_str()),
+            "A4 body digit above the footer margin on page {page_number} was \
+             removed as a folio: {}",
+            page.markdown
+        );
+        assert!(
+            page.markdown.contains("Company report"),
+            "the running head itself must survive on page {page_number}: {}",
+            page.markdown
+        );
+        assert!(
+            !tokens.contains(&page_number.as_str()),
+            "the real folio on page {page_number} survived: {}",
+            page.markdown
+        );
+    }
+}
+
+#[test]
+fn test_process_pdf_keeps_a4_body_digits_in_both_margins() {
+    // The same page through the `pdf2md` entry point, which reaches the folio
+    // filter by a different route than `extract_pages_markdown`.
+    let pdf = make_a4_margin_body_digits_pdf();
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::new()).unwrap();
+    let markdown = result.markdown.expect("pdf2md mode produces Markdown");
+    let tokens = number_tokens(&markdown);
+
+    for expected in ["21", "22", "23", "91", "92", "93"] {
+        assert!(
+            tokens.contains(&expected),
+            "A4 body digit {expected} was removed as a folio: {markdown}"
+        );
+    }
+    for folio in ["1", "2", "3"] {
+        assert!(
+            !tokens.contains(&folio),
+            "folio {folio} survived: {markdown}"
         );
     }
 }
@@ -7372,7 +7575,7 @@ fn clipping_preserves_prose_and_text_operator_fragments_within_one_clip() {
 #[test]
 fn clip_sidecar_stays_aligned_across_skipped_text_and_graphics_restore() {
     let content = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
-        + "BT /F1 12 Tf 3 Tr (Hidden) Tj () TJ ET\n"
+        + "BT /F1 12 Tf 3 Tr (Hidden) Tj () TJ ET 0 Tr\n"
         + &clipped_field("84 98 25 15 re W n", 84.0, "Beta");
     let items = clipped_run_items(&content);
     assert_eq!(
@@ -10022,10 +10225,10 @@ fn an_odd_length_string_no_cmap_reads_counts_its_bytes_once() {
 // Text paint and document information
 // =========================================================================
 
-/// One page showing a run in the default black, a red run, a run shown
-/// under a `3 Tr` set before its text object, a run hidden by `3 Tr` inside
-/// its own text object, a line shown with `"`, a Form XObject's text under
-/// the page's blue fill and a run after the form. The information dictionary
+/// One page showing a run in the default black, a red run, a run hidden by
+/// a `3 Tr` set before its text object, a run hidden by `3 Tr` inside its
+/// own text object, a line shown with `"`, a Form XObject's text under the
+/// page's blue fill and a run after the form. The information dictionary
 /// holds every text entry, in PDFDocEncoding and UTF-16BE.
 fn synthetic_paint_and_info_pdf() -> Vec<u8> {
     use lopdf::{dictionary, Document, Object, Stream, StringFormat};
@@ -10121,10 +10324,11 @@ fn text_items_report_their_fill_colour_and_render_mode() {
     // The default paint, and a fill colour set before the text object.
     assert_eq!(paint("Body text"), (black, black, Some(0)));
     assert_eq!(paint("Red text"), (Some([204, 26, 26]), black, Some(0)));
-    // A run shown under a `3 Tr` set before its text object is extracted as
-    // it always was, and says it paints nothing; a run hidden inside its own
-    // text object is still left out of the positioned text.
-    assert_eq!(paint("Invisible text"), (black, black, Some(3)));
+    // `3 Tr` is graphics state, so it hides the following text object as
+    // well as a run that sets the mode inside its own text object.
+    assert!(!items
+        .iter()
+        .any(|item| item.text.contains("Invisible text")));
     assert!(!items.iter().any(|item| item.text.contains("Layer text")));
     // `"` moves to the next line (the leading below the `Td`) and shows its
     // string, painted like any other run.
@@ -10142,13 +10346,12 @@ fn text_items_report_their_fill_colour_and_render_mode() {
 }
 
 #[test]
-fn markdown_keeps_invisible_and_quoted_text_as_the_extraction_reads_it() {
+fn markdown_omits_invisible_text_and_keeps_quoted_text() {
     let result = process_pdf_mem(&synthetic_paint_and_info_pdf()).unwrap();
     let markdown = result.markdown.unwrap();
     for text in [
         "Body text",
         "Red text",
-        "Invisible text",
         "Quoted line",
         "Form text",
         "After form",
@@ -10158,7 +10361,94 @@ fn markdown_keeps_invisible_and_quoted_text_as_the_extraction_reads_it() {
             "{text:?} missing from {markdown:?}"
         );
     }
+    assert!(!markdown.contains("Invisible text"), "{markdown:?}");
     assert!(!markdown.contains("Layer text"), "{markdown:?}");
+}
+
+fn helvetica_page(content: &[u8]) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.7");
+    let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "FirstChar" => 0,
+        "LastChar" => 255,
+        "Widths" => Object::Array(widths),
+    });
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn positioned_text(content: &str) -> Vec<String> {
+    extract_text_with_positions_mem(&helvetica_page(content.as_bytes()))
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect()
+}
+
+/// `Tr` is graphics state. A mode set inside one text object still hides the
+/// next, a mode set before any text object hides every object that follows,
+/// and `Q` restores the mode that was in force at `q`.
+#[test]
+fn text_rendering_mode_persists_across_text_objects() {
+    let carried = positioned_text(
+        "BT /F1 12 Tf 72 700 Td 3 Tr (alpha) Tj ET\n\
+         BT /F1 12 Tf 72 680 Td (beta) Tj ET\n",
+    );
+    assert!(
+        carried.is_empty(),
+        "mode set inside the first text object must hide the next: {carried:?}"
+    );
+
+    let outside = positioned_text(
+        "3 Tr\n\
+         BT /F1 12 Tf 72 700 Td (alpha) Tj ET\n\
+         BT /F1 12 Tf 72 680 Td (beta) Tj ET\n",
+    );
+    assert!(
+        outside.is_empty(),
+        "mode set outside a text object must hide the page: {outside:?}"
+    );
+
+    let restored = positioned_text(
+        "q 3 Tr BT /F1 12 Tf 72 700 Td (hidden) Tj ET Q\n\
+         BT /F1 12 Tf 72 680 Td (shown) Tj ET\n",
+    );
+    assert_eq!(restored, vec!["shown".to_string()], "{restored:?}");
+
+    let reset = positioned_text(
+        "BT /F1 12 Tf 3 Tr 72 700 Td (hidden) Tj ET\n\
+         0 Tr BT /F1 12 Tf 72 680 Td (shown) Tj ET\n",
+    );
+    assert_eq!(reset, vec!["shown".to_string()], "{reset:?}");
 }
 
 #[test]
@@ -11186,4 +11476,214 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
         &lines,
     );
     assert_eq!(read, ["(2)(4)"]);
+}
+
+/// Three-page PDF whose page 2 draws an uncompressed 1-pixel-high inline
+/// image with `image_data` as its raw bytes - the repro shape from issue
+/// #617 (AutoCAD plots draw gradient strips this way).
+fn make_pdf_with_inline_image_page(image_data: &[u8]) -> Vec<u8> {
+    let text = |label: &str| {
+        format!("BT /F1 12 Tf 72 720 Td ({label}: a page of ordinary text.) Tj ET\n").into_bytes()
+    };
+    let mut page2 = text("Page 2");
+    page2.extend_from_slice(b"q 72 0 0 24 72 600 cm\nBI /CS /DeviceGray /W ");
+    page2.extend_from_slice(image_data.len().to_string().as_bytes());
+    page2.extend_from_slice(b" /H 1 /BPC 8 ID\n");
+    page2.extend_from_slice(image_data);
+    page2.extend_from_slice(b"\nEI\nQ\n");
+    page2.extend_from_slice(&text("Text after the image"));
+
+    let page_contents = [text("Page 1"), page2, text("Page 3")];
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        Vec::new(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    let mut kids = Vec::new();
+    for content in page_contents {
+        let mut stream_obj = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        stream_obj.extend_from_slice(&content);
+        stream_obj.extend_from_slice(b"\nendstream");
+        objects.push(stream_obj);
+        let contents_id = objects.len();
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 3 0 R >> >> /Contents {contents_id} 0 R >>"
+            )
+            .into_bytes(),
+        );
+        kids.push(format!("{} 0 R", objects.len()));
+    }
+    objects[1] = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        kids.len()
+    )
+    .into_bytes();
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn test_inline_image_percent_byte_does_not_fail_document() {
+    // Issue #617: a `%` byte in unfiltered inline image data must survive
+    // the comment pre-pass; before the fix it was stripped to end-of-line,
+    // the image data came up short, and the whole document call failed.
+    let pdf = make_pdf_with_inline_image_page(&[0x80, b'%', 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+    let extraction = extract_pages_markdown_mem(&pdf, None)
+        .expect("document with a `%` byte in inline image data extracts");
+    assert_eq!(extraction.pages.len(), 3);
+
+    // Subset extraction that skips the image page worked before the fix and
+    // must keep working.
+    let subset = extract_pages_markdown_mem(&pdf, Some(&[0, 2])).expect("subset extraction");
+    assert_eq!(subset.pages.len(), 2);
+}
+
+#[test]
+fn test_inline_image_gray_control_still_extracts() {
+    // Control row from the issue's repro matrix: plain gray bytes extracted
+    // fine before the fix and must keep extracting.
+    let pdf = make_pdf_with_inline_image_page(&[0x80, 0x80, 0x80]);
+    let extraction = extract_pages_markdown_mem(&pdf, None).expect("control case extracts");
+    assert_eq!(extraction.pages.len(), 3);
+}
+
+/// One Letter page drawing `Client:` beside an AcroForm text field named
+/// `txtClientName` and a checked box named `chkAgree`.
+fn make_pdf_with_named_form_fields() -> Vec<u8> {
+    let content = b"BT /F1 12 Tf 72 700 Td (Client:) Tj ET";
+    let objects: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R 6 0 R] >> >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R /Annots [5 0 R 6 0 R] >>"
+            .into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (txtClientName) \
+         /V (Ivanov Ivan) /Rect [130 695 330 715] /P 3 0 R >>"
+            .into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Btn /T (chkAgree) \
+         /V /Yes /Rect [72 650 84 662] /P 3 0 R >>"
+            .into(),
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            std::str::from_utf8(content).unwrap()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn form_field_names_stay_out_of_the_markdown_and_are_counted() {
+    let pdf = make_pdf_with_named_form_fields();
+    let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
+    let markdown = &result.pages[0].markdown;
+    assert!(markdown.contains("Client:"), "{markdown}");
+    assert!(markdown.contains("Ivanov Ivan"), "{markdown}");
+    assert!(markdown.contains('\u{2611}'), "{markdown}");
+    assert!(!markdown.contains("txtClientName"), "{markdown}");
+    assert!(!markdown.contains("chkAgree"), "{markdown}");
+    assert!(!markdown.contains("Yes"), "{markdown}");
+    let names = vec![pdf_inspector::PageFormFieldNames { page: 1, names: 2 }];
+    assert_eq!(result.form_field_names_by_page, names);
+
+    // The OCR pipeline's native pass (what an app runs before asking for
+    // OCR) carries the same count and the same name-free text.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    {
+        use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+        let native = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native");
+        assert!(native.pages_routed_to_ocr.is_empty());
+        assert!(
+            native.markdown.contains("Ivanov Ivan"),
+            "{}",
+            native.markdown
+        );
+        assert!(!native.markdown.contains("txtClientName"));
+        assert_eq!(native.form_field_names_by_page, names);
+    }
+}
+
+#[test]
+fn invisible_text_stays_out_and_is_counted_in_stretches() {
+    let pages = [
+        // 1: `3 Tr` set in one text object carries into the next (one
+        // stretch), visible text ends it, a later hidden run is a second.
+        "BT /F1 12 Tf 72 700 Td (Visible one) Tj ET\n\
+         BT 3 Tr 72 680 Td (SECRET-A) Tj ET\n\
+         BT 72 660 Td [(SECRET-B)] TJ ET\n\
+         BT 0 Tr 72 640 Td (Visible two) Tj ET\n\
+         BT 3 Tr 72 620 Td (SECRET-C) Tj ( ) Tj ET",
+        // 2: text only.
+        "BT /F1 12 Tf 72 700 Td (Only words) Tj ET",
+        // 3: hidden spaces only: nothing counted.
+        "BT /F1 12 Tf 3 Tr 72 700 Td (   ) Tj 0 Tr 0 -20 Td (Shown) Tj ET",
+        // 4: hidden inside q/Q; Q restores the visible mode.
+        "q BT /F1 12 Tf 3 Tr 72 700 Td (SECRET-D) Tj ET Q\n\
+         BT /F1 12 Tf 72 680 Td (After) Tj ET",
+    ];
+    let pdf = make_pdf_with_image_pages(&pages);
+    let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
+    let page = |page, stretches| pdf_inspector::PageInvisibleText { page, stretches };
+    assert_eq!(result.invisible_text_by_page, vec![page(1, 2), page(4, 1)]);
+    for markdown in result.pages.iter().map(|page| &page.markdown) {
+        assert!(!markdown.contains("SECRET"), "{markdown}");
+    }
+    assert!(result.pages[0].markdown.contains("Visible two"));
+    assert!(result.pages[2].markdown.contains("Shown"));
+    assert!(result.pages[3].markdown.contains("After"));
+    // A page selection reports only the selected pages.
+    let selected = extract_pages_markdown_mem(&pdf, Some(&[1, 3])).expect("extract");
+    assert_eq!(selected.invisible_text_by_page, vec![page(4, 1)]);
+
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    {
+        use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+        let native = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native");
+        assert_eq!(native.invisible_text_by_page, vec![page(1, 2), page(4, 1)]);
+        assert!(!native.markdown.contains("SECRET"));
+    }
 }

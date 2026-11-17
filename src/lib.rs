@@ -168,6 +168,32 @@ pub struct PageImages {
     pub images: u32,
 }
 
+/// The form field names a single 1-indexed page leaves out of its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageFormFieldNames {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// How many AcroForm fields on the page contribute their value to the
+    /// text without their name: the name (`/T`, joined with its parents')
+    /// is the form's internal key, which the page never draws.
+    pub names: u32,
+}
+
+/// The invisible text a single 1-indexed page leaves out of its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageInvisibleText {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// How many stretches of invisible text (text render mode 3, which a
+    /// viewer does not paint) the page's text leaves out. A stretch is
+    /// invisible text with nothing kept between its parts: consecutive
+    /// invisible text-showing operators count once, across text objects and
+    /// form XObjects, and visible text or an image between them starts a
+    /// new one. Text of spaces only counts nothing. A scan's hidden OCR
+    /// layer is typically one stretch.
+    pub stretches: u32,
+}
+
 /// The shortest side, in points, an image must be drawn at to count in
 /// [`PageImages`]: about 1.4 mm.
 pub const MIN_COUNTED_IMAGE_SIDE_PT: f32 = 4.0;
@@ -575,6 +601,12 @@ pub struct PagesExtractionResult {
     /// order. Markdown carries no image content: at most a placeholder,
     /// with `MarkdownOptions::include_images`.
     pub images_by_page: Vec<PageImages>,
+    /// The requested pages with AcroForm fields whose names were left out
+    /// of the text (their values stay), with how many, in request order.
+    pub form_field_names_by_page: Vec<PageFormFieldNames>,
+    /// The requested pages whose text leaves out invisible (render mode 3)
+    /// text, with how many stretches, in request order.
+    pub invisible_text_by_page: Vec<PageInvisibleText>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -674,23 +706,30 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
-        if let Some(required_pages) = required_pages.as_ref() {
-            extractor::extract_positioned_text_for_document_analysis(
-                &doc,
-                &font_cmaps,
-                required_pages,
-            )?
-        } else {
-            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
-        };
+    let (
+        (all_items, all_rects, all_lines),
+        page_thresholds,
+        gid_pages,
+        _page_rotations,
+        _,
+        invisible_text_by_page,
+    ) = if let Some(required_pages) = required_pages.as_ref() {
+        extractor::extract_positioned_text_for_document_analysis(&doc, &font_cmaps, required_pages)?
+    } else {
+        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
+    };
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
     // Per-page Markdown receives the original items plus these decisions so
     // table detection can retain legitimate numeric cells.
+    let page_bounds = extractor::page_vertical_bounds(&doc);
     let (filtered_items, removed_page_number_pages, page_number_removal_mask) =
-        extractor::filter_markdown_page_numbers_with_removed_pages(all_items.clone(), page_count);
+        extractor::filter_markdown_page_numbers_with_removed_pages(
+            all_items.clone(),
+            page_count,
+            &page_bounds,
+        );
 
     // Tables need the original numeric cells; columns use folio-cleaned
     // evidence so removed page numbers cannot create false layout metadata.
@@ -706,7 +745,13 @@ fn extract_pages_markdown_mem_impl(
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
     let repeated_header_footer_items = if strip_repeated_headers_footers {
-        repeated_header_footer_item_keys(&all_items, &page_thresholds, &chart_regions, page_count)
+        repeated_header_footer_item_keys(
+            &all_items,
+            &page_thresholds,
+            &chart_regions,
+            page_count,
+            &page_bounds,
+        )
     } else {
         HashSet::new()
     };
@@ -725,9 +770,15 @@ fn extract_pages_markdown_mem_impl(
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
     let mut images_by_page = Vec::new();
+    let mut form_field_names_by_page = Vec::new();
+    let mut invisible_text_pages = Vec::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
+    let field_names_left_out = extractor::form_field_names_by_page(
+        &doc,
+        &lopdf_pages.iter().map(|(&num, &id)| (id, num)).collect(),
+    );
 
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
@@ -811,6 +862,18 @@ fn extract_pages_markdown_mem_impl(
                 images: signals.pictures,
             });
         }
+        if let Some(&stretches) = invisible_text_by_page.get(&page_1idx) {
+            invisible_text_pages.push(PageInvisibleText {
+                page: page_1idx,
+                stretches,
+            });
+        }
+        if let Some(&names) = field_names_left_out.get(&page_1idx) {
+            form_field_names_by_page.push(PageFormFieldNames {
+                page: page_1idx,
+                names,
+            });
+        }
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -836,6 +899,7 @@ fn extract_pages_markdown_mem_impl(
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
                     precomputed_chart_regions: Some(&chart_regions),
+                    page_bounds: &page_bounds,
                 },
             )
         };
@@ -905,6 +969,8 @@ fn extract_pages_markdown_mem_impl(
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
             images_by_page,
+            form_field_names_by_page,
+            invisible_text_by_page: invisible_text_pages,
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -988,6 +1054,7 @@ fn repeated_header_footer_item_keys(
     page_thresholds: &HashMap<u32, f32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     page_count: u32,
+    page_bounds: &extractor::PageVerticalBounds,
 ) -> HashSet<HeaderFooterItemKey> {
     let candidates = items
         .iter()
@@ -1004,6 +1071,7 @@ fn repeated_header_footer_item_keys(
         page_thresholds,
         &HashSet::new(),
         chart_regions,
+        page_bounds,
     );
     let all_items: HashSet<_> = lines
         .iter()
@@ -1043,6 +1111,7 @@ mod ocr_header_footer_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: types::ItemType::Text,
@@ -1067,7 +1136,13 @@ mod ocr_header_footer_tests {
             thresholds.insert(page, 0.1);
         }
 
-        let removed = repeated_header_footer_item_keys(&items, &thresholds, &HashMap::new(), 3);
+        let removed = repeated_header_footer_item_keys(
+            &items,
+            &thresholds,
+            &HashMap::new(),
+            3,
+            &HashMap::new(),
+        );
         assert_eq!(removed.len(), 2);
         for page in 1..=3 {
             assert_eq!(
@@ -1601,6 +1676,19 @@ pub fn extract_tables_in_regions_mem_with_options(
         lines_by_page.insert(*page_num, lines);
     }
 
+    // Folio bands for the column-table builder, expressed in the frame its
+    // items are already in. `extract_page_text_items_in_page_box` shifted
+    // every item so that the visible box's lower-left corner is the origin,
+    // so a page's extent is `0..height` here — not the raw user-space
+    // `(y0, y1)` that `extractor::page_vertical_bounds` reports for the
+    // markdown pipeline, which never leaves user space. Handing the raw pair
+    // to this path would put the top band a full `y0` above the items on any
+    // page whose box origin is not at zero.
+    let page_bounds: extractor::PageVerticalBounds = page_heights
+        .iter()
+        .map(|(page, height)| (*page, (0.0, *height)))
+        .collect();
+
     let mut results = Vec::with_capacity(page_regions.len());
 
     for (page_0idx, regions) in page_regions {
@@ -1816,7 +1904,9 @@ pub fn extract_tables_in_regions_mem_with_options(
             {
                 candidates.push(candidate);
             }
-            if let Some(table) = tables::try_build_table_from_columns(&matched, page_1idx) {
+            if let Some(table) =
+                tables::try_build_table_from_columns(&matched, page_1idx, &page_bounds)
+            {
                 if let Some(candidate) = evaluate(TableCandidateSource::Column, &table) {
                     candidates.push(candidate);
                 }
@@ -4697,7 +4787,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4772,6 +4862,7 @@ fn process_document(
             gid_encoded_pages,
             _page_rotations,
             cmap_coverage,
+            _invisible_text_by_page,
         )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
@@ -4843,6 +4934,10 @@ fn process_document(
                     .as_ref()
                     .is_none_or(|filter| filter.contains(&page))
             };
+            // Measured once and shared: the folio filter, column detection and
+            // the column table builder must all read the same page geometry or
+            // they disagree about where a page's margin is.
+            let page_bounds = extractor::page_vertical_bounds(&doc);
             let rects: Vec<_> = rects
                 .into_iter()
                 .filter(|rect| selected_page(rect.page))
@@ -4864,6 +4959,7 @@ fn process_document(
                 items,
                 page_count,
                 options.page_filter.as_ref(),
+                &page_bounds,
             );
 
             let text_quality = analyze_text_quality(&items);
@@ -4892,6 +4988,7 @@ fn process_document(
                         page_count,
                         prefiltered_page_number_pages: Some(&removed_pages),
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                        page_bounds: &page_bounds,
                         precomputed_chart_regions: Some(&chart_regions),
                     },
                 ))
@@ -5954,6 +6051,7 @@ mod text_cluster_column_undercount_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -6241,6 +6339,7 @@ mod table_candidate_selection_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -6718,9 +6817,14 @@ fn select_items_with_document_folio_context(
     all_items: Vec<types::TextItem>,
     page_count: u32,
     page_filter: Option<&HashSet<u32>>,
+    page_bounds: &extractor::PageVerticalBounds,
 ) -> FolioFilteredItems {
     let (all_layout_items, all_removed_pages, all_removal_mask) =
-        extractor::filter_markdown_page_numbers_with_removed_pages(all_items.clone(), page_count);
+        extractor::filter_markdown_page_numbers_with_removed_pages(
+            all_items.clone(),
+            page_count,
+            page_bounds,
+        );
     let selected_page = |page: u32| page_filter.is_none_or(|filter| filter.contains(&page));
 
     let (items, removal_mask) = all_items
@@ -7277,6 +7381,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -7328,8 +7433,11 @@ mod tests {
             test_item("1", 25.0, 20.0, 12.0, 10.0),
             test_item("2", 520.0, 60.0, 12.0, 10.0),
         ];
-        let (filtered, _, _) =
-            extractor::filter_markdown_page_numbers_with_removed_pages(items.clone(), 1);
+        let (filtered, _, _) = extractor::filter_markdown_page_numbers_with_removed_pages(
+            items.clone(),
+            1,
+            &HashMap::new(),
+        );
         assert!(filtered.is_empty());
 
         let filtered = compute_layout_complexity(&items, &filtered, &[], &[]);
@@ -7421,16 +7529,23 @@ mod tests {
             .filter(|item| item.page == 1)
             .cloned()
             .collect();
-        let (page_local_layout, _, _) =
-            extractor::filter_markdown_page_numbers_with_removed_pages(page_one_items.clone(), 4);
+        let (page_local_layout, _, _) = extractor::filter_markdown_page_numbers_with_removed_pages(
+            page_one_items.clone(),
+            4,
+            &HashMap::new(),
+        );
         let page_local = compute_layout_complexity(&page_one_items, &page_local_layout, &[], &[]);
         assert!(
             page_local.pages_with_columns.contains(&1),
             "fixture must reproduce page-local folio column evidence"
         );
 
-        let selected =
-            select_items_with_document_folio_context(items, 4, Some(&HashSet::from([1])));
+        let selected = select_items_with_document_folio_context(
+            items,
+            4,
+            Some(&HashSet::from([1])),
+            &HashMap::new(),
+        );
         assert_eq!(
             selected
                 .removal_mask
@@ -8495,6 +8610,7 @@ mod rotated_run_region_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }

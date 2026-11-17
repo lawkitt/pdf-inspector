@@ -1430,6 +1430,7 @@ pub fn to_markdown_from_items_with_rects_and_page_count(
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
             precomputed_chart_regions: None,
+            page_bounds: &HashMap::new(),
         },
     )
 }
@@ -1450,6 +1451,10 @@ pub(crate) struct MarkdownDocumentContext<'a> {
     /// Optional chart masks shared with layout analysis so the geometry is
     /// detected once and interpreted identically by both pipelines.
     pub(crate) precomputed_chart_regions: Option<&'a PageChartRegions>,
+    /// Vertical extent of each page's visible box, so the folio bands match
+    /// the page's real height. Empty on the items-only entry points, whose
+    /// callers hold no document to measure.
+    pub(crate) page_bounds: &'a crate::extractor::PageVerticalBounds,
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -1496,6 +1501,10 @@ pub(crate) fn complete_table_markdown_from_items(
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
             precomputed_chart_regions: None,
+            // OCR fusion hands in items recovered from a rendered page, not
+            // a document, so there is no page box to measure: the folio
+            // bands stay at their US-Letter calibration.
+            page_bounds: &HashMap::new(),
         },
         TableOutputMode::CompleteTables,
     );
@@ -1535,11 +1544,69 @@ fn convert_items_with_rects_lines_and_table_output(
         prefiltered_page_number_pages,
         prefiltered_page_number_mask,
         precomputed_chart_regions,
+        page_bounds,
     } = context;
 
     if items.is_empty() {
         return MarkdownConversionOutput::default();
     }
+
+    // Keep positioned extraction faithful to the source operations. Semantic
+    // Markdown needs only one copy of the same text painted at identical
+    // coordinates.
+    #[derive(Eq, Hash, PartialEq)]
+    struct OverlayKey {
+        page: u32,
+        is_form_field: bool,
+        text: String,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        font: String,
+        font_size: u32,
+        is_bold: bool,
+        is_italic: bool,
+        is_underline: bool,
+        is_strikeout: bool,
+        mcid: Option<i64>,
+    }
+
+    let mut seen_overlays = HashSet::new();
+    let overlay_keep_mask: Vec<bool> = items
+        .iter()
+        .map(|item| match item.item_type {
+            ItemType::Text | ItemType::FormField => seen_overlays.insert(OverlayKey {
+                page: item.page,
+                is_form_field: matches!(item.item_type, ItemType::FormField),
+                text: item.text.clone(),
+                x: item.x.to_bits(),
+                y: item.y.to_bits(),
+                width: item.width.to_bits(),
+                height: item.height.to_bits(),
+                font: item.font.clone(),
+                font_size: item.font_size.to_bits(),
+                is_bold: item.is_bold,
+                is_italic: item.is_italic,
+                is_underline: item.is_underline,
+                is_strikeout: item.is_strikeout,
+                mcid: item.mcid,
+            }),
+            _ => true,
+        })
+        .collect();
+    let deduplicated_page_number_mask = prefiltered_page_number_mask.map(|mask| {
+        mask.iter()
+            .zip(&overlay_keep_mask)
+            .filter_map(|(remove, keep)| keep.then_some(*remove))
+            .collect::<Vec<_>>()
+    });
+    let items = items
+        .into_iter()
+        .zip(&overlay_keep_mask)
+        .filter_map(|(item, keep)| keep.then_some(item))
+        .collect::<Vec<_>>();
+    let prefiltered_page_number_mask = deduplicated_page_number_mask.as_deref();
 
     // Table detection must retain the original collection because short
     // numeric table cells can be indistinguishable from folios until
@@ -1996,7 +2063,9 @@ fn convert_items_with_rects_lines_and_table_output(
             });
             let has_structural_elements = band_rects.len() >= 6 || band_lines.len() >= 4;
             if !band_has_tables && !has_structural_elements {
-                if let Some(table) = crate::tables::try_build_table_from_columns(band_items, page) {
+                if let Some(table) =
+                    crate::tables::try_build_table_from_columns(band_items, page, page_bounds)
+                {
                     for &idx in &table.item_indices {
                         if let Some(&page_idx) = band_index_map.get(idx) {
                             if let Some(&(global_idx, _)) = group.get(page_idx) {
@@ -2234,6 +2303,7 @@ fn convert_items_with_rects_lines_and_table_output(
         crate::extractor::filter_markdown_page_numbers_with_removed_pages(
             non_table_items.into_iter().map(|(_, item)| item).collect(),
             document_page_count,
+            page_bounds,
         )
         .0
     };
@@ -2248,6 +2318,7 @@ fn convert_items_with_rects_lines_and_table_output(
             &table_page_set,
             &page_chart_map,
             &page_image_regions,
+            page_bounds,
         )
     } else {
         // Separate items into physical-band pages, chart/prose pages, and
@@ -2277,6 +2348,7 @@ fn convert_items_with_rects_lines_and_table_output(
                 &table_page_set,
                 &page_chart_map,
                 &page_image_regions,
+                page_bounds,
             );
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.
@@ -2300,6 +2372,7 @@ fn convert_items_with_rects_lines_and_table_output(
                             page_thresholds,
                             &table_page_set,
                             &page_chart_map,
+                            page_bounds,
                         ),
                     );
                 }
@@ -2334,6 +2407,7 @@ fn convert_items_with_rects_lines_and_table_output(
                                 page_thresholds,
                                 &table_page_set,
                                 &page_chart_map,
+                                page_bounds,
                             ),
                         );
                     }
@@ -2375,6 +2449,7 @@ fn convert_items_with_rects_lines_and_table_output(
                         page_thresholds,
                         &table_page_set,
                         &page_chart_map,
+                        page_bounds,
                     ),
                 );
                 remaining = below;
@@ -2702,6 +2777,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: crate::types::ItemType::Text,
@@ -2714,6 +2790,113 @@ mod tests {
         let mut it = make_item(x, y, page);
         it.width = width;
         it
+    }
+
+    /// Lines of a Russian lease clause list: the intro, `а)`–`г)` items
+    /// (each label in its own run when `split_label`), and a closing line.
+    fn russian_clause_page(split_label: bool) -> Vec<TextItem> {
+        let line = |text: &str, x: f32, y: f32, width: f32| {
+            let mut item = make_item_w(x, y, width, 1);
+            item.text = text.into();
+            item.font = "Arial".into();
+            item.font_size = 11.0;
+            item.height = 11.0;
+            item
+        };
+        let clauses = [
+            (
+                "а)",
+                "вносить арендную плату своевременно и в полном объеме;",
+            ),
+            ("б)", "содержать помещение в надлежащем состоянии;"),
+            ("в)", "не сдавать помещение в субаренду без согласия;"),
+            ("г)", "вернуть помещение по истечении срока договора."),
+        ];
+        let mut items = vec![line(
+            "2.1. Арендатор принимает на себя следующие обязанности:",
+            72.0,
+            700.0,
+            320.0,
+        )];
+        for (index, (label, body)) in clauses.iter().enumerate() {
+            let y = 680.0 - 16.0 * index as f32;
+            if split_label {
+                items.push(line(label, 72.0, y, 10.0));
+                items.push(line(body, 90.0, y, 330.0));
+            } else {
+                items.push(line(&format!("{label} {body}"), 72.0, y, 350.0));
+            }
+        }
+        items.push(line(
+            "2.2. Арендодатель обязуется передать помещение по акту.",
+            72.0,
+            600.0,
+            330.0,
+        ));
+        items
+    }
+
+    #[test]
+    fn russian_clause_labels_become_list_items() {
+        for split_label in [false, true] {
+            let markdown = to_markdown_from_items(
+                russian_clause_page(split_label),
+                MarkdownOptions::default(),
+            );
+            for expected in [
+                "- а) вносить арендную плату своевременно и в полном объеме;",
+                "- б) содержать помещение в надлежащем состоянии;",
+                "- в) не сдавать помещение в субаренду без согласия;",
+                "- г) вернуть помещение по истечении срока договора.",
+            ] {
+                assert!(
+                    markdown.lines().any(|line| line == expected),
+                    "split_label={split_label}: {expected}\n{markdown}"
+                );
+            }
+            // The next clause is its own paragraph, not the last item's tail.
+            assert!(
+                markdown.contains("\n\n2.2. Арендодатель обязуется"),
+                "split_label={split_label}\n{markdown}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_overlays_with_distinct_mcids_are_not_collapsed() {
+        let mut first = make_item(100.0, 700.0, 1);
+        first.text = "Tagged overlay".into();
+        first.width = 80.0;
+        first.mcid = Some(10);
+
+        let mut second = first.clone();
+        second.mcid = Some(11);
+
+        let struct_roles = HashMap::from([(
+            1,
+            HashMap::from([
+                (10, crate::structure_tree::StructRole::H1),
+                (11, crate::structure_tree::StructRole::H2),
+            ]),
+        )]);
+        let markdown = to_markdown_from_items_with_rects_and_lines(
+            vec![first, second],
+            MarkdownOptions::default(),
+            &[],
+            &[],
+            MarkdownDocumentContext {
+                page_thresholds: &HashMap::new(),
+                struct_roles: Some(&struct_roles),
+                struct_tables: &[],
+                page_count: 1,
+                prefiltered_page_number_pages: None,
+                prefiltered_page_number_mask: None,
+                precomputed_chart_regions: None,
+                page_bounds: &HashMap::new(),
+            },
+        );
+
+        assert_eq!(markdown.matches("Tagged overlay").count(), 2, "{markdown}");
     }
 
     #[test]
@@ -2757,6 +2940,7 @@ mod tests {
                 prefiltered_page_number_pages: Some(&removed_pages),
                 prefiltered_page_number_mask: Some(&removal_mask),
                 precomputed_chart_regions: None,
+                page_bounds: &HashMap::new(),
             },
         );
 
