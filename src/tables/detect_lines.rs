@@ -1729,6 +1729,42 @@ pub(crate) fn detect_vector_grid_tables_from_lines(
     detect_tables_from_lines_inner(items, lines, page, false, false)
 }
 
+/// Drops outer row edges (ascending `edges`) that belong to no drawn grid:
+/// a rule that no vertical line reaches and that would close a band much
+/// taller than any row between the verticals. A title's or heading's border
+/// rule above a ruled table (a Word "Title" style exported by LibreOffice,
+/// upstream #612) otherwise becomes the table's top edge, and the headings
+/// and paragraphs between it and the real top rule turn into a fabricated
+/// first row. A header band without verticals of its own stays: it is no
+/// taller than about two of the grid's rows.
+fn trim_detached_outer_rules(mut edges: Vec<f32>, verticals: &[(f32, f32, f32)]) -> Vec<f32> {
+    const REACH: f32 = 3.0;
+    let reached = |y: f32| {
+        verticals
+            .iter()
+            .any(|&(_, low, high)| y >= low - REACH && y <= high + REACH)
+    };
+    while edges.len() > 3 {
+        let inner: Vec<f32> = edges.iter().copied().filter(|&y| reached(y)).collect();
+        if inner.len() < 3 {
+            break;
+        }
+        let tallest_row = inner
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .fold(0.0_f32, f32::max);
+        let last = edges.len() - 1;
+        if !reached(edges[last]) && edges[last] - edges[last - 1] > tallest_row * 2.0 {
+            edges.pop();
+        } else if !reached(edges[0]) && edges[1] - edges[0] > tallest_row * 2.0 {
+            edges.remove(0);
+        } else {
+            break;
+        }
+    }
+    edges
+}
+
 fn detect_tables_from_lines_inner(
     items: &[TextItem],
     lines: &[PdfLine],
@@ -1883,6 +1919,11 @@ fn detect_tables_from_lines_inner(
     // Snap Y-values of horizontal lines → row edges
     let h_ys: Vec<f32> = horizontals.iter().map(|(y, _, _)| *y).collect();
     let row_edges = snap_edges(&h_ys, 3.0);
+    let row_edges = if cols_from_segments {
+        row_edges
+    } else {
+        trim_detached_outer_rules(row_edges, &verticals)
+    };
 
     // Column edges from drawn verticals when present, else from the
     // horizontal-segment endpoints derived above.
@@ -2174,6 +2215,26 @@ mod tests {
             y2,
             page,
         }
+    }
+
+    #[test]
+    fn detached_outer_rule_is_not_a_row_edge() {
+        // Verticals span 500..570; rows are 14 pt. A title rule at 688 would
+        // close a 118 pt band; a header rule at 590 a 20 pt one.
+        let verticals = [(85.0, 500.0, 570.0), (522.0, 500.0, 570.0)];
+        let rows = vec![500.0, 514.0, 528.0, 542.0, 556.0, 570.0];
+        let mut with_title = rows.clone();
+        with_title.push(688.0);
+        assert_eq!(trim_detached_outer_rules(with_title, &verticals), rows);
+        let mut with_footer = vec![380.0];
+        with_footer.extend(rows.iter().copied());
+        assert_eq!(trim_detached_outer_rules(with_footer, &verticals), rows);
+        let mut with_header_band = rows.clone();
+        with_header_band.push(590.0);
+        assert_eq!(
+            trim_detached_outer_rules(with_header_band.clone(), &verticals),
+            with_header_band
+        );
     }
 
     #[test]
