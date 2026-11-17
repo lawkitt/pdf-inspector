@@ -938,6 +938,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let text_ops = counts.text_ops;
     let image_count = counts.image_count;
     let path_ops = counts.path_ops;
+    let rect_ops = counts.rect_ops;
     let font_changes = counts.font_changes;
 
     // Check for XObject images and calculate coverage. An image the
@@ -995,16 +996,21 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // Text in decodable fonts with enough text operators is likewise real
     // native text when its raw operands have little ASCII diversity: a form
     // whose fill-in rules are dotted lines drawn as thousands of tiny shapes
-    // next to a few repeated labels (upstream #361). The exemption is held to
-    // the same path operators per decoded character as the CID check, so a
-    // dozen live header lines over outlined body text stay vector text.
+    // next to a few repeated labels (upstream #361). The exemption holds
+    // when the paths are mostly rectangles (each `re` and the paint after
+    // it), which outlined glyphs are not drawn with, however many dots
+    // there are; otherwise it is held to the same path operators per
+    // decoded character as the CID check, so a dozen live header lines over
+    // outlined body text stay vector text.
     let mut has_vector_text = path_ops >= 1000
         && path_ops > text_ops.saturating_mul(200)
         && (unique_alphanum_chars as usize) < VECTOR_TEXT_MIN_ALPHANUMERICS;
     if has_vector_text {
         let decoded = decoded_text_counts(doc, page_id);
         has_vector_text = !(decoded.through_cid_cmap && decoded.is_page_text(path_ops))
-            && !(has_decodable_text_fonts && text_ops >= 10 && decoded.outweighs_paths(path_ops));
+            && !(has_decodable_text_fonts
+                && text_ops >= 10
+                && (rect_ops.saturating_mul(2) >= path_ops || decoded.outweighs_paths(path_ops)));
     }
 
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.

@@ -9908,27 +9908,31 @@ fn make_text_with_dotted_rules_pdf(text: &str, dots: usize) -> Vec<u8> {
 /// was routed to OCR with reason `vector_text` and its Markdown was empty.
 #[test]
 fn test_decodable_text_with_dotted_form_rules_is_not_vector_text() {
-    let pdf = make_text_with_dotted_rules_pdf("clean text", 3000);
+    // 3000 dots is the probe of the triage; 8000 are more path operators
+    // than 100 per decoded character of the twelve lines, and still dots.
+    for dots in [3000, 8000] {
+        let pdf = make_text_with_dotted_rules_pdf("clean text", dots);
 
-    let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
-    let page = &pages.pages[0];
-    assert!(!page.needs_ocr, "{page:?}");
-    assert_eq!(page.ocr_reason, None);
-    assert_eq!(page.markdown.matches("clean text").count(), 12, "{page:?}");
-    assert!(pages.pages_needing_ocr.is_empty());
+        let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+        let page = &pages.pages[0];
+        assert!(!page.needs_ocr, "{dots} dots: {page:?}");
+        assert_eq!(page.ocr_reason, None);
+        assert_eq!(page.markdown.matches("clean text").count(), 12, "{page:?}");
+        assert!(pages.pages_needing_ocr.is_empty());
 
-    let processed = process_pdf_mem(&pdf).unwrap();
-    assert!(vector_text_reasons(&processed).is_empty());
-    assert!(processed.pages_needing_ocr.is_empty());
-    assert!(processed.markdown.unwrap().contains("clean text"));
+        let processed = process_pdf_mem(&pdf).unwrap();
+        assert!(vector_text_reasons(&processed).is_empty(), "{dots} dots");
+        assert!(processed.pages_needing_ocr.is_empty());
+        assert!(processed.markdown.unwrap().contains("clean text"));
 
-    // mdoc's native pass.
-    #[cfg(feature = "ocr")]
-    {
-        use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
-        let native = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native");
-        assert!(native.pages_recommended_for_ocr.is_empty());
-        assert_eq!(native.markdown.matches("clean text").count(), 12);
+        // mdoc's native pass.
+        #[cfg(feature = "ocr")]
+        {
+            use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+            let native = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native");
+            assert!(native.pages_recommended_for_ocr.is_empty());
+            assert_eq!(native.markdown.matches("clean text").count(), 12);
+        }
     }
 }
 

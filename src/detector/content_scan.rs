@@ -175,6 +175,9 @@ pub(super) struct ContentCounts {
     pub(super) image_count: u32,
     /// Path construction and painting operators.
     pub(super) path_ops: u32,
+    /// `re` operators among `path_ops`: rectangles, such as the dots of a
+    /// dotted rule, which outlined glyphs are not drawn with.
+    pub(super) rect_ops: u32,
     /// `Tf` operators whose font name could be read.
     pub(super) font_changes: u32,
 }
@@ -184,6 +187,7 @@ impl ContentCounts {
         self.text_ops += other.text_ops;
         self.image_count += other.image_count;
         self.path_ops += other.path_ops;
+        self.rect_ops += other.rect_ops;
         self.font_changes += other.font_changes;
     }
 }
@@ -1419,6 +1423,7 @@ fn scan_masked_content<'a>(
             // Two-byte: re (rect), f* (fill even-odd), B*/b*, W* (clip even-odd)
             b'r' if ops.get(i + 1) == Some(&b'e') && is_word_start(i) && is_token_end(i + 1) => {
                 counts.path_ops += 1;
+                counts.rect_ops += 1;
                 if let Some(rect) = numeric_operands_before::<4>(ops, i, operand_floor) {
                     state.path_rect(rect);
                 }
