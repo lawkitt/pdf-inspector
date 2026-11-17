@@ -1086,8 +1086,16 @@ fn line_grid_spans_band_boundary(lines: &[PdfLine], page: u32, bands: &[(f32, f3
                 group_end += 1;
             }
 
-            let mut span = (horizontal_rules[index].1, horizontal_rules[index].2);
-            for &(_, left, right) in &horizontal_rules[index + 1..group_end] {
+            // Merge the row's segments left to right: rules a point or two
+            // apart in y still sort by y above, which would start the span
+            // at whichever segment came first.
+            let mut row: Vec<(f32, f32)> = horizontal_rules[index..group_end]
+                .iter()
+                .map(|&(_, left, right)| (left, right))
+                .collect();
+            row.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut span = row[0];
+            for &(left, right) in &row[1..] {
                 if left <= span.1 + 6.0 {
                     span.1 = span.1.max(right);
                 } else {
@@ -2989,6 +2997,27 @@ mod tests {
             !line_grid_spans_band_boundary(&lines, 1, &[(50.0, 200.0), (300.0, 450.0)]),
             "disjoint ruled tables must retain their physical gutter"
         );
+    }
+
+    #[test]
+    fn line_grid_rows_merge_left_to_right_across_small_y_offsets() {
+        // Each row is two segments a point apart in y, the right one first
+        // in y order; together they cross the boundary at x=200.
+        let lines: Vec<PdfLine> = [400.0, 370.0, 335.0]
+            .into_iter()
+            .flat_map(|y| {
+                [
+                    make_rule(300.0, y, 450.0, y),
+                    make_rule(50.0, y - 1.0, 300.0, y - 1.0),
+                ]
+            })
+            .collect();
+
+        assert!(line_grid_spans_band_boundary(
+            &lines,
+            1,
+            &[(50.0, 200.0), (300.0, 450.0)]
+        ));
     }
 
     #[test]
