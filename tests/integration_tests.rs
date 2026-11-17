@@ -10012,6 +10012,47 @@ fn test_live_header_over_outlined_text_is_still_vector_text() {
     assert_eq!(vector_text_reasons(&processed), vec![1]);
 }
 
+/// Lettering drawn in dots — 5×7 dot-matrix glyphs of 1 pt squares at a
+/// 1.2 pt pitch, forty thousand of them — is vector text, though its paths
+/// are rectangles: the dots stack, as a dotted rule's do not, so a dozen
+/// live header lines over it still leave the page to OCR.
+#[test]
+fn test_live_header_over_dot_matrix_lettering_is_still_vector_text() {
+    let mut content = String::from("BT /F1 12 Tf ");
+    for line in 0..12 {
+        content.push_str(&format!(
+            "1 0 0 1 72 {} Tm (Annual Report 2026) Tj ",
+            760 - line * 14
+        ));
+    }
+    content.push_str("ET\n");
+    let mut dots = 0;
+    'glyphs: for glyph in 0.. {
+        let (gx, gy) = (
+            40.0 + (glyph % 70) as f32 * 7.5,
+            560.0 - (glyph / 70) as f32 * 10.0,
+        );
+        for row in 0..7 {
+            for col in 0..5 {
+                let (x, y) = (gx + col as f32 * 1.2, gy - row as f32 * 1.2);
+                content.push_str(&format!("{x:.1} {y:.1} 1 1 re f\n"));
+                dots += 1;
+                if dots == 40_000 {
+                    break 'glyphs;
+                }
+            }
+        }
+    }
+    let pdf = make_text_pdf(&content, "0 0 612 792");
+
+    let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_VECTOR_TEXT)
+    );
+}
+
 const MAC_ROMAN_HELVETICA: &str =
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /MacRomanEncoding >>";
 
