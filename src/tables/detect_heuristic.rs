@@ -727,12 +727,13 @@ pub(crate) fn detect_tables_with_page_width(
             log::debug!("body-font: {} strict regions found", regions.len());
 
             for (y_min, y_max, _x_min, _x_max) in &regions {
+                let y_min = extend_over_wrapped_last_row(&body_candidates, *y_min, *y_max);
                 // Use full X range for region items — the strict X bounds from
                 // qualifying rows can exclude continuation lines in wrapped cells.
                 // Y bounds from the region are sufficient to scope the table area.
                 let region_items: Vec<(usize, &TextItem)> = body_candidates
                     .iter()
-                    .filter(|(_, item)| item.y >= *y_min && item.y <= *y_max)
+                    .filter(|(_, item)| item.y >= y_min && item.y <= *y_max)
                     .cloned()
                     .collect();
 
@@ -820,6 +821,104 @@ fn find_table_regions(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
     }
 
     regions
+}
+
+/// Lowers a body-font table region's bottom over the wrapped lines of its
+/// last row (upstream #669). The region ends at the last row with items in
+/// two or more columns, so when a cell of that row wraps, its next line is
+/// left below the region and falls out of the table as a paragraph. A line
+/// one line pitch below joins the region when each of its text segments
+/// starts where one of the last row's cells starts and ends before the next
+/// cell does, and the region's own rows wrap the same way somewhere (a line
+/// continuing the cells of the row above it), so a table of one-line rows
+/// does not swallow a short note set right under it.
+fn extend_over_wrapped_last_row(candidates: &[(usize, &TextItem)], y_min: f32, y_max: f32) -> f32 {
+    const SAME_LINE: f32 = 2.0;
+    const SAME_START: f32 = 3.0;
+
+    // Text segments of each baseline, top to bottom: runs closer than a
+    // font size join one segment, as words of one cell line do.
+    let mut items: Vec<&TextItem> = candidates
+        .iter()
+        .map(|(_, item)| *item)
+        .filter(|item| item.y <= y_max)
+        .collect();
+    items.sort_by(|a, b| b.y.total_cmp(&a.y));
+    let mut lines: Vec<(f32, Vec<&TextItem>)> = Vec::new();
+    for item in items {
+        match lines.last_mut() {
+            Some((y, runs)) if (*y - item.y).abs() <= SAME_LINE => runs.push(item),
+            _ => lines.push((item.y, vec![item])),
+        }
+    }
+    let lines: Vec<(f32, Vec<(f32, f32)>)> = lines
+        .into_iter()
+        .map(|(y, mut runs)| {
+            runs.sort_by(|a, b| a.x.total_cmp(&b.x));
+            let mut segments: Vec<(f32, f32)> = Vec::new();
+            for run in runs {
+                let end = run.x + run.width.max(0.0);
+                match segments.last_mut() {
+                    Some(last) if run.x - last.1 <= run.font_size.max(1.0) => {
+                        last.1 = last.1.max(end);
+                    }
+                    _ => segments.push((run.x, end)),
+                }
+            }
+            (y, segments)
+        })
+        .collect();
+
+    let inside = lines.iter().take_while(|(y, _)| *y >= y_min).count();
+    if inside < 3 {
+        return y_min;
+    }
+    let pitch = lines[..inside]
+        .windows(2)
+        .map(|pair| pair[0].0 - pair[1].0)
+        .fold(f32::INFINITY, f32::min);
+    if !pitch.is_finite() || pitch <= 0.0 {
+        return y_min;
+    }
+    let one_line_below = |upper: f32, lower: f32| {
+        let gap = upper - lower;
+        gap >= pitch * 0.7 && gap <= pitch * 1.25
+    };
+    // Every segment of `line` continues a cell of `row`.
+    let continues = |row: &[(f32, f32)], line: &[(f32, f32)]| {
+        row.len() >= 2
+            && line.len() < row.len()
+            && line.iter().all(|&(start, end)| {
+                row.iter()
+                    .position(|cell| (cell.0 - start).abs() <= SAME_START)
+                    .is_some_and(|cell| row.get(cell + 1).is_none_or(|next| end < next.0))
+            })
+    };
+    let wraps_inside = (1..inside).any(|line| {
+        let row = (0..line).rev().find(|&row| lines[row].1.len() >= 2);
+        row.is_some_and(|row| {
+            continues(&lines[row].1, &lines[line].1)
+                && one_line_below(lines[line - 1].0, lines[line].0)
+        })
+    });
+    let Some(last_row) = (0..inside).rev().find(|&row| lines[row].1.len() >= 2) else {
+        return y_min;
+    };
+    if !wraps_inside {
+        return y_min;
+    }
+    let mut lowest = inside - 1;
+    while let Some((y, segments)) = lines.get(lowest + 1) {
+        if !one_line_below(lines[lowest].0, *y) || !continues(&lines[last_row].1, segments) {
+            break;
+        }
+        lowest += 1;
+    }
+    if lowest == inside - 1 {
+        y_min
+    } else {
+        y_min.min(lines[lowest].0 - 5.0)
+    }
 }
 
 /// Find Y-regions for body-font table candidates using strict structural criteria.

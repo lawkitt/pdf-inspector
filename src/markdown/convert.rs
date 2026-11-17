@@ -127,11 +127,30 @@ fn compare_positioned_blocks(
             .then_with(|| a_idx.cmp(b_idx));
     }
 
-    // Preserve the legacy ordering for ordinary pages: tables in detection
-    // order, followed by images in input order. Chart pages give every block
-    // a chart order and use the logical stream comparison above.
-    a_kind.cmp(b_kind).then_with(|| a_idx.cmp(b_idx))
+    // Ordinary pages: tables, then images in input order. Tables go top to
+    // bottom, and left to right when their tops share a band (side-by-side
+    // tables): several can wait for the same line, or for the end of a page
+    // whose text they claimed entirely, and detection order is not reading
+    // order (a page's regions are found bottom-up, rect hints in cluster
+    // order). Chart pages give every block a chart order and use the logical
+    // stream comparison above.
+    let table_order = |kind: &PositionedBlockKind, block: &PositionedMarkdown| {
+        (*kind == PositionedBlockKind::Table)
+            .then(|| (-(block.y / TABLE_TOP_BAND).round() as i64, block.x))
+    };
+    a_kind
+        .cmp(b_kind)
+        .then_with(|| match (table_order(a_kind, a), table_order(b_kind, b)) {
+            (Some((a_band, a_x)), Some((b_band, b_x))) => {
+                a_band.cmp(&b_band).then_with(|| a_x.total_cmp(&b_x))
+            }
+            _ => Ordering::Equal,
+        })
+        .then_with(|| a_idx.cmp(b_idx))
 }
+
+/// Tables whose tops lie this close (in points) read left to right.
+const TABLE_TOP_BAND: f32 = 24.0;
 
 fn positioned_blocks_for_page<'a>(
     page: u32,
