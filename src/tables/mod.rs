@@ -709,6 +709,15 @@ pub(crate) fn try_build_table_from_columns(
         multi_col_rows
     );
 
+    // A wrapped row's next line is a row of its own so far (upstream #315);
+    // the checks above read the rows as found.
+    let wrapped = grid::wrapped_line_rows(&row_ys, &cells);
+    if wrapped.contains(&true) {
+        row_ys = grid::fold_wrapped_rows(row_ys, &wrapped, |_, _| {});
+        cells = grid::fold_wrapped_rows(cells, &wrapped, |above, below| {
+            grid::join_wrapped_cells(above, below)
+        });
+    }
     Some(Table::new(col_xs, row_ys, cells, item_indices))
 }
 

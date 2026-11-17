@@ -6,10 +6,12 @@ use pdf_inspector::extract_pages_markdown_mem;
 
 /// A text run at (`x`, `y`) in `/F1` (Helvetica) or `/F2` (Helvetica-Bold).
 fn text(font: &str, size: f32, x: f32, y: f32, s: &str) -> String {
+    // Helvetica's built-in StandardEncoding draws the em dash at octal 320.
     let escaped = s
         .replace('\\', "\\\\")
         .replace('(', "\\(")
-        .replace(')', "\\)");
+        .replace(')', "\\)")
+        .replace('\u{2014}', "\\320");
     format!("BT /{font} {size} Tf 1 0 0 1 {x} {y} Tm ({escaped}) Tj ET\n")
 }
 
@@ -261,5 +263,96 @@ fn a_wrapped_last_row_stays_in_its_cell() {
             .find(|line| line.contains("After the table the document continues"))
             .unwrap_or_else(|| panic!("paragraph after the table missing:\n{markdown}"));
         assert!(!after.starts_with('|'), "{markdown}");
+    }
+}
+
+/// The service table of upstream #315 at the reported geometry (9.5 pt
+/// type, baselines 720 / 703.5 / 692.25 / 675.75): the first body row wraps
+/// in four of its five cells at an 11.25 pt line pitch, rows are 16.5 pt
+/// apart. `ruled` draws the collapsed borders as stroked rules.
+fn service_table_page(ruled: bool) -> String {
+    let columns = [45.0, 235.0, 345.0, 385.0, 485.0];
+    let lines: [(f32, [&str; 5]); 4] = [
+        (
+            720.0,
+            [
+                "Service",
+                "Frequency / Duration",
+                "Delivery",
+                "Provider",
+                "Location",
+            ],
+        ),
+        (
+            703.5,
+            [
+                "Specialized Academic Instruction \u{2014}",
+                "45 min/session, 3x per",
+                "pull-",
+                "Special Education",
+                "Learning Lab",
+            ],
+        ),
+        (692.25, ["Reading/Writing", "week", "out", "Teacher", ""]),
+        (
+            675.75,
+            [
+                "Academic Support Lab",
+                "As needed",
+                "direct",
+                "Content Mastery Staff",
+                "Content Mastery Center",
+            ],
+        ),
+    ];
+    let mut page = text("F2", 14.0, 45.0, 750.0, "Services");
+    if ruled {
+        for y in [727.0, 712.0, 684.0, 666.0] {
+            page += &hline(40.0, 590.0, y);
+        }
+        for x in [40.0, 230.0, 340.0, 380.0, 480.0, 590.0] {
+            page += &vline(x, 666.0, 727.0);
+        }
+    }
+    for (y, cells) in lines {
+        for (x, cell) in columns.iter().zip(cells) {
+            if !cell.is_empty() {
+                page += &text("F1", 9.5, *x, y, cell);
+            }
+        }
+    }
+    page += &text(
+        "F1",
+        9.5,
+        45.0,
+        640.0,
+        "Services begin on the first school day after the meeting and continue for one year.",
+    );
+    page
+}
+
+/// Upstream #315 (reported by kjellarsen): a table whose first body row
+/// wraps must keep its two body rows apart, with the wrapped lines in the
+/// first. Ruled, that already held; borderless, every baseline became its
+/// own row, so the wrapped lines read as a third body row (and the heading
+/// above was pulled into the table with them).
+#[test]
+fn wrapped_cells_stay_in_their_row_and_rows_stay_apart() {
+    for ruled in [true, false] {
+        let markdown = page_markdown(&make_pdf(&[service_table_page(ruled)])).remove(0);
+        assert_eq!(
+            table_rows(&markdown),
+            [
+                "|Service|Frequency / Duration|Delivery|Provider|Location|",
+                "|Specialized Academic Instruction \u{2014} Reading/Writing|45 min/session, 3x per week|pull- out|Special Education Teacher|Learning Lab|",
+                "|Academic Support Lab|As needed|direct|Content Mastery Staff|Content Mastery Center|",
+            ],
+            "ruled: {ruled}\n{markdown}"
+        );
+        let heading = markdown
+            .lines()
+            .find(|line| line.contains("Services") && !line.contains("begin"))
+            .unwrap_or_else(|| panic!("heading missing:\n{markdown}"));
+        assert!(!heading.starts_with('|'), "{markdown}");
     }
 }

@@ -308,6 +308,111 @@ pub(crate) fn find_row_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
     rows
 }
 
+/// Whether `below`, the next line of a table cell, reads as a continuation
+/// of `above`: it starts in lowercase, or `above` breaks off on a hyphen,
+/// dash, comma or slash, or on a lowercase word with no closing punctuation.
+pub(crate) fn continues_cell_text(above: &str, below: &str) -> bool {
+    let above = above.trim_end();
+    let below = below.trim_start();
+    if above.is_empty() || below.is_empty() {
+        return false;
+    }
+    if below.chars().next().is_some_and(char::is_lowercase) {
+        return true;
+    }
+    if above.ends_with(['-', '\u{2010}', '\u{2013}', '\u{2014}', ',', '/', '&']) {
+        return true;
+    }
+    above.split_whitespace().last().is_some_and(|word| {
+        word.chars().all(char::is_alphabetic) && word.chars().next().is_some_and(char::is_lowercase)
+    })
+}
+
+/// Which rows of a borderless table are only the next line of the row
+/// above, its cells wrapped (upstream #315). Row clustering gives each
+/// baseline its own row, so a wrapped row came out as two. A row is such a
+/// line when the table's baselines fall into two spacings, line pitch and a
+/// looser row pitch, and the row sits at line pitch under the row above,
+/// fills fewer cells than it, only cells the row above fills too, holds no
+/// bare numbers, and at least half of its cells continue the text above
+/// (`continues_cell_text`). `rows` are the rows' baselines, top to bottom.
+pub(crate) fn wrapped_line_rows(rows: &[f32], cells: &[Vec<String>]) -> Vec<bool> {
+    let mut wrapped = vec![false; rows.len()];
+    if rows.len() < 3 || cells.len() != rows.len() {
+        return wrapped;
+    }
+    let gaps: Vec<f32> = rows
+        .windows(2)
+        .map(|pair| (pair[0] - pair[1]).abs())
+        .collect();
+    let line_pitch = gaps.iter().copied().fold(f32::INFINITY, f32::min);
+    let row_pitch = gaps.iter().copied().fold(0.0_f32, f32::max);
+    if !line_pitch.is_finite() || line_pitch <= 0.0 || row_pitch < line_pitch * 1.3 {
+        return wrapped;
+    }
+    let filled = |cell: &String| !cell.trim().is_empty();
+    let numeric = |cell: &str| {
+        cell.chars().any(|ch| ch.is_ascii_digit())
+            && cell.chars().all(|ch| {
+                ch.is_ascii_digit()
+                    || ch.is_whitespace()
+                    || matches!(ch, '.' | ',' | '-' | '%' | '$')
+            })
+    };
+    for row in 1..rows.len() {
+        if gaps[row - 1] > line_pitch * 1.15 {
+            continue;
+        }
+        let (above, below) = (&cells[row - 1], &cells[row]);
+        let lines: Vec<usize> = (0..below.len())
+            .filter(|&col| filled(&below[col]))
+            .collect();
+        if lines.is_empty()
+            || lines.len() >= above.iter().filter(|cell| filled(cell)).count()
+            || lines.iter().any(|&col| !above.get(col).is_some_and(filled))
+            || lines.iter().all(|&col| numeric(below[col].trim()))
+        {
+            continue;
+        }
+        let continuing = lines
+            .iter()
+            .filter(|&&col| continues_cell_text(&above[col], &below[col]))
+            .count();
+        wrapped[row] = continuing * 2 >= lines.len();
+    }
+    wrapped
+}
+
+/// Folds each row flagged in `wrapped` into the row above it with `merge`.
+pub(crate) fn fold_wrapped_rows<T>(
+    rows: Vec<T>,
+    wrapped: &[bool],
+    mut merge: impl FnMut(&mut T, T),
+) -> Vec<T> {
+    let mut folded: Vec<T> = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        match folded.last_mut() {
+            Some(previous) if wrapped.get(index).copied().unwrap_or(false) => merge(previous, row),
+            _ => folded.push(row),
+        }
+    }
+    folded
+}
+
+/// Joins a wrapped line's cells onto the row above, cell by cell.
+pub(crate) fn join_wrapped_cells(above: &mut [String], below: Vec<String>) {
+    for (cell, line) in above.iter_mut().zip(below) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !cell.is_empty() {
+            cell.push(' ');
+        }
+        cell.push_str(line);
+    }
+}
+
 /// Find which column index an X position belongs to
 pub(crate) fn find_column_index(columns: &[f32], x: f32) -> Option<usize> {
     // Calculate adaptive threshold based on column spacing
@@ -615,6 +720,73 @@ mod tests {
         let cols = find_column_boundaries(&items, TableDetectionMode::SmallFont);
         // Only the cluster at x=100 should survive
         assert!(cols.len() <= 1);
+    }
+
+    // --- wrapped_line_rows ---
+
+    fn row(cells: &[&str]) -> Vec<String> {
+        cells.iter().map(|cell| cell.to_string()).collect()
+    }
+
+    #[test]
+    fn wrapped_line_folds_into_its_row() {
+        // Upstream #315: 16.5 pt rows, an 11.25 pt wrapped line.
+        let rows = [720.0, 703.5, 692.25, 675.75];
+        let cells = vec![
+            row(&["Service", "Frequency", "Delivery", "Provider", "Location"]),
+            row(&[
+                "Instruction \u{2014}",
+                "3x per",
+                "pull-",
+                "Special Education",
+                "Lab",
+            ]),
+            row(&["Reading/Writing", "week", "out", "Teacher", ""]),
+            row(&["Support Lab", "As needed", "direct", "Staff", "Center"]),
+        ];
+        let wrapped = wrapped_line_rows(&rows, &cells);
+        assert_eq!(wrapped, [false, false, true, false]);
+        let folded = fold_wrapped_rows(cells, &wrapped, |a, b| join_wrapped_cells(a, b));
+        assert_eq!(folded.len(), 3);
+        assert_eq!(
+            folded[1],
+            row(&[
+                "Instruction \u{2014} Reading/Writing",
+                "3x per week",
+                "pull- out",
+                "Special Education Teacher",
+                "Lab"
+            ])
+        );
+    }
+
+    #[test]
+    fn rows_at_one_pitch_or_without_continuing_text_stay() {
+        // Uniform pitch: lowercase cells alone fold nothing.
+        let rows = [700.0, 688.0, 676.0];
+        let cells = vec![
+            row(&["term", "meaning"]),
+            row(&["apple", "a fruit"]),
+            row(&["beet", ""]),
+        ];
+        assert_eq!(wrapped_line_rows(&rows, &cells), [false; 3]);
+        // Grouped rows: a new label under a full row, at line pitch, is a row.
+        let rows = [700.0, 688.0, 664.0, 652.0];
+        let cells = vec![
+            row(&["Revenue", "100", "120"]),
+            row(&["Cost of sales", "60", "70"]),
+            row(&["Operating expenses", "", ""]),
+            row(&["Salaries", "20", "22"]),
+        ];
+        assert_eq!(wrapped_line_rows(&rows, &cells), [false; 4]);
+        // Bare numbers under a row are data.
+        let rows = [700.0, 688.0, 664.0];
+        let cells = vec![
+            row(&["Total", "100", "120"]),
+            row(&["", "10", ""]),
+            row(&["Net", "90", "100"]),
+        ];
+        assert_eq!(wrapped_line_rows(&rows, &cells), [false; 3]);
     }
 
     // --- find_row_boundaries ---
