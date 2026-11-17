@@ -2792,6 +2792,76 @@ mod tests {
         it
     }
 
+    /// Lines of a Russian lease clause list: the intro, `а)`–`г)` items
+    /// (each label in its own run when `split_label`), and a closing line.
+    fn russian_clause_page(split_label: bool) -> Vec<TextItem> {
+        let line = |text: &str, x: f32, y: f32, width: f32| {
+            let mut item = make_item_w(x, y, width, 1);
+            item.text = text.into();
+            item.font = "Arial".into();
+            item.font_size = 11.0;
+            item.height = 11.0;
+            item
+        };
+        let clauses = [
+            (
+                "а)",
+                "вносить арендную плату своевременно и в полном объеме;",
+            ),
+            ("б)", "содержать помещение в надлежащем состоянии;"),
+            ("в)", "не сдавать помещение в субаренду без согласия;"),
+            ("г)", "вернуть помещение по истечении срока договора."),
+        ];
+        let mut items = vec![line(
+            "2.1. Арендатор принимает на себя следующие обязанности:",
+            72.0,
+            700.0,
+            320.0,
+        )];
+        for (index, (label, body)) in clauses.iter().enumerate() {
+            let y = 680.0 - 16.0 * index as f32;
+            if split_label {
+                items.push(line(label, 72.0, y, 10.0));
+                items.push(line(body, 90.0, y, 330.0));
+            } else {
+                items.push(line(&format!("{label} {body}"), 72.0, y, 350.0));
+            }
+        }
+        items.push(line(
+            "2.2. Арендодатель обязуется передать помещение по акту.",
+            72.0,
+            600.0,
+            330.0,
+        ));
+        items
+    }
+
+    #[test]
+    fn russian_clause_labels_become_list_items() {
+        for split_label in [false, true] {
+            let markdown = to_markdown_from_items(
+                russian_clause_page(split_label),
+                MarkdownOptions::default(),
+            );
+            for expected in [
+                "- а) вносить арендную плату своевременно и в полном объеме;",
+                "- б) содержать помещение в надлежащем состоянии;",
+                "- в) не сдавать помещение в субаренду без согласия;",
+                "- г) вернуть помещение по истечении срока договора.",
+            ] {
+                assert!(
+                    markdown.lines().any(|line| line == expected),
+                    "split_label={split_label}: {expected}\n{markdown}"
+                );
+            }
+            // The next clause is its own paragraph, not the last item's tail.
+            assert!(
+                markdown.contains("\n\n2.2. Арендодатель обязуется"),
+                "split_label={split_label}\n{markdown}"
+            );
+        }
+    }
+
     #[test]
     fn exact_overlays_with_distinct_mcids_are_not_collapsed() {
         let mut first = make_item(100.0, 700.0, 1);

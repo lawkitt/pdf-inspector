@@ -112,10 +112,16 @@ pub(crate) fn is_list_item(text: &str) -> bool {
         }
     }
 
-    // Letter list: "a.", "a)", "(a)"
+    // Letter list: "a.", "a)", "(a)", and a lowercase letter of any script
+    // before ")": Russian clauses run "а)", "б)", … "я)". A non-Latin letter
+    // before "." is left to the label rules below, since "т." and "г." are
+    // abbreviations.
     let mut chars = trimmed.chars();
     if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
         if first.is_ascii_alphabetic() && (second == '.' || second == ')') {
+            return true;
+        }
+        if first.is_lowercase() && second == ')' {
             return true;
         }
         if first == '(' && chars.next() == Some(')') {
@@ -515,6 +521,39 @@ mod tests {
                 !starts_markdown_list_item(&format_list_item(text, false)),
                 "{text}"
             );
+        }
+    }
+
+    /// Every lowercase Russian letter, ё included, as a clause label.
+    const RUSSIAN_LOWERCASE: &str = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя";
+
+    #[test]
+    fn russian_clause_labels_are_list_items_like_latin_ones() {
+        assert_eq!(RUSSIAN_LOWERCASE.chars().count(), 33);
+        for (latin, cyrillic) in ('a'..='z').cycle().zip(RUSSIAN_LOWERCASE.chars()) {
+            for (letter, body) in [
+                (latin, "the tenant shall pay the rent;"),
+                (cyrillic, "арендатор обязуется вносить арендную плату;"),
+            ] {
+                let spaced = format!("{letter}) {body}");
+                let run_in = format!("{letter}){body}");
+                let bare = format!("{letter})");
+                assert!(is_list_item(&spaced), "{spaced}");
+                assert!(is_list_item(&run_in), "{run_in}");
+                assert!(is_list_item(&bare), "{bare}");
+                assert_eq!(format_list_item_t(&spaced), format!("- {letter}) {body}"));
+                assert_eq!(format_list_item_t(&run_in), format!("- {letter}) {body}"));
+                let parenthesized = format!("({letter}) {body}");
+                assert!(is_list_item(&parenthesized), "{parenthesized}");
+                assert_eq!(
+                    format_list_item_t(&parenthesized),
+                    format!("- {parenthesized}")
+                );
+            }
+        }
+        // Abbreviations stay prose: "т. е.", "г. Москва".
+        for text in ["т. е. арендатор", "г. Москва, ул. Тверская"] {
+            assert!(!is_list_item(text), "{text}");
         }
     }
 

@@ -27,6 +27,10 @@ version and date. Earlier releases are described in their
   `PageFormFieldNames`). A checked box or selected radio button reads as
   `☑` instead of its on-state name (`Yes`), which the page does not show
   either; an unchecked one still adds nothing.
+- A lowercase letter of any script before `)` counts as a list label in
+  every list check, as a Latin one does: a Russian clause label alone on
+  its line (`б)`) no longer falls back to prose. All 33 lowercase Russian
+  letters are covered; `т.` and `г.` before a dot stay abbreviations.
 
 ### Changed
 
