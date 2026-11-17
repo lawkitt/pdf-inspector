@@ -648,6 +648,11 @@ struct PageAnalysis {
     form_bytes_exceeded: bool,
     /// The pictures the page shows (see `PageImages`).
     pictures: u32,
+    /// Whether the content the page executes paints anything: a text-showing
+    /// operator, an image draw that lands, a path or shading in its own
+    /// streams, or a form it runs. Images and forms the resources bind but
+    /// the content never draws paint nothing.
+    paints_page: bool,
     /// Total image area in pixels (reserved for future use)
     #[allow(dead_code)]
     total_image_area: u64,
@@ -892,6 +897,14 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let (executed, page_counts) =
         content_scan::scan_page_content(doc, page_id, &mut all_unique_chars, &mut page_font_names);
     counts.add(page_counts);
+    // A form the page runs counts as painting whatever it holds, so a page
+    // whose only content is a form still goes to OCR when it extracts empty.
+    let paints_page = executed.text_ops > 0
+        || executed.draws_image
+        || page_counts.path_ops > 0
+        || page_counts.shading_ops > 0
+        || executed.form_bytes > 0
+        || executed.form_bytes_exceeded;
 
     // Resolve font names against the page's resource dictionaries,
     // respecting PDF resource inheritance shadowing: the most-specific
@@ -1034,6 +1047,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         executed_form_bytes,
         form_bytes_exceeded,
         pictures: executed.pictures,
+        paints_page,
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
@@ -2288,9 +2302,7 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> PageOcrSign
         has_vector_text: analysis.has_vector_text,
         has_invisible_text_layer: analysis.has_invisible_text_layer,
         pictures: analysis.pictures,
-        has_painted_content: analysis.has_images
-            || analysis.path_op_count > 0
-            || analysis.text_operator_count > 0,
+        has_painted_content: analysis.paints_page,
     }
 }
 
@@ -2308,8 +2320,10 @@ pub(crate) struct PageOcrSignals {
     pub(crate) has_invisible_text_layer: bool,
     /// The pictures the page shows (see `PageImages`).
     pub(crate) pictures: u32,
-    /// The page paints something: an image, a path or a text-showing
-    /// operator. A page painting nothing has nothing for OCR to read.
+    /// The content the page executes paints something: an image, a path, a
+    /// shading, a text-showing operator or a form (see
+    /// `PageAnalysis::paints_page`). A page painting nothing has nothing for
+    /// OCR to read.
     pub(crate) has_painted_content: bool,
 }
 

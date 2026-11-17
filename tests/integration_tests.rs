@@ -12491,3 +12491,71 @@ fn mixed_empty_markdown_needs_ocr() {
     assert!(result.pages[0].needs_ocr);
     assert_eq!(result.pages_needing_ocr, vec![1]);
 }
+
+/// A one-page PDF with the given page `/Resources` and content stream.
+fn make_page_with_resources_pdf(resources: &str, content: &str) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources {resources} /Contents 4 0 R >>"
+        ),
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ),
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray \
+         /BitsPerComponent 8 /Length 1 >>\nstream\nx\nendstream"
+            .to_string(),
+    ];
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// The blank-page signal of #339 comes from what the page's content
+/// paints, not from what its resources bind: a page painting only a
+/// shading still goes to OCR, and a page binding an image it never draws
+/// is still blank.
+#[test]
+fn blank_page_signal_follows_executed_painting() {
+    let shading = "<< /Shading << /Sh1 << /ShadingType 2 /ColorSpace /DeviceRGB \
+                   /Coords [0 0 612 0] /Function << /FunctionType 2 /Domain [0 1] \
+                   /C0 [1 1 1] /C1 [0 0 0] /N 1 >> >> >> >>";
+    let shaded = make_page_with_resources_pdf(shading, "/Sh1 sh");
+    let result = extract_pages_markdown_mem(&shaded, None).unwrap();
+    assert!(result.pages[0].needs_ocr, "a shaded page paints something");
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+
+    let unused_image = make_page_with_resources_pdf("<< /XObject << /Im0 5 0 R >> >>", "");
+    let result = extract_pages_markdown_mem(&unused_image, None).unwrap();
+    assert!(
+        !result.pages[0].needs_ocr,
+        "an image never drawn paints nothing"
+    );
+    assert!(result.pages_needing_ocr.is_empty());
+
+    let drawn_image = make_page_with_resources_pdf(
+        "<< /XObject << /Im0 5 0 R >> >>",
+        "q 100 0 0 100 100 100 cm /Im0 Do Q",
+    );
+    let result = extract_pages_markdown_mem(&drawn_image, None).unwrap();
+    assert!(result.pages[0].needs_ocr);
+}
