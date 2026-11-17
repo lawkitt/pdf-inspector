@@ -438,6 +438,18 @@ fn clean_cells(cells: &[Vec<String>], layout_rows: &[bool]) -> (Vec<Vec<String>>
             && filled_cells == 1
             && header_filled >= 3
             && looks_like_plain_section_label(first_cell);
+        // A table on a page after a page break can open with the rest of a
+        // row split by the break (upstream #588): its first cell is empty
+        // like this row's, and each of this row's cells continues the text
+        // above it, so this row is that fragment's next line, not a first
+        // data row under a header.
+        let continues_split_row = cleaned.len() == 1
+            && cleaned[0].first().is_some_and(|cell| cell.is_empty())
+            && row
+                .iter()
+                .zip(&cleaned[0])
+                .filter(|(below, _)| !below.trim().is_empty())
+                .all(|(below, above)| super::grid::continues_cell_text(above, below.trim()));
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
@@ -445,7 +457,7 @@ fn clean_cells(cells: &[Vec<String>], layout_rows: &[bool]) -> (Vec<Vec<String>>
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
             && !looks_like_hierarchical_subrow
-            && cleaned.len() > 1;
+            && (cleaned.len() > 1 || continues_split_row);
 
         // Wrapped-cell continuation: row has fewer filled cells than the header
         // row, suggesting it's overflow text from the previous row's cells.
@@ -966,6 +978,53 @@ mod tests {
         let (cleaned, _) = clean_table_cells(&cells);
         // Should not merge into first row (header)
         assert_eq!(cleaned.len(), 2);
+    }
+
+    #[test]
+    fn split_row_fragment_heading_a_table_keeps_its_next_line() {
+        // The rest of a row split by a page break opens the next page's
+        // table; its next line, a row of its own here, joins it.
+        let cells = vec![
+            vec![
+                "".into(),
+                "cannot be repaired, and refunds the price".into(),
+                "after the report".into(),
+            ],
+            vec![
+                "".into(),
+                "of any goods it cannot replace.".into(),
+                "".into(),
+            ],
+            vec![
+                "4.20".into(),
+                "The buyer pays in full.".into(),
+                "14 days".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        assert_eq!(
+            cleaned,
+            vec![
+                vec![
+                    "".to_string(),
+                    "cannot be repaired, and refunds the price of any goods it cannot replace."
+                        .to_string(),
+                    "after the report".to_string(),
+                ],
+                vec![
+                    "4.20".to_string(),
+                    "The buyer pays in full.".to_string(),
+                    "14 days".to_string(),
+                ],
+            ]
+        );
+        // A header with an empty corner keeps a second row that does not
+        // continue its text.
+        let cells = vec![
+            vec!["".into(), "Revenue".into(), "Profit".into()],
+            vec!["".into(), "Group".into(), "Company".into()],
+        ];
+        assert_eq!(clean_table_cells(&cells).0.len(), 2);
     }
 
     #[test]
