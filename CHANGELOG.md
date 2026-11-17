@@ -160,6 +160,13 @@ version and date. Earlier releases are described in their
   no text items. A page that paints something but extracts empty still
   goes to OCR. ([#339](https://github.com/firecrawl/pdf-inspector/pull/339),
   ported)
+- Per-page Markdown extraction keeps a page carrying one unmappable glyph:
+  a single U+FFFD (a `≤` or ballot box from a symbol font without a
+  ToUnicode CMap) blanked the whole page and routed it to OCR as
+  `suspected_garbled_text`. The Markdown check now weighs replacement
+  characters by the density policy the text-quality analysis already
+  applies; a dense or long run of them still routes the page to OCR.
+  ([#206](https://github.com/firecrawl/pdf-inspector/pull/206), ported)
 
 ## [1.26.1] - 2026-11-15
 
