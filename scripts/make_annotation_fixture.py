@@ -4,8 +4,9 @@
 A synthetic two-page document whose annotations exercise the text-bearing
 annotations pdf-inspector reports beside the Markdown (``annotations`` on the
 per-page and OCR results): a sticky note with its popup, a FreeText box, a
-highlight with a comment and a reply in Russian, a review state that resolves
-the note, markup with rich text only, a highlight without a comment, and
+highlight with a comment and a reply in Russian, review states (written as
+text strings, as the specification has them, and once as names) that resolve
+the note directly and the highlight through a chain, markup with rich text only, a highlight without a comment, and
 entries that must be skipped (a malformed rectangle, an entry that is not a
 dictionary).
 
@@ -22,20 +23,23 @@ Page 1 /Annots, in order:
     A3  Highlight  "thirty days", Alice, /CreationDate only, a comment, popup P3
     P3  Popup      of A3 (not reported)
     A4  Text       reply to A3: author "Борис", "Да, рабочих дней."
-    A5  Text       Review state Completed in reply to A1 (resolves A1; not reported)
+    A5  Text       Review state (Completed) in reply to A1 (resolves A1; not reported)
     A6  Highlight  "highlight", no /Contents (not reported)
     A7  Underline  "Payment is due", author "Ирина", /RC only (with Cyrillic)
     A8  Highlight  /Rect is a string (malformed: skipped)
     A9  StrikeOut  "shall", "Delete"
     A10 Squiggly   "invoice", "Wrong word?"
+    A11 Text       Review state (Rejected) in reply to A3 (not reported)
+    A12 Text       Review state /Completed (names) in reply to A11, dated later:
+                   resolves A3 through the chain (not reported)
     --  42         an indirect integer, not a dictionary (skipped)
 
 Page 2 /Annots:
 
     B1  Text       Bob, "Second page note"
-    B2  Text       Review state Accepted in reply to B1
-    B3  Text       Review state Rejected in reply to B1, dated later (B1 stays
-                   unresolved: the latest review state wins)
+    B2  Text       Review state (Accepted) in reply to B1
+    B3  Text       Review state (Rejected) in reply to B2, dated later (B1 stays
+                   unresolved: the latest state up the chain wins)
 
 Only the standard library is needed (the PDF writer is shared with
 ``make_font_metadata_fixtures.py``):
@@ -200,7 +204,7 @@ def build_pdf() -> bytes:
     )
     a5 = add(
         f"/Subtype /Text /Rect [40 694 58 712] /P {page1} 0 R /IRT {a1} 0 R /F 30"
-        " /State /Completed /StateModel /Review /T (Alice)"
+        " /State (Completed) /StateModel (Review) /T (Alice)"
         " /M (D:20261118110000+07'00') /Contents (Completed set by Alice)"
     )
     a6 = add(
@@ -226,8 +230,18 @@ def build_pdf() -> bytes:
         f" /QuadPoints {quad_points(invoice)} /C [0 1 0] /T (Bob)"
         " /M (D:20261118095500+07'00') /Contents (Wrong word?)"
     )
+    a11 = add(
+        f"/Subtype /Text /Rect [540 680 558 698] /P {page1} 0 R /IRT {a3} 0 R /F 30"
+        " /State (Rejected) /StateModel (Review) /T (Bob)"
+        " /M (D:20261118103000+07'00') /Contents (Rejected set by Bob)"
+    )
+    a12 = add(
+        f"/Subtype /Text /Rect [540 680 558 698] /P {page1} 0 R /IRT {a11} 0 R /F 30"
+        " /State /Completed /StateModel /Review /T (Bob)"
+        " /M (D:20261118104500+07'00') /Contents (Completed set by Bob)"
+    )
     not_a_dictionary = writer.add(b"42")
-    page1_annots = [a1, p1, a2, a3, p3, a4, a5, a6, a7, a8, a9, a10, not_a_dictionary]
+    page1_annots = [a1, p1, a2, a3, p3, a4, a5, a6, a7, a8, a9, a10, a11, a12, not_a_dictionary]
 
     b1 = add(
         f"/Subtype /Text /Rect [40 694 58 712] /P {page2} 0 R /T (Bob)"
@@ -235,12 +249,12 @@ def build_pdf() -> bytes:
     )
     b2 = add(
         f"/Subtype /Text /Rect [40 694 58 712] /P {page2} 0 R /IRT {b1} 0 R /F 30"
-        " /State /Accepted /StateModel /Review /T (Alice)"
+        " /State (Accepted) /StateModel (Review) /T (Alice)"
         " /M (D:20261118131000+07'00') /Contents (Accepted set by Alice)"
     )
     b3 = add(
-        f"/Subtype /Text /Rect [40 694 58 712] /P {page2} 0 R /IRT {b1} 0 R /F 30"
-        " /State /Rejected /StateModel /Review /T (Alice)"
+        f"/Subtype /Text /Rect [40 694 58 712] /P {page2} 0 R /IRT {b2} 0 R /F 30"
+        " /State (Rejected) /StateModel (Review) /T (Alice)"
         " /M (D:20261118132000+07'00') /Contents (Rejected set by Alice)"
     )
     page2_annots = [b1, b2, b3]

@@ -69,7 +69,8 @@ fn check_fixture_annotations(annotations: &[PdfAnnotation]) {
         unreachable!()
     };
 
-    // The note: /M wins over /CreationDate; a Completed review state resolves it.
+    // The note: /M wins over /CreationDate; a Completed review state
+    // (written as text strings) resolves it.
     assert_eq!(note.author.as_deref(), Some("Alice"));
     assert_eq!(note.date.as_deref(), Some("D:20261118093000+07'00'"));
     assert!(note.resolved);
@@ -95,7 +96,8 @@ fn check_fixture_annotations(annotations: &[PdfAnnotation]) {
     assert!((highlight.rect.y - (697.0 - CROP)).abs() < 0.01);
     assert!((highlight.rect.height - 13.0).abs() < 0.01);
     assert_eq!(highlight.marked_text.as_deref(), Some("thirty days"));
-    assert!(!highlight.resolved);
+    // Rejected, then Completed in reply to the Rejected state.
+    assert!(highlight.resolved);
 
     // The reply, in Russian, points at the highlight.
     assert_eq!(reply.author.as_deref(), Some("Борис"));
@@ -109,7 +111,8 @@ fn check_fixture_annotations(annotations: &[PdfAnnotation]) {
     assert_eq!(strike.marked_text.as_deref(), Some("shall"));
     assert_eq!(squiggly.marked_text.as_deref(), Some("invoice"));
 
-    // Page 2 has no CropBox; its latest review state is Rejected.
+    // Page 2 has no CropBox; its note was Accepted, then Rejected in reply
+    // to the Accepted state.
     assert_rect_near(second.rect, rect(40.0, 694.0, 18.0, 18.0));
     assert!(!second.resolved);
     assert_eq!(second.author.as_deref(), Some("Bob"));

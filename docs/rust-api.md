@@ -540,7 +540,7 @@ sticky notes (`/Text`), FreeText boxes and text markup (`/Highlight`,
 | `rect` | `/Rect` as an `AnnotationRect` (`x`, `y`, `width`, `height`) |
 | `quads` | markup only: the box around each `/QuadPoints` quad, in order |
 | `in_reply_to` | index in the same list of the annotation this one replies to (`/IRT`, unless `/RT /Group`); `None` when not a reply or the parent is not listed |
-| `resolved` | the latest review state recorded for it (a reply with `/State` under `/StateModel /Review`, latest by date, else by order) is `Accepted` or `Completed` |
+| `resolved` | the latest review state recorded for it is `Accepted` or `Completed`: a reply with `/State` under the `Review` model (text strings or names), to the annotation or to an earlier state of it, latest by date, else by order |
 | `marked_text` | markup only: the page text under the quads, as whole words whose estimated middle lies within a quad; `None` when nothing is under them and on pages whose text needs OCR |
 
 Geometry uses the [coordinate frame](#coordinate-frame) of positioned items:

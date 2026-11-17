@@ -318,9 +318,11 @@ pub struct PdfAnnotation {
     /// cycle is `None`.
     pub in_reply_to: Option<usize>,
     /// Whether the PDF records the annotation as resolved: its latest
-    /// review state (a reply with `/State` under `/StateModel /Review`,
-    /// latest by date, else by order) is `Accepted` or `Completed`. `false`
-    /// when there is none.
+    /// review state is `Accepted` or `Completed`. A review state is a reply
+    /// with `/State` under the `Review` state model (text strings, as the
+    /// specification writes them, or names), to the annotation or to an
+    /// earlier state of it; the latest is chosen by date, else by order.
+    /// `false` when there is none.
     pub resolved: bool,
     /// For text markup, the page text under the quads, read from the
     /// extracted text runs: whole words whose estimated middle lies within

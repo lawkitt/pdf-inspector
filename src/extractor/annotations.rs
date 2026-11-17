@@ -44,6 +44,10 @@ pub const MAX_ANNOTATION_QUADS: usize = 1_000;
 /// extraction; markup past the budget reports no marked text.
 pub(crate) const MAX_MARKED_TEXT_CHECKS: usize = 5_000_000;
 
+/// Longest chain of review states followed back to the annotation they
+/// apply to.
+const MAX_STATE_CHAIN: usize = 64;
+
 /// Most bytes of rich text (`/RC`) read for one annotation: a string is
 /// cut there, a stream inflating past it is not read.
 pub(crate) const MAX_RICH_TEXT_BYTES: usize = 1024 * 1024;
@@ -64,6 +68,7 @@ struct Found {
 
 /// A review state an annotation records for its parent.
 struct ReviewState {
+    object: Option<ObjectId>,
     parent: ObjectId,
     resolved: bool,
     date: Option<i64>,
@@ -143,18 +148,19 @@ impl Collector {
         // A Text annotation with a `/State` in reply to another records that
         // annotation's state; it is not a comment of its own.
         if kind == AnnotationKind::Text {
-            if let (Some(parent), Some(state)) = (parent, name(doc, dict, b"State")) {
-                let model = name(doc, dict, b"StateModel");
-                let is_review = match model {
-                    Some(model) => model == b"Review",
+            if let (Some(parent), Some(state)) = (parent, name_or_text(doc, dict, b"State")) {
+                let model = name_or_text(doc, dict, b"StateModel");
+                let is_review = match model.as_deref() {
+                    Some(model) => model == "Review",
                     // Without a model, the state's value implies it (PDF
                     // 32000-1, table 172).
-                    None => !matches!(state, b"Marked" | b"Unmarked"),
+                    None => !matches!(state.as_str(), "Marked" | "Unmarked"),
                 };
                 if is_review {
                     self.states.push(ReviewState {
+                        object,
                         parent,
-                        resolved: matches!(state, b"Accepted" | b"Completed"),
+                        resolved: matches!(state.as_str(), "Accepted" | "Completed"),
                         date: date_of(doc, dict).as_deref().and_then(pdf_date_key),
                         order: self.states.len(),
                     });
@@ -213,13 +219,33 @@ impl Collector {
             ..
         } = self;
 
-        // The latest review state per parent decides whether it is resolved.
+        // A later state change may reply to the previous state rather than
+        // to the annotation (PDF 32000-1, 12.5.6.3), so each state applies
+        // to the first annotation up its chain that is not a state; the
+        // latest state per annotation decides whether it is resolved.
+        let state_parent: HashMap<ObjectId, ObjectId> = states
+            .iter()
+            .filter_map(|state| Some((state.object?, state.parent)))
+            .collect();
+        let annotation_of = |state: &ReviewState| {
+            let mut target = state.parent;
+            // A bounded walk: a cycle of states, or a crafted long chain,
+            // ends here.
+            for _ in 0..states.len().min(MAX_STATE_CHAIN) {
+                match state_parent.get(&target) {
+                    Some(&parent) => target = parent,
+                    None => break,
+                }
+            }
+            target
+        };
         let mut latest: HashMap<ObjectId, &ReviewState> = HashMap::new();
         for state in &states {
-            match latest.get(&state.parent) {
+            let target = annotation_of(state);
+            match latest.get(&target) {
                 Some(current) if !is_later(state, current) => {}
                 _ => {
-                    latest.insert(state.parent, state);
+                    latest.insert(target, state);
                 }
             }
         }
@@ -355,6 +381,18 @@ fn name<'a>(doc: &'a Document, dict: &'a Dictionary, key: &[u8]) -> Option<&'a [
     let object = dict.get(key).ok()?;
     let (_, object) = doc.dereference(object).ok()?;
     object.as_name().ok()
+}
+
+/// A value written as a name or, as the specification has it for `/State`
+/// and `/StateModel`, a text string.
+fn name_or_text(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<String> {
+    let object = dict.get(key).ok()?;
+    let (_, object) = doc.dereference(object).ok()?;
+    match object {
+        Object::Name(name) => Some(String::from_utf8_lossy(name).into_owned()),
+        Object::String(bytes, _) => Some(decode_pdf_text_string(bytes).trim().to_string()),
+        _ => None,
+    }
 }
 
 fn number(doc: &Document, object: &Object) -> Option<f32> {
@@ -977,6 +1015,52 @@ mod tests {
         let found = collect(&doc, page_id);
         let links: Vec<Option<usize>> = found.iter().map(|a| a.in_reply_to).collect();
         assert_eq!(links, vec![None, Some(2), None]);
+    }
+
+    #[test]
+    fn review_states_follow_their_chain_to_the_annotation() {
+        let (mut doc, page_id) = doc_with_annotations(Vec::new());
+        let ids: Vec<ObjectId> = (0..8).map(|_| doc.new_object_id()).collect();
+        let state = |parent: ObjectId, value: Object, date: &str| {
+            let mut annotation = note("state");
+            annotation.set("IRT", parent);
+            annotation.set("State", value);
+            annotation.set("StateModel", Object::string_literal("Review"));
+            annotation.set("M", Object::string_literal(date));
+            annotation
+        };
+        let objects = [
+            // 0: Accepted, then Rejected in reply to the Accepted state.
+            note("accepted then rejected"),
+            state(ids[0], Object::string_literal("Accepted"), "D:20260101"),
+            state(ids[1], Object::string_literal("Rejected"), "D:20260102"),
+            // 3: Rejected, then Completed (as a name) in reply to it.
+            note("rejected then completed"),
+            state(ids[3], Object::string_literal("Rejected"), "D:20260101"),
+            state(ids[4], Object::Name(b"Completed".to_vec()), "D:20260102"),
+            // Two states replying to each other: the walk ends.
+            state(ids[7], Object::string_literal("Completed"), "D:20260101"),
+            state(ids[6], Object::string_literal("Completed"), "D:20260102"),
+        ];
+        for (id, object) in ids.iter().zip(objects) {
+            doc.objects.insert(*id, Object::Dictionary(object));
+        }
+        let annots: Vec<Object> = ids.iter().map(|&id| id.into()).collect();
+        doc.get_dictionary_mut(page_id)
+            .unwrap()
+            .set("Annots", annots);
+        let found = collect(&doc, page_id);
+        let resolved: Vec<(&str, bool)> = found
+            .iter()
+            .map(|a| (a.text.as_str(), a.resolved))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                ("accepted then rejected", false),
+                ("rejected then completed", true)
+            ]
+        );
     }
 
     #[test]
