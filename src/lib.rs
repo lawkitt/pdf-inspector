@@ -626,16 +626,17 @@ pub struct PagesExtractionResult {
     /// The requested pages whose text leaves out invisible (render mode 3)
     /// text, with how many stretches, in request order.
     pub invisible_text_by_page: Vec<PageInvisibleText>,
-    /// The requested pages that left out repeated running header or footer
-    /// rows, with how many, in request order (with header/footer stripping
-    /// on). See [`PageRepeatedLines`].
-    pub repeated_lines_by_page: Vec<PageRepeatedLines>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
 
 pub(crate) struct InternalPagesExtraction {
     pub(crate) result: PagesExtractionResult,
+    /// The requested pages that left out repeated running header or footer
+    /// rows, with how many, in request order; empty unless the caller asked
+    /// for repeats to be stripped.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) repeated_lines_by_page: Vec<PageRepeatedLines>,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -997,14 +998,15 @@ fn extract_pages_markdown_mem_impl(
             images_by_page,
             form_field_names_by_page,
             invisible_text_by_page: invisible_text_pages,
-            repeated_lines_by_page: repeated_header_footer.repeated_lines_for(
-                &pages_slice
-                    .iter()
-                    .filter_map(|page| page.checked_add(1))
-                    .collect::<Vec<_>>(),
-            ),
             is_complex: complexity.is_complex,
         },
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        repeated_lines_by_page: repeated_header_footer.repeated_lines_for(
+            &pages_slice
+                .iter()
+                .filter_map(|page| page.checked_add(1))
+                .collect::<Vec<_>>(),
+        ),
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         page_count,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -1102,6 +1104,7 @@ pub(crate) struct RepeatedHeaderFooter {
     pub(crate) rows_by_page: BTreeMap<u32, u32>,
 }
 
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 impl RepeatedHeaderFooter {
     /// The requested pages' counts, in request order.
     pub(crate) fn repeated_lines_for(&self, pages: &[u32]) -> Vec<PageRepeatedLines> {

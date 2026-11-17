@@ -233,16 +233,106 @@ fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Normalize text for frequency comparison: collapse whitespace and strip leading/trailing
-/// digit sequences (page numbers). E.g., "Chapter 3 — Page 5" and "Chapter 3 — Page 6"
-/// both normalize to "Chapter 3 — Page".
-fn normalize_for_comparison(s: &str) -> String {
-    let ws = normalize_whitespace(s);
-    let trimmed = ws.trim_start_matches(|c: char| c.is_numeric()).trim_start();
-    let trimmed = trimmed
-        .trim_end_matches(|c: char| c.is_numeric())
-        .trim_end();
-    trimmed.to_string()
+/// Stands in for a page number in a comparison key.
+const FOLIO: char = '\u{E000}';
+
+/// A decimal digit's value, in the scripts page numbers are set in: ASCII,
+/// Arabic-Indic, Persian, Devanagari and the other Indic scripts, Thai, Lao,
+/// Tibetan, Myanmar, Khmer, Mongolian, and full-width forms.
+fn decimal_digit_value(c: char) -> Option<u32> {
+    if let Some(digit) = c.to_digit(10) {
+        return Some(digit);
+    }
+    const ZEROS: [u32; 19] = [
+        0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+        0x0D66, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x17E0, 0x1810, 0xFF10,
+    ];
+    let code = c as u32;
+    ZEROS
+        .iter()
+        .find(|&&zero| (zero..zero + 10).contains(&code))
+        .map(|&zero| code - zero)
+}
+
+/// The row's page-number slot: its whitespace-collapsed text with the
+/// standalone number of up to four digits that opens (`leading`) or closes
+/// it replaced by [`FOLIO`], and that number. A number joined to other
+/// characters ("EDU-401", "502A", "2-123/2026") is part of the text.
+fn folio_slot(collapsed: &str, leading: bool) -> Option<(String, u32)> {
+    let (rest, token) = if leading {
+        let (token, rest) = collapsed.split_once(' ')?;
+        (rest, token)
+    } else {
+        let (rest, token) = collapsed.rsplit_once(' ')?;
+        (rest, token)
+    };
+    if token.chars().count() > 4 {
+        return None;
+    }
+    let mut value = 0u32;
+    for c in token.chars() {
+        value = value * 10 + decimal_digit_value(c)?;
+    }
+    let template = if leading {
+        format!("{FOLIO} {rest}")
+    } else {
+        format!("{rest} {FOLIO}")
+    };
+    Some((template, value))
+}
+
+/// Comparison keys for repetition. Two rows repeat only when their text is
+/// the same, numbers included, runs of whitespace aside: "Case 2-123" and
+/// "Case 2-124" are different rows. The one tolerance is a page number: a
+/// standalone number opening or closing the row that rises with the page
+/// (`value - page` the same on every page that shows the row), so "Annual
+/// Report 5" on page 5 and "Annual Report 6" on page 6 share a key.
+struct ComparisonKeys {
+    folio_templates: HashSet<String>,
+}
+
+impl ComparisonKeys {
+    /// Learns the page-number templates from the edge rows that could be
+    /// furniture, as (text, page) pairs.
+    fn learn<'a>(rows: impl IntoIterator<Item = (&'a str, u32)>) -> Self {
+        let mut slots: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+        for (text, page) in rows {
+            let collapsed = normalize_whitespace(text);
+            for leading in [false, true] {
+                if let Some((template, value)) = folio_slot(&collapsed, leading) {
+                    slots.entry(template).or_default().push((page, value));
+                }
+            }
+        }
+        let folio_templates = slots
+            .into_iter()
+            .filter(|(_, occurrences)| {
+                let offset = |&(page, value): &(u32, u32)| i64::from(value) - i64::from(page);
+                let first = offset(&occurrences[0]);
+                let pages: HashSet<u32> = occurrences.iter().map(|&(page, _)| page).collect();
+                pages.len() >= 2 && occurrences.iter().all(|o| offset(o) == first)
+            })
+            .map(|(template, _)| template)
+            .collect();
+        Self { folio_templates }
+    }
+
+    fn key(&self, text: &str) -> String {
+        let collapsed = normalize_whitespace(text);
+        for leading in [false, true] {
+            if let Some((template, _)) = folio_slot(&collapsed, leading) {
+                if self.folio_templates.contains(&template) {
+                    return template;
+                }
+            }
+        }
+        collapsed
+    }
+}
+
+/// A key's text length without its page-number slot, for the length floor.
+fn key_text_chars(key: &str) -> usize {
+    key.replace(FOLIO, "").trim().chars().count()
 }
 
 /// A parenthesized annotation marker: a short (≤3 chars) token of digits or
@@ -283,10 +373,10 @@ fn is_decorative_separator(text: &str) -> bool {
     chars.all(|c| c == first)
 }
 
-/// A Y-band's members in document order plus the row's coalesced,
-/// comparison-normalized text. Single source for band coalescing: the
-/// frequency build and both band passes must key on identical text.
-fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String, String) {
+/// A Y-band's members in document order plus the row's coalesced text.
+/// Single source for band coalescing: the frequency build and both band
+/// passes must key on identical text.
+fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String) {
     let mut sorted = indices.to_vec();
     sorted.sort();
     let coalesced: String = sorted
@@ -294,14 +384,13 @@ fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String,
         .map(|&i| lines[i].text())
         .collect::<Vec<_>>()
         .join(" ");
-    let normalized = normalize_for_comparison(&coalesced);
-    (sorted, coalesced, normalized)
+    (sorted, coalesced)
 }
 
 /// Strip lines that repeat on many distinct pages (running headers/footers).
 ///
 /// A line is considered a repeated header/footer if:
-/// 1. Its normalized text appears on `>= max(3, page_count * 30%)` distinct pages
+/// 1. Its comparison key appears on `>= max(3, page_count * 30%)` distinct pages
 /// 2. It is at least 10 characters long
 /// 3. It doesn't look like a structural element (heading, list item)
 /// 4. It consistently appears in the top or bottom N distinct Y positions
@@ -315,8 +404,11 @@ fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String,
 /// band are also stripped. This handles split column headers where individual
 /// fragments may not independently meet the frequency threshold.
 ///
-/// Page numbers are stripped from line text before comparison, so headers like
-/// "Chapter 3 — Page 5" and "Chapter 3 — Page 6" are treated as the same text.
+/// Rows compare as exact text, numbers included (see [`ComparisonKeys`]):
+/// "Case No. 2-123" does not repeat "Case No. 2-124". A page number opening or
+/// closing the row that rises with the page is the one tolerance, so headers
+/// like "Chapter 3 — Page 5" and "Chapter 3 — Page 6" are the same row. The
+/// first page that shows a repeated row keeps it.
 fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
     if lines.is_empty() || page_count < 3 {
         return lines;
@@ -431,36 +523,23 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     }
     let band_key = |line: &TextLine| -> (u32, i32) { (line.page, (line.y * 10.0).round() as i32) };
 
-    // Build frequency maps using normalize_for_comparison.
-    // Individual line text -> distinct pages
-    let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
-    let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
+    // Edge rows that could be furniture: single lines, and the coalesced
+    // text of multi-member Y-bands. The latter catches split column headers
+    // where individual fragments don't meet the frequency threshold but the
+    // combined row does.
+    let mut edge_lines: Vec<(String, u32, f32)> = Vec::new();
     for line in &lines {
         if !is_y_at_edge(line.y, line.page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
         let text = line.text();
-        // Structural checks must see the original text: normalization strips
-        // leading digits, so "1. Introduction" would otherwise lose the
-        // numbered-heading protection along with its number.
+        // Structural checks see the original text, before any key is made.
         if is_structural_line(text.trim()) {
             continue;
         }
-        let normalized = normalize_for_comparison(&text);
-        if normalized.chars().count() < 10 || is_decorative_separator(&normalized) {
-            continue;
-        }
-        freq.entry(normalized.clone())
-            .or_default()
-            .insert(line.page);
-        y_positions.entry(normalized).or_default().push(line.y);
+        edge_lines.push((text, line.page, line.y));
     }
-
-    // Coalesced row text -> distinct pages (for multi-member Y-bands).
-    // This catches split column headers where individual fragments don't meet
-    // the frequency threshold but the combined row does.
-    let mut band_freq: HashMap<String, HashSet<u32>> = HashMap::new();
-    let mut band_y_positions: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut edge_bands: Vec<(String, u32, f32)> = Vec::new();
     for (&(page, _), indices) in &y_bands {
         if indices.len() < 2 {
             continue; // single-line bands are already in the individual map
@@ -469,19 +548,35 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if !is_y_at_edge(band_y, page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
-        let (_, coalesced, normalized) = coalesced_band(&lines, indices);
+        let (_, coalesced) = coalesced_band(&lines, indices);
         if is_structural_line(coalesced.trim()) {
             continue;
         }
-        if normalized.chars().count() < 10 || is_decorative_separator(&normalized) {
-            continue;
-        }
-        band_freq
-            .entry(normalized.clone())
-            .or_default()
-            .insert(page);
-        band_y_positions.entry(normalized).or_default().push(band_y);
+        edge_bands.push((coalesced, page, band_y));
     }
+    let keys = ComparisonKeys::learn(
+        edge_lines
+            .iter()
+            .chain(&edge_bands)
+            .map(|(text, page, _)| (text.as_str(), *page)),
+    );
+
+    // Frequency maps: comparison key -> distinct pages and Y positions.
+    let frequencies = |rows: &[(String, u32, f32)]| {
+        let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
+        let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
+        for (text, page, y) in rows {
+            let key = keys.key(text);
+            if key_text_chars(&key) < 10 || is_decorative_separator(&key) {
+                continue;
+            }
+            freq.entry(key.clone()).or_default().insert(*page);
+            y_positions.entry(key).or_default().push(*y);
+        }
+        (freq, y_positions)
+    };
+    let (freq, y_positions) = frequencies(&edge_lines);
+    let (band_freq, band_y_positions) = frequencies(&edge_bands);
 
     // Compute threshold
     let threshold = 3u32.max(page_count * 30 / 100);
@@ -548,16 +643,15 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         }
         let text = line.text();
         // Removal must apply the same original-text structural protection
-        // as candidate collection: a structural line can share a normalized
-        // key with a non-structural candidate once its leading number is
-        // normalized away. Protection extends to the line's whole Y-band —
+        // as candidate collection: a structural line can share a comparison
+        // key with a non-structural candidate. Protection extends to the line's whole Y-band —
         // one physical row — so a heading's row-mates are not half-removed.
         if protected_bands.contains(&band_key(line)) {
             continue;
         }
-        let normalized = normalize_for_comparison(&text);
-        if candidates.contains(&normalized) {
-            let first = first_page_individual.entry(normalized).or_insert(line.page);
+        let key = keys.key(&text);
+        if candidates.contains(&key) {
+            let first = first_page_individual.entry(key).or_insert(line.page);
             if line.page > *first {
                 removal_set.insert(idx);
             } else if line.page == *first {
@@ -577,9 +671,10 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if !is_y_at_edge(band_y, page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
-        let (_, _, normalized) = coalesced_band(&lines, indices);
-        if band_candidates.contains(&normalized) {
-            let first = first_page_band.entry(normalized).or_insert(page);
+        let (_, coalesced) = coalesced_band(&lines, indices);
+        let key = keys.key(&coalesced);
+        if band_candidates.contains(&key) {
+            let first = first_page_band.entry(key).or_insert(page);
             if page < *first {
                 *first = page;
             }
@@ -594,12 +689,13 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if !is_y_at_edge(band_y, page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
-        let (sorted_indices, coalesced, normalized) = coalesced_band(&lines, indices);
+        let (sorted_indices, coalesced) = coalesced_band(&lines, indices);
         if is_structural_line(coalesced.trim()) {
             continue;
         }
-        if band_candidates.contains(&normalized) {
-            let first = first_page_band.get(&normalized).copied().unwrap_or(0);
+        let key = keys.key(&coalesced);
+        if band_candidates.contains(&key) {
+            let first = first_page_band.get(&key).copied().unwrap_or(0);
             if page > first {
                 for &idx in &sorted_indices {
                     removal_set.insert(idx);
@@ -1602,5 +1698,118 @@ mod tests {
                 .any(|l| l.page == 6 && l.text().contains("page 6 row 0")),
             "the near-empty page body must stay"
         );
+    }
+
+    /// `pages` pages of 20 unique body lines, each topped by `header(page)`.
+    fn headed_pages(pages: u32, header: impl Fn(u32) -> String) -> Vec<TextLine> {
+        let mut lines = Vec::new();
+        for page in 1..=pages {
+            lines.push(make_line(&header(page), 10.0, page, 750.0, None));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("уникальный текст страницы {page}, строка {j}, body"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        lines
+    }
+
+    fn header_pages(result: &[TextLine], needle: &str) -> Vec<u32> {
+        result
+            .iter()
+            .filter(|l| l.text().contains(needle))
+            .map(|l| l.page)
+            .collect()
+    }
+
+    #[test]
+    fn exact_repeat_stays_on_its_first_page_only() {
+        let result = strip_repeated_lines(headed_pages(5, |_| "Дело № 2-123/2026".into()), 5);
+        assert_eq!(header_pages(&result, "Дело № 2-123/2026"), [1]);
+        assert_eq!(result.len(), 5 * 20 + 1, "body lines all stay");
+    }
+
+    #[test]
+    fn rows_that_differ_in_a_number_are_not_repeats() {
+        // Numbers count (upstream #653): a case number that changes, inside
+        // the row or at its end, makes a different row.
+        let result = strip_repeated_lines(headed_pages(5, |p| format!("Дело № 2-12{p}/2026")), 5);
+        assert_eq!(result.len(), 5 * 21);
+        let cases = [0, 4171, 4382, 4593, 4604];
+        let result = strip_repeated_lines(
+            headed_pages(4, |p| format!("Case file number {}", cases[p as usize])),
+            4,
+        );
+        assert_eq!(result.len(), 4 * 21, "a changing trailing number is kept");
+        let result = strip_repeated_lines(
+            headed_pages(4, |p| {
+                format!("{} Exhibit list of the claimant", cases[p as usize])
+            }),
+            4,
+        );
+        assert_eq!(result.len(), 4 * 21, "a changing leading number is kept");
+    }
+
+    #[test]
+    fn identifiers_joined_to_numbers_keep_their_digits() {
+        // Upstream #653's reproduction: a running header with its page
+        // number, over body codes that differ only in digits.
+        let mut lines = Vec::new();
+        for (page, code) in [(1u32, 401), (2, 502), (3, 603)] {
+            let rows = [
+                format!("Course workbook Page {page}"),
+                format!("Textbook catalogue code EDU-{code}"),
+                format!("{code}A identifies the worksheet"),
+            ];
+            for (row, text) in rows.iter().enumerate() {
+                lines.push(make_line(text, 10.0, page, 750.0 - row as f32 * 26.0, None));
+            }
+            for j in 0..12u32 {
+                lines.push(make_line(
+                    &format!("Unique paragraph for page {page} with extra worksheet item {j}."),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 25.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 3);
+        for code in ["EDU-401", "EDU-502", "EDU-603", "401A", "502A", "603A"] {
+            assert_eq!(header_pages(&result, code).len(), 1, "{code} must survive");
+        }
+        assert_eq!(header_pages(&result, "Course workbook"), [1]);
+    }
+
+    #[test]
+    fn a_page_number_that_rises_with_the_page_still_repeats() {
+        let result = strip_repeated_lines(
+            headed_pages(5, |p| format!("Annual Report of the Board Page {p}")),
+            5,
+        );
+        assert_eq!(header_pages(&result, "Annual Report of the Board"), [1]);
+        // Printed numbering may start after a cover: the offset holds.
+        let result = strip_repeated_lines(
+            headed_pages(5, |p| format!("{} Отчёт о работе за год", p + 2)),
+            5,
+        );
+        assert_eq!(header_pages(&result, "Отчёт о работе за год"), [1]);
+    }
+
+    #[test]
+    fn a_number_that_does_not_follow_the_page_is_no_page_number() {
+        // Same row shape, numbers out of step with the pages: different rows.
+        let numbers = [0, 7, 3, 9, 4];
+        let result = strip_repeated_lines(
+            headed_pages(4, |p| {
+                format!("Annual Report of the Board {}", numbers[p as usize])
+            }),
+            4,
+        );
+        assert_eq!(header_pages(&result, "Annual Report of the Board").len(), 4);
     }
 }

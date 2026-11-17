@@ -291,6 +291,11 @@ pub fn process_pdf_with_ocr_mem(
         options.ocr.mode != OcrMode::Off,
     )?;
     let mut native = extraction.result;
+    let native_repeated: BTreeMap<u32, u32> = extraction
+        .repeated_lines_by_page
+        .iter()
+        .map(|page| (page.page, page.lines))
+        .collect();
     let page_count = extraction.page_count;
     let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
     // The renderer reads the document as the loader repaired it, when it
@@ -485,11 +490,6 @@ pub fn process_pdf_with_ocr_mem(
     fused.render_time_ms = fused
         .render_time_ms
         .saturating_add(supplemental_preflight_ms);
-    let native_repeated: BTreeMap<u32, u32> = native
-        .repeated_lines_by_page
-        .iter()
-        .map(|page| (page.page, page.lines))
-        .collect();
     for page in &mut fused.pages {
         let native_lines = native_repeated.get(&page.page_number).copied().unwrap_or(0);
         page.provenance.repeated_lines = match page.provenance.source {

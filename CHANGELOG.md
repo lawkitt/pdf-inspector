@@ -37,9 +37,25 @@ version and date. Earlier releases are described in their
   kept between its parts counts once, across text objects and form
   XObjects; text of spaces only counts nothing. The text stays out of the
   Markdown as before.
+- The OCR pipeline reports the running header and footer rows each page's
+  Markdown left out as repeats (`OcrPdfResult::repeated_lines_by_page`, a
+  list of `PageRepeatedLines`, and `PageProvenance::repeated_lines`), with
+  header/footer stripping on, from native text and OCR alike.
 
 ### Changed
 
+- Repeated headers and footers: rows repeat only as exact text, numbers
+  included, so "Case No. 2-123" and "Case No. 2-124", or "EDU-401" and
+  "EDU-502", are different rows and both stay (upstream #653). A page
+  number opening or closing the row still lets it repeat when it rises with
+  the page ("Annual Report 5", "Annual Report 6"). The first page that shows
+  a repeated row keeps it, as before.
+- OCR: a scan's running header or footer stays on the first recognized page
+  that shows it and its exact repeats in the same place go, on three or
+  more recognized pages; before, each recognized page was converted on its
+  own and kept every repeat. A one- or two-page scan no longer loses an
+  edge line to the per-page typographic fallback for short native
+  documents, which read OCR box heights as font sizes.
 - A word hyphenated at a line wrap inside one paragraph is joined without
   the document having to use it elsewhere, when a lowercase letter meets a
   lowercase letter of the same script ("contrac-" + "tion", "дого-" +

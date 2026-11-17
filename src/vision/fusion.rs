@@ -2232,6 +2232,20 @@ mod tests {
             );
         }
         assert_eq!(repeated_lines(&fused), [0, 0, 0, 0]);
+
+        let fused = fuse_scans(
+            [(1, 4171), (2, 4382), (3, 4593)]
+                .into_iter()
+                .map(|(page, case)| {
+                    let header = format!("Case file number {case}");
+                    scanned_page(page, Some(&header), 9.0)
+                })
+                .collect(),
+            &strip_options(),
+        );
+        assert_eq!(pages_showing(&fused, "Case file number 4382"), [2]);
+        assert_eq!(pages_showing(&fused, "Case file number 4593"), [3]);
+        assert_eq!(repeated_lines(&fused), [0, 0, 0]);
     }
 
     #[test]
