@@ -9688,6 +9688,96 @@ fn test_cid_text_next_to_vector_art_is_extracted_not_routed_to_ocr() {
     assert_eq!(vector_text_reasons(&soup), vec![1]);
 }
 
+/// Twelve lines of `text` in Helvetica plus `dots` sub-point filled squares:
+/// a form page whose dotted fill-in rules are drawn as thousands of tiny
+/// rectangles. The probe of upstream #361 (issue #342).
+fn make_text_with_dotted_rules_pdf(text: &str, dots: usize) -> Vec<u8> {
+    let mut content = String::from("BT /F1 12 Tf ");
+    for line in 0..12 {
+        content.push_str(&format!("1 0 0 1 72 {} Tm ({text}) Tj ", 720 - line * 18));
+    }
+    content.push_str(
+        "ET
+",
+    );
+    for dot in 0..dots {
+        let (x, y) = (36 + (dot % 100) * 5, 450 - (dot / 100) * 5);
+        content.push_str(&format!(
+            "{x} {y} 0.25 0.25 re f
+"
+        ));
+    }
+    make_text_pdf(&content, "0 0 612 792")
+}
+
+/// Upstream #361 (issue #342): decodable native text next to dense dotted
+/// form rules is text, not vector-outlined glyphs. Before the port the page
+/// was routed to OCR with reason `vector_text` and its Markdown was empty.
+#[test]
+fn test_decodable_text_with_dotted_form_rules_is_not_vector_text() {
+    let pdf = make_text_with_dotted_rules_pdf("clean text", 3000);
+
+    let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+    let page = &pages.pages[0];
+    assert!(!page.needs_ocr, "{page:?}");
+    assert_eq!(page.ocr_reason, None);
+    assert_eq!(page.markdown.matches("clean text").count(), 12, "{page:?}");
+    assert!(pages.pages_needing_ocr.is_empty());
+
+    let processed = process_pdf_mem(&pdf).unwrap();
+    assert!(vector_text_reasons(&processed).is_empty());
+    assert!(processed.pages_needing_ocr.is_empty());
+    assert!(processed.markdown.unwrap().contains("clean text"));
+
+    // mdoc's native pass.
+    #[cfg(feature = "ocr")]
+    {
+        use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+        let native = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native");
+        assert!(native.pages_recommended_for_ocr.is_empty());
+        assert_eq!(native.markdown.matches("clean text").count(), 12);
+    }
+}
+
+/// The exemption of upstream #361 is held to the fork's vector-text ratio:
+/// a dozen live header lines next to forty thousand path operators of
+/// outlined body text are still a vector-text page, so the body goes to OCR
+/// instead of the page returning its header alone.
+#[test]
+fn test_live_header_over_outlined_text_is_still_vector_text() {
+    let mut content = String::from("BT /F1 12 Tf ");
+    for line in 0..12 {
+        content.push_str(&format!(
+            "1 0 0 1 72 {} Tm (Annual Report 2026) Tj ",
+            760 - line * 14
+        ));
+    }
+    content.push_str(
+        "ET
+",
+    );
+    for i in 0..8_000 {
+        let (x, y) = (50 + (i % 80) * 6, 100 + (i / 80) * 5);
+        content.push_str(&format!(
+            "{x} {y} m {} {} l {} {y} l h f
+",
+            x + 3,
+            y + 4,
+            x + 5
+        ));
+    }
+    let pdf = make_text_pdf(&content, "0 0 612 792");
+
+    let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_VECTOR_TEXT)
+    );
+    let processed = process_pdf_mem(&pdf).unwrap();
+    assert_eq!(vector_text_reasons(&processed), vec![1]);
+}
+
 const MAC_ROMAN_HELVETICA: &str =
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /MacRomanEncoding >>";
 

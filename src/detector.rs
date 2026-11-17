@@ -968,6 +968,13 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         .filter(|b| b.is_ascii_alphanumeric())
         .count() as u32;
 
+    // Check if the page has fonts that can decode text to Unicode.
+    // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars in raw
+    // bytes but are fully decodable — we need this to avoid false scan detection.
+    // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
+    let has_decodable_text_fonts =
+        text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
+
     // Vector-outlined text: massive path ops with minimal text ops.
     // Each outlined glyph needs ~10-30 path commands, so a page of
     // outlined text produces thousands of path ops.
@@ -984,12 +991,20 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // any of it came through such a font's ToUnicode CMap (see
     // `DecodedTextCounts::is_page_text`); decoding walks the content
     // streams again, so it is not done for the other pages.
+    //
+    // Text in decodable fonts with enough text operators is likewise real
+    // native text when its raw operands have little ASCII diversity: a form
+    // whose fill-in rules are dotted lines drawn as thousands of tiny shapes
+    // next to a few repeated labels (upstream #361). The exemption is held to
+    // the same path operators per decoded character as the CID check, so a
+    // dozen live header lines over outlined body text stay vector text.
     let mut has_vector_text = path_ops >= 1000
         && path_ops > text_ops.saturating_mul(200)
         && (unique_alphanum_chars as usize) < VECTOR_TEXT_MIN_ALPHANUMERICS;
     if has_vector_text {
         let decoded = decoded_text_counts(doc, page_id);
-        has_vector_text = !(decoded.through_cid_cmap && decoded.is_page_text(path_ops));
+        has_vector_text = !(decoded.through_cid_cmap && decoded.is_page_text(path_ops))
+            && !(has_decodable_text_fonts && text_ops >= 10 && decoded.outweighs_paths(path_ops));
     }
 
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.
@@ -1001,13 +1016,6 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // Check for Type3-only fonts — glyph bitmaps without Unicode mapping.
     // Uses the usage-based font set for accuracy.
     let has_only_type3_fonts = text_ops > 0 && used_fonts_are_only_type3(&used_font_ids, &font_map);
-
-    // Check if the page has fonts that can decode text to Unicode.
-    // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars in raw
-    // bytes but are fully decodable — we need this to avoid false scan detection.
-    // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
-    let has_decodable_text_fonts =
-        text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
 
     PageAnalysis {
         text_operator_count: text_ops,
@@ -1075,8 +1083,15 @@ impl DecodedTextCounts {
     /// character.
     fn is_page_text(self, path_ops: u32) -> bool {
         self.distinct_alphanumerics >= VECTOR_TEXT_MIN_ALPHANUMERICS
-            && (self.alphanumerics as u64) * u64::from(VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER)
-                >= u64::from(path_ops)
+            && self.outweighs_paths(path_ops)
+    }
+
+    /// Whether the page carries at most
+    /// [`VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER`] of its `path_ops` path
+    /// operators per decoded alphanumeric character.
+    fn outweighs_paths(self, path_ops: u32) -> bool {
+        (self.alphanumerics as u64) * u64::from(VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER)
+            >= u64::from(path_ops)
     }
 }
 
