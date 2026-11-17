@@ -301,7 +301,10 @@ impl ComparisonKeys {
             let collapsed = normalize_whitespace(text);
             for leading in [false, true] {
                 if let Some((template, value)) = folio_slot(&collapsed, leading) {
-                    slots.entry(template).or_default().push((page, value));
+                    slots
+                        .entry(without_whitespace(&template))
+                        .or_default()
+                        .push((page, value));
                 }
             }
         }
@@ -322,23 +325,24 @@ impl ComparisonKeys {
     /// whitespace-collapsed text's characters, its page-number slot aside.
     fn key(&self, text: &str) -> (String, usize) {
         let collapsed = normalize_whitespace(text);
-        let mut shown = collapsed.as_str();
-        let mut template = None;
+        // Templates are learned and matched without whitespace, the key's
+        // own form, so spellings that differ only in spacing share one
+        // page-number check.
         for leading in [false, true] {
-            if let Some((candidate, _)) = folio_slot(&collapsed, leading) {
-                if self.folio_templates.contains(&candidate) {
-                    template = Some(candidate);
-                    break;
+            if let Some((template, _)) = folio_slot(&collapsed, leading) {
+                let key = without_whitespace(&template);
+                if self.folio_templates.contains(&key) {
+                    let chars = template.replace(FOLIO, "").trim().chars().count();
+                    return (key, chars);
                 }
             }
         }
-        if let Some(template) = &template {
-            shown = template.as_str();
-        }
-        let chars = shown.replace(FOLIO, "").trim().chars().count();
-        let key = shown.chars().filter(|c| !c.is_whitespace()).collect();
-        (key, chars)
+        (without_whitespace(&collapsed), collapsed.chars().count())
     }
+}
+
+fn without_whitespace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// A parenthesized annotation marker: a short (≤3 chars) token of digits or
@@ -1832,5 +1836,20 @@ mod tests {
             4,
         );
         assert_eq!(header_pages(&result, "Acme Holdings"), [1]);
+    }
+
+    #[test]
+    fn spacing_variants_share_one_page_number_check() {
+        // Two spellings of a row, each numbered in step with the page on its
+        // own pages, but out of step together: different case numbers.
+        let headers = [
+            "",
+            "Case file number 4171",
+            "Case file number 4172",
+            "Case file num ber 4382",
+            "Case file num ber 4383",
+        ];
+        let result = strip_repeated_lines(headed_pages(4, |p| headers[p as usize].into()), 4);
+        assert_eq!(header_pages(&result, "Case file num").len(), 4);
     }
 }

@@ -72,7 +72,7 @@ pub use process_mode::ProcessMode;
 pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use text_quality::{
     analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
@@ -632,11 +632,11 @@ pub struct PagesExtractionResult {
 
 pub(crate) struct InternalPagesExtraction {
     pub(crate) result: PagesExtractionResult,
-    /// The requested pages that left out repeated running header or footer
-    /// rows, with how many, in request order; empty unless the caller asked
-    /// for repeats to be stripped.
+    /// The requested pages' running header or footer rows left out as
+    /// repeats (their text); empty unless the caller asked for repeats to be
+    /// stripped.
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
-    pub(crate) repeated_lines_by_page: Vec<PageRepeatedLines>,
+    pub(crate) repeated_rows_by_page: BTreeMap<u32, Vec<String>>,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -1000,7 +1000,7 @@ fn extract_pages_markdown_mem_impl(
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
-        repeated_lines_by_page: repeated_header_footer.repeated_lines_for(
+        repeated_rows_by_page: repeated_header_footer.rows_for(
             &pages_slice
                 .iter()
                 .filter_map(|page| page.checked_add(1))
@@ -1087,21 +1087,21 @@ impl From<&TextItem> for HeaderFooterItemKey {
 pub(crate) struct RepeatedHeaderFooter {
     /// Items to leave out of the Markdown.
     pub(crate) items: HashSet<HeaderFooterItemKey>,
-    /// 1-indexed page -> rows removed as repeats of a row kept on an
-    /// earlier page.
-    pub(crate) rows_by_page: BTreeMap<u32, u32>,
+    /// 1-indexed page -> the text of each row removed as a repeat of a row
+    /// kept on an earlier page, top to bottom.
+    pub(crate) rows_by_page: BTreeMap<u32, Vec<String>>,
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 impl RepeatedHeaderFooter {
-    /// The requested pages' counts, in request order.
-    pub(crate) fn repeated_lines_for(&self, pages: &[u32]) -> Vec<PageRepeatedLines> {
+    /// The requested pages' removed rows.
+    pub(crate) fn rows_for(&self, pages: &[u32]) -> BTreeMap<u32, Vec<String>> {
         pages
             .iter()
-            .filter_map(|&page| {
+            .filter_map(|page| {
                 self.rows_by_page
-                    .get(&page)
-                    .map(|&lines| PageRepeatedLines { page, lines })
+                    .get(page)
+                    .map(|rows| (*page, rows.clone()))
             })
             .collect()
     }
@@ -1140,12 +1140,17 @@ pub(crate) fn repeated_header_footer_items(
         chart_regions,
         page_bounds,
     );
-    let line_rows: Vec<(u32, i32, Vec<HeaderFooterItemKey>)> = lines
+    let line_rows: Vec<(u32, i32, f32, String, Vec<HeaderFooterItemKey>)> = lines
         .iter()
         .map(|line| {
             (
                 line.page,
                 (line.y * 10.0).round() as i32,
+                line.items
+                    .iter()
+                    .map(|item| item.x)
+                    .fold(f32::INFINITY, f32::min),
+                line.text(),
                 line.items.iter().map(HeaderFooterItemKey::from).collect(),
             )
         })
@@ -1156,8 +1161,12 @@ pub(crate) fn repeated_header_footer_items(
         .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
         .collect();
     let mut removed = RepeatedHeaderFooter::default();
-    let mut rows = BTreeSet::new();
-    for (page, row, keys) in line_rows {
+    // One visual row, however many lines it was grouped into: its removed
+    // lines' text, left to right.
+    // (page, row from the top) -> (left edge, text) of each removed line.
+    type RowKey = (u32, std::cmp::Reverse<i32>);
+    let mut rows: BTreeMap<RowKey, Vec<(f32, String)>> = BTreeMap::new();
+    for (page, row, left, text, keys) in line_rows {
         let mut line_removed = false;
         for key in keys {
             if !kept_items.contains(&key) {
@@ -1166,11 +1175,19 @@ pub(crate) fn repeated_header_footer_items(
             }
         }
         if line_removed {
-            rows.insert((page, row));
+            rows.entry((page, std::cmp::Reverse(row)))
+                .or_default()
+                .push((left, text));
         }
     }
-    for (page, _) in rows {
-        *removed.rows_by_page.entry(page).or_default() += 1;
+    for ((page, _), mut parts) in rows {
+        parts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let text = parts
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        removed.rows_by_page.entry(page).or_default().push(text);
     }
     removed
 }
@@ -1230,7 +1247,10 @@ mod ocr_header_footer_tests {
             repeated_header_footer_items(&items, &thresholds, &HashMap::new(), 3, &HashMap::new());
         assert_eq!(
             repeated.rows_by_page,
-            BTreeMap::from([(2, 1), (3, 1)]),
+            BTreeMap::from([
+                (2, vec!["Repeated report header".to_string()]),
+                (3, vec!["Repeated report header".to_string()]),
+            ]),
             "pages 2 and 3 each leave out the header row page 1 keeps"
         );
         let removed = repeated.items;

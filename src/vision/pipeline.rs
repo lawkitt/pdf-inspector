@@ -26,8 +26,8 @@ use super::{
     route_ocr_pages, run_ocr_pages, FusedPageMarkdown, FusedPages, HttpModelDownloadError,
     HttpModelDownloader, ModelAcquireError, ModelManifest, ModelStore, ModelStoreError,
     OarOcrEngine, OarOcrError, OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions,
-    OcrPage, OcrRoutingError, OcrRun, OcrRunError, PageContentSource, PageRenderer, PdfiumRenderer,
-    RenderError, RenderOptions, PP_OCR_V6_SMALL,
+    OcrPage, OcrRoutingError, OcrRun, OcrRunError, PageRenderer, PdfiumRenderer, RenderError,
+    RenderOptions, PP_OCR_V6_SMALL,
 };
 
 /// Bounds live rendered-page memory while preserving small OCR batches.
@@ -291,11 +291,7 @@ pub fn process_pdf_with_ocr_mem(
         options.ocr.mode != OcrMode::Off,
     )?;
     let mut native = extraction.result;
-    let native_repeated: BTreeMap<u32, u32> = extraction
-        .repeated_lines_by_page
-        .iter()
-        .map(|page| (page.page, page.lines))
-        .collect();
+    let native_repeated = extraction.repeated_rows_by_page;
     let page_count = extraction.page_count;
     let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
     // The renderer reads the document as the loader repaired it, when it
@@ -462,6 +458,7 @@ pub fn process_pdf_with_ocr_mem(
             &fusion_options,
             &native_candidates,
             &fusion_routes,
+            &native_repeated,
         )?
     } else {
         // Resolve the native renderer before any network request so a missing
@@ -484,21 +481,13 @@ pub fn process_pdf_with_ocr_mem(
             &fusion_options,
             &native_candidates,
             &fusion_routes,
+            &native_repeated,
             options.retain_recognition.then_some(&mut recognition),
         )?
     };
     fused.render_time_ms = fused
         .render_time_ms
         .saturating_add(supplemental_preflight_ms);
-    for page in &mut fused.pages {
-        let native_lines = native_repeated.get(&page.page_number).copied().unwrap_or(0);
-        page.provenance.repeated_lines = match page.provenance.source {
-            PageContentSource::Native => native_lines,
-            PageContentSource::Ocr => page.provenance.repeated_lines,
-            // One header row left out of both sources is still one row.
-            PageContentSource::Fused => page.provenance.repeated_lines.max(native_lines),
-        };
-    }
     let repeated_lines_by_page = fused
         .pages
         .iter()
@@ -617,6 +606,7 @@ fn run_and_fuse_ocr_chunks<R, O>(
     fusion_options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
     fusion_routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_repeated: &BTreeMap<u32, Vec<String>>,
     mut recognition: Option<&mut Vec<OcrPage>>,
 ) -> Result<FusedPages, OcrPipelineError>
 where
@@ -658,6 +648,7 @@ where
         fusion_options,
         native_candidates,
         fusion_routes,
+        native_repeated,
     )?;
     if let Some(recognition) = recognition.as_mut() {
         recognition.extend(run.pages.into_iter().map(|page| page.ocr));
@@ -1292,6 +1283,7 @@ mod tests {
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
             &routes,
+            &BTreeMap::new(),
             Some(&mut recognition),
         )
         .unwrap();
@@ -1444,6 +1436,7 @@ mod tests {
             &OcrFusionOptions::new().markdown(MarkdownOptions::default()),
             &BTreeMap::new(),
             &routes,
+            &BTreeMap::new(),
             Some(&mut recognition),
         )
         .unwrap();
