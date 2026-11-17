@@ -9,6 +9,7 @@ pub(crate) mod content_stream;
 pub(crate) mod display_frame;
 pub(crate) mod fonts;
 pub(crate) mod geometry;
+pub(crate) mod hidden_paint;
 pub(crate) mod invisible;
 mod layout;
 mod links;
@@ -235,7 +236,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages, _page_rotations, _cmap_coverage, _invisible) =
+    let (extraction, _thresholds, _gid_pages, _page_rotations, _cmap_coverage, _invisible, _hidden) =
         extract_positioned_text_from_doc_in_page_box(
             &doc,
             &font_cmaps,
@@ -351,6 +352,7 @@ pub fn extract_text_with_positions_and_rotations_mem_with_options(
         page_rotations,
         _cmap_coverage,
         _invisible,
+        _hidden,
     ) = extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, options)?;
     if options.frame == PositionFrame::Display {
         display_frame::document_items_to_display_frame(&doc, &mut items, &page_rotations);
@@ -424,6 +426,7 @@ pub(crate) fn extract_page_text_items_in_page_box_with_options(
         coords_rotated,
         skipped_invisible,
         _run_coverage,
+        _hidden_text,
     ) = extract_page_text_items_with_options(
         doc,
         page_id,
@@ -465,8 +468,9 @@ pub(crate) type InvisibleTextByPage = HashMap<u32, u32>;
 /// What a document-level extraction returns: the text, rectangles and lines
 /// of the extracted pages, their join thresholds, the pages with gid-encoded
 /// fonts, their frame rotations, per font the two-byte codes shown through
-/// the font's CMap and how many of them the CMap had no entry for, and the
-/// invisible text each page left out.
+/// the font's CMap and how many of them the CMap had no entry for, the
+/// invisible text each page left out, and the hidden text each page left
+/// out (see `hidden_paint`).
 pub(crate) type DocumentExtraction = (
     PageExtraction,
     PageThresholds,
@@ -474,7 +478,14 @@ pub(crate) type DocumentExtraction = (
     PageRotations,
     CMapCoverageByFont,
     InvisibleTextByPage,
+    HiddenTextByPage,
 );
+
+/// Per page (1-indexed, like `TextItem::page`), the runs left out because
+/// they are drawn in the colour of what lies under them or covered by a
+/// later opaque paint (see `hidden_paint`); pages that left none out are
+/// absent.
+pub(crate) type HiddenTextByPage = HashMap<u32, hidden_paint::HiddenText>;
 
 /// Per-page `(y0, y1)` extent of the visible box, so the folio bands can be
 /// measured from the page's real top edge. Ordered bottom-then-top. The alias
@@ -585,6 +596,7 @@ fn extract_positioned_text_with_folio_context_impl(
         mut page_rotations,
         cmap_coverage,
         invisible_text_by_page,
+        hidden_text,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -605,6 +617,7 @@ fn extract_positioned_text_with_folio_context_impl(
             page_rotations,
             cmap_coverage,
             invisible_text_by_page,
+            hidden_text,
         ));
     }
 
@@ -626,6 +639,7 @@ fn extract_positioned_text_with_folio_context_impl(
         // Like their coverage, the context pages' invisible text is no part
         // of what the selected pages left out.
         _context_invisible,
+        _context_hidden,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -650,6 +664,7 @@ fn extract_positioned_text_with_folio_context_impl(
         page_rotations,
         cmap_coverage,
         invisible_text_by_page,
+        hidden_text,
     ))
 }
 
@@ -686,6 +701,7 @@ fn extract_positioned_text_impl(
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
     // Per font, the codes shown through its CMap over every extracted page.
     let mut cmap_coverage = CMapCoverageByFont::new();
+    let mut hidden_text = HiddenTextByPage::new();
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -721,6 +737,7 @@ fn extract_positioned_text_impl(
             coords_rotated,
             invisible_text,
             mut run_coverage,
+            page_hidden_text,
         ) = match page_result {
             Ok(extraction) => extraction,
             Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
@@ -737,6 +754,9 @@ fn extract_positioned_text_impl(
         }
         if coords_rotated != geometry::PageRotation::Upright {
             page_rotations.insert(*page_num, coords_rotated);
+        }
+        if page_hidden_text.runs > 0 {
+            hidden_text.insert(*page_num, page_hidden_text);
         }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
@@ -934,6 +954,7 @@ fn extract_positioned_text_impl(
         page_rotations,
         cmap_coverage,
         invisible_text_by_page,
+        hidden_text,
     ))
 }
 
@@ -5490,7 +5511,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, page_rotations, _, _) =
+        let ((items, _, _), _, _, page_rotations, _, _, _) =
             extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
         assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
         let field = items

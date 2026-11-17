@@ -220,6 +220,11 @@ pub struct OcrPdfResult {
     /// `MarkdownOptions::strip_headers_footers` off it is empty. See
     /// [`PageRepeatedLines`](crate::PageRepeatedLines).
     pub repeated_lines_by_page: Vec<crate::PageRepeatedLines>,
+    /// Selected pages whose native text layer painted text no reader can
+    /// see (see [`crate::PageHiddenText`]), with how much, from native
+    /// extraction. Left out of the native Markdown whether or not the page
+    /// was then recognized.
+    pub hidden_text_by_page: Vec<crate::PageHiddenText>,
     /// Selected pages where deterministic table detection found tables.
     pub pages_with_tables: Vec<u32>,
     /// Selected pages where deterministic layout found multiple columns.
@@ -348,14 +353,25 @@ pub fn process_pdf_with_ocr_mem(
     let mut renderer = None;
     let mut recovered_natively = BTreeSet::new();
     if options.ocr.mode == OcrMode::Auto {
-        let complete_recovery_candidates =
+        // PDFium reads every character of the text layer, the hidden runs
+        // native extraction left out among them (see `PageHiddenText`):
+        // pages that left any out are not recovered from it, so hidden text
+        // cannot come back through the recovery.
+        let hidden_text_pages: BTreeSet<u32> = native
+            .hidden_text_by_page
+            .iter()
+            .map(|hidden| hidden.page)
+            .collect();
+        let mut complete_recovery_candidates =
             native_recovery_candidates(&initially_routed, &native.ocr_reasons_by_page);
+        complete_recovery_candidates.retain(|page| !hidden_text_pages.contains(page));
         let mut native_probe_pages: BTreeSet<u32> =
             complete_recovery_candidates.iter().copied().collect();
         native_probe_pages.extend(
             native_candidates
                 .keys()
                 .filter(|page| fusion_routes.contains_key(page))
+                .filter(|page| !hidden_text_pages.contains(page))
                 .copied(),
         );
         if !native_probe_pages.is_empty() {
@@ -533,6 +549,7 @@ pub fn process_pdf_with_ocr_mem(
         form_field_names_by_page: native.form_field_names_by_page,
         invisible_text_by_page: native.invisible_text_by_page,
         repeated_lines_by_page,
+        hidden_text_by_page: native.hidden_text_by_page,
         pages_with_tables: pages_with_tables.clone(),
         pages_with_columns: native.pages_with_columns,
         is_complex: native.is_complex || !pages_with_tables.is_empty(),

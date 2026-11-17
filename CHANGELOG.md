@@ -42,6 +42,17 @@ version and date. Earlier releases are described in their
   list of `PageRepeatedLines`, and `PageProvenance::repeated_lines`), with
   header/footer stripping on, from native text and OCR alike. A fused page
   counts a row only when neither source shows it.
+- Text a reader never sees is left out of the Markdown: a run drawn in the
+  colour of what lies under its whole box (white on the unpainted page,
+  white on a white fill, red on a red band; colours within 6 of 255 on every
+  sRGB channel count as the same), and a run a later opaque solid fill or
+  opaque image covers. Per-page Markdown extraction and the OCR pipeline
+  report how much each page left out (`hidden_text_by_page`, a list of
+  `PageHiddenText`), in stretches as for invisible text. Conservative: text over an image, a shading or
+  anything else whose colour is not read stays whatever its colour, as do
+  rotated runs, runs in optional content, Type3 fonts or unread colour
+  spaces, and runs under a translucent, blended or masked paint.
+  `include_invisible` brings these runs back, as it does render-mode-3 text.
 
 ### Changed
 
@@ -97,6 +108,10 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- White text drawn inside a form XObject is no longer dropped when it sits
+  on a dark fill: forms skipped every white-filled run, though the page's
+  own text stopped being filtered by colour for exactly that reason. Such
+  runs are now judged like the page's own, against what lies under them.
 - A simple font's ToUnicode CMap of fewer than ten entries keeps its say
   for the codes the embedded program does not read. Such a CMap yields to
   the program's own reading, and its entries were then dropped, so a code

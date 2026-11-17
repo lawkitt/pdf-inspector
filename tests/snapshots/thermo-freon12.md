@@ -12,8 +12,6 @@
 
 ##### (R-12)
 
-##### Technical Information Technical Information
-
 ##### Thermodynamic Properties of Freon<sup>®</sup> 12 Refrigerant
 
 ##### (R-12)
