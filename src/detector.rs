@@ -951,7 +951,6 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let text_ops = counts.text_ops;
     let image_count = counts.image_count;
     let path_ops = counts.path_ops;
-    let rect_ops = counts.rect_ops;
     let font_changes = counts.font_changes;
 
     // Check for XObject images and calculate coverage. An image the
@@ -1010,11 +1009,12 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // native text when its raw operands have little ASCII diversity: a form
     // whose fill-in rules are dotted lines drawn as thousands of tiny shapes
     // next to a few repeated labels (upstream #361). The exemption holds
-    // when the paths are mostly rectangles (each `re` and the paint after
-    // it) that lie as dotted rules do, not stacked into lettering, however
-    // many dots there are; otherwise it is held to the same path operators
-    // per decoded character as the CID check, so a dozen live header lines
-    // over outlined body text stay vector text.
+    // when small rectangles lying as dotted rules do, not stacked into
+    // lettering, account for at least half of the path operators (each dot
+    // an `re` and its paint), however many dots there are; otherwise it is
+    // held to the same path operators per decoded character as the CID
+    // check, so a dozen live header lines over outlined body text stay
+    // vector text.
     let mut has_vector_text = path_ops >= 1000
         && path_ops > text_ops.saturating_mul(200)
         && (unique_alphanum_chars as usize) < VECTOR_TEXT_MIN_ALPHANUMERICS;
@@ -1023,7 +1023,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_vector_text = !(decoded.through_cid_cmap && decoded.is_page_text(path_ops))
             && !(has_decodable_text_fonts
                 && text_ops >= 10
-                && ((rect_ops.saturating_mul(2) >= path_ops && executed.small_rects_form_rules)
+                && (executed.rule_dots.saturating_mul(2) >= path_ops
                     || decoded.outweighs_paths(path_ops)));
     }
 

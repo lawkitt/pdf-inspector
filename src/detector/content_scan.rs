@@ -63,10 +63,10 @@ pub(super) struct ExecutedContent {
     /// or is itself past `FORM_CONTENT_CACHE_MAX_BYTES` — from which point
     /// no form is followed and the evidence is incomplete.
     pub(super) form_bytes_exceeded: bool,
-    /// Whether the small rectangles the content draws lie the way the dots
-    /// of dotted rules do rather than the way dots of lettering do (see
-    /// [`small_rects_form_rules`]).
-    pub(super) small_rects_form_rules: bool,
+    /// The distinct small rectangles the content draws, when they lie the
+    /// way the dots of dotted rules do rather than the way dots of
+    /// lettering do; zero otherwise (see [`rule_dots`]).
+    pub(super) rule_dots: u32,
 }
 
 /// The page's content streams read as one — the text render mode and the
@@ -179,9 +179,6 @@ pub(super) struct ContentCounts {
     pub(super) image_count: u32,
     /// Path construction and painting operators.
     pub(super) path_ops: u32,
-    /// `re` operators among `path_ops`: rectangles, such as the dots of a
-    /// dotted rule, which outlined glyphs are not drawn with.
-    pub(super) rect_ops: u32,
     /// `sh` operators: shadings painted straight onto the page.
     pub(super) shading_ops: u32,
     /// `Tf` operators whose font name could be read.
@@ -193,7 +190,6 @@ impl ContentCounts {
         self.text_ops += other.text_ops;
         self.image_count += other.image_count;
         self.path_ops += other.path_ops;
-        self.rect_ops += other.rect_ops;
         self.shading_ops += other.shading_ops;
         self.font_changes += other.font_changes;
     }
@@ -1055,48 +1051,78 @@ impl<'a> ContentScanState<'a> {
             shows_only_a_hidden_text_layer: self.shows_only_a_hidden_text_layer(),
             form_bytes: self.executed_form_bytes,
             form_bytes_exceeded: self.form_bytes_exceeded,
-            small_rects_form_rules: small_rects_form_rules(&self.small_rect_centers),
+            rule_dots: rule_dots(&self.small_rect_centers),
         }
     }
 }
 
 /// The longest side, in points on the page, of a rectangle counted as a
-/// dot (see [`small_rects_form_rules`]).
+/// dot (see [`rule_dots`]).
 const SMALL_RECT_MAX_SIDE: f64 = 3.0;
 
 /// The most small rectangles a page's scan keeps; past it the verdict
 /// covers those kept.
 const SMALL_RECTS_MAX: usize = 100_000;
 
-/// Whether small rectangles lie like the dots of dotted rules: in rows with
-/// nothing stacked close above or below. Dots that build lettering (a dot
-/// matrix, block letters) have neighbours a dot pitch above or below; a
-/// dotted rule's nearest row is the next rule, a line apart. At most one
-/// dot in ten may have another within 1 pt across and 0.2–4 pt up or down.
-fn small_rects_form_rules(centers: &[(f32, f32)]) -> bool {
-    if centers.is_empty() {
-        return false;
+/// The fewest small rectangles a page must draw for [`rule_dots`] to look
+/// at them: a page needs a thousand path operators to be taken for vector
+/// text, two per dot (`re` and its paint).
+const RULE_DOTS_MIN: usize = 500;
+
+/// The most distinct dots one 1 pt cell may hold and still be read as part
+/// of a rule; a denser cell is a cluster, its dots stacked.
+const RULE_DOTS_PER_CELL_MAX: usize = 4;
+
+/// How many distinct small rectangles a page draws when they lie like the
+/// dots of dotted rules, in rows with nothing stacked close above or below;
+/// zero otherwise, or when there are fewer than `RULE_DOTS_MIN`. Dots that
+/// build lettering (a dot matrix, block letters) have neighbours a dot
+/// pitch above or below; a dotted rule's nearest row is the next rule, a
+/// line apart. At most one dot in ten may have another within 1 pt across
+/// and 0.2–4 pt up or down. Centres are taken to 0.1 pt and counted once,
+/// and a cell of more than `RULE_DOTS_PER_CELL_MAX` dots counts as stacked
+/// without its dots being compared, so the work stays linear in the dots.
+fn rule_dots(centers: &[(f32, f32)]) -> u32 {
+    if centers.len() < RULE_DOTS_MIN {
+        return 0;
     }
-    let cell = |v: f32| v.floor() as i32;
-    let mut cells: HashMap<(i32, i32), Vec<(f32, f32)>> = HashMap::new();
-    for &(x, y) in centers {
-        cells.entry((cell(x), cell(y))).or_default().push((x, y));
+    // In tenths of a point.
+    let distinct: HashSet<(i32, i32)> = centers
+        .iter()
+        .map(|&(x, y)| ((x * 10.0).round() as i32, (y * 10.0).round() as i32))
+        .collect();
+    if distinct.len() < RULE_DOTS_MIN {
+        return 0;
     }
-    let stacked = centers
+    let cell = |(x, y): (i32, i32)| (x.div_euclid(10), y.div_euclid(10));
+    let mut cells: HashMap<(i32, i32), Vec<(i32, i32)>> = HashMap::new();
+    for &dot in &distinct {
+        cells.entry(cell(dot)).or_default().push(dot);
+    }
+    let stacked = distinct
         .iter()
         .filter(|&&(x, y)| {
-            (cell(x) - 1..=cell(x) + 1).any(|cx| {
-                (cell(y) - 5..=cell(y) + 5).any(|cy| {
-                    cells.get(&(cx, cy)).is_some_and(|dots| {
-                        dots.iter().any(|&(dx, dy)| {
-                            (dx - x).abs() <= 1.0 && (0.2..=4.0).contains(&(dy - y).abs())
-                        })
+            let (cx, cy) = cell((x, y));
+            if cells[&(cx, cy)].len() > RULE_DOTS_PER_CELL_MAX {
+                return true;
+            }
+            (cx - 1..=cx + 1).any(|nx| {
+                (cy - 5..=cy + 5).any(|ny| {
+                    cells.get(&(nx, ny)).is_some_and(|dots| {
+                        dots.len() > RULE_DOTS_PER_CELL_MAX
+                            || dots.iter().any(|&(dx, dy)| {
+                                (dx - x).abs() <= 10 && (2..=40).contains(&(dy - y).abs())
+                            })
                     })
                 })
             })
         })
         .count();
-    stacked * 10 <= centers.len()
+    if stacked * 10 <= distinct.len() {
+        distinct.len() as u32
+    } else {
+        0
+    }
 }
 
 /// The most distinct image-draw boxes a page's scan keeps for
@@ -1487,7 +1513,6 @@ fn scan_masked_content<'a>(
             }
             b'r' if ops.get(i + 1) == Some(&b'e') && is_word_start(i) && is_token_end(i + 1) => {
                 counts.path_ops += 1;
-                counts.rect_ops += 1;
                 if let Some(rect) = numeric_operands_before::<4>(ops, i, operand_floor) {
                     state.path_rect(rect);
                 }
