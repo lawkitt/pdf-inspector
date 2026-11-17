@@ -772,10 +772,21 @@ fn extract_positioned_text_impl(
         });
         if let Some((bx0, by0, bx1, by1)) = clip_box {
             const TOL: f32 = 6.0;
-            let outside = |it: &TextItem| {
-                let cx = it.x + it.width / 2.0;
-                !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
+            // A run is off the page when its baseline is outside the box, or
+            // its centre is and no part of it reaches into the box: a run the
+            // crop edge cuts through is partly visible and stays.
+            let off_box = |x: f32, y: f32, width: f32| {
+                let cx = x + width / 2.0;
+                let (x0, x1) = if width < 0.0 {
+                    (x + width, x)
+                } else {
+                    (x, x + width)
+                };
+                let reaches_in = x0 < bx1 && x1 > bx0;
+                !(y >= by0 - TOL && y <= by1 + TOL)
+                    || (!(cx >= bx0 - TOL && cx <= bx1 + TOL) && !reaches_in)
             };
+            let outside = |it: &TextItem| off_box(it.x, it.y, it.width);
             // Only clip when the off-page material reads as coherent text
             // (neighboring-page paragraphs, or a single off-page phrase).
             // Curved/rotated display text leaves short glyph fragments with
@@ -794,11 +805,15 @@ fn extract_positioned_text_impl(
                 .sum();
             // Genuine neighboring-page content is cleanly separated from
             // on-page text. When an off-page item continues an on-page
-            // line (same baseline, near-adjacent x), the coordinates are
-            // artifacts of transforms we mis-model — don't clip those.
+            // line (same baseline, near-adjacent x, on either side), the
+            // coordinates are artifacts of transforms we mis-model — don't
+            // clip those.
             let straddles = off.iter().any(|o| {
                 items.iter().any(|i| {
-                    !outside(i) && (i.y - o.y).abs() <= 2.0 && (o.x - (i.x + i.width)).abs() <= 10.0
+                    !outside(i)
+                        && (i.y - o.y).abs() <= 2.0
+                        && ((o.x - (i.x + i.width)).abs() <= 10.0
+                            || (i.x - (o.x + o.width)).abs() <= 10.0)
                 })
             });
             let coherent = wordy_chars * 2 >= total_chars.max(1) && !straddles;
@@ -808,10 +823,7 @@ fn extract_positioned_text_impl(
                 // The runs left out take their CMap coverage with them; a
                 // run without a position (see `RunCoverage`) stays.
                 run_coverage.retain(|run| match run.position {
-                    Some((x, y, width)) => {
-                        let cx = x + width / 2.0;
-                        cx >= bx0 - TOL && cx <= bx1 + TOL && y >= by0 - TOL && y <= by1 + TOL
-                    }
+                    Some((x, y, width)) => !off_box(x, y, width),
                     None => true,
                 });
                 if items.len() < before {

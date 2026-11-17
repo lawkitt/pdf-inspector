@@ -6890,6 +6890,31 @@ fn test_sparse_clipping_keeps_continuations_and_short_fragments() {
     assert_eq!(fragments.replace(' ', ""), "abc", "{text}");
 }
 
+/// A run the crop edge cuts through is partly visible: its centre lies out
+/// of the box, but it reaches in, so it stays however sparse the off-page
+/// text is (Codex review of the #437 port).
+#[test]
+fn test_sparse_clipping_keeps_runs_the_crop_edge_cuts_through() {
+    let content = "BT /F1 10 Tf 1 0 0 1 200 700 Tm (Body text inside the page) Tj \
+                   1 0 0 1 -10 650 Tm (Partly visible words) Tj ET";
+    let pdf = make_text_pdf_with_boxes(content, "0 0 612 792", Some("50 50 562 742"));
+    let text = joined_item_text(&pdf);
+    assert!(text.contains("Body text inside the page"), "{text}");
+    assert!(text.contains("Partly visible words"), "{text}");
+}
+
+/// An off-page run that ends just before an on-page run on its baseline
+/// continues that line, whichever side it is on, and stays.
+#[test]
+fn test_sparse_clipping_keeps_continuations_on_the_left() {
+    let content = "BT /F1 10 Tf 1 0 0 1 200 700 Tm (Body text inside the page) Tj \
+                   1 0 0 1 10 650 Tm (Prefix) Tj 1 0 0 1 44 650 Tm (Visible) Tj ET";
+    let pdf = make_text_pdf_with_boxes(content, "0 0 612 792", Some("50 50 562 742"));
+    let text = joined_item_text(&pdf);
+    assert!(text.contains("Visible"), "{text}");
+    assert!(text.contains("Prefix"), "{text}");
+}
+
 // ============================================================================
 // Image XObject emission
 // ============================================================================
