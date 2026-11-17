@@ -178,6 +178,8 @@ pub(super) struct ContentCounts {
     /// `re` operators among `path_ops`: rectangles, such as the dots of a
     /// dotted rule, which outlined glyphs are not drawn with.
     pub(super) rect_ops: u32,
+    /// `sh` operators: shadings painted straight onto the page.
+    pub(super) shading_ops: u32,
     /// `Tf` operators whose font name could be read.
     pub(super) font_changes: u32,
 }
@@ -188,6 +190,7 @@ impl ContentCounts {
         self.image_count += other.image_count;
         self.path_ops += other.path_ops;
         self.rect_ops += other.rect_ops;
+        self.shading_ops += other.shading_ops;
         self.font_changes += other.font_changes;
     }
 }
@@ -1420,7 +1423,11 @@ fn scan_masked_content<'a>(
             b'W' if is_word_start(i) && is_token_end(i) => {
                 state.clip_requested();
             }
-            // Two-byte: re (rect), f* (fill even-odd), B*/b*, W* (clip even-odd)
+            // Two-byte: sh (shading), re (rect), f* (fill even-odd), B*/b*,
+            // W* (clip even-odd)
+            b's' if ops.get(i + 1) == Some(&b'h') && is_word_start(i) && is_token_end(i + 1) => {
+                counts.shading_ops += 1;
+            }
             b'r' if ops.get(i + 1) == Some(&b'e') && is_word_start(i) && is_token_end(i + 1) => {
                 counts.path_ops += 1;
                 counts.rect_ops += 1;
