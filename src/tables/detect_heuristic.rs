@@ -1573,6 +1573,10 @@ fn detect_table_in_region(
         cells.push(row_cells);
     }
 
+    // A wrapped row's next line is a row of its own so far (upstream #315).
+    // The checks below read the rows as found; the table keeps them folded.
+    let wrapped = super::grid::wrapped_line_rows(&rows, &cells);
+
     // Validation 0 (small-font pass only): reject tiny all-numeric
     // fragments. A <=2-row grid whose every cell is a bare 1-2 digit number
     // carries no tabular information — in practice these are
@@ -1682,7 +1686,27 @@ fn detect_table_in_region(
     // in cols 1-3, page numbers in last col) leave most cells empty and trip
     // the paragraph heuristic; TOC shape is a safer signal here. Narrow only
     // — see narrow-TOC rationale at validation 1.
-    if is_paragraph_content(&cells) && !is_narrow_toc {
+    // A hyphen breaking a wrapped cell's word is no paragraph signal when
+    // the cell's next line folds back into its row.
+    let unbroken_cells;
+    let paragraph_cells = if wrapped.contains(&true) {
+        let mut cells = cells.clone();
+        for row in 1..cells.len() {
+            if !wrapped[row] {
+                continue;
+            }
+            for col in 0..cells[row].len() {
+                if !cells[row][col].trim().is_empty() && cells[row - 1][col].ends_with('-') {
+                    cells[row - 1][col].pop();
+                }
+            }
+        }
+        unbroken_cells = cells;
+        &unbroken_cells
+    } else {
+        &cells
+    };
+    if is_paragraph_content(paragraph_cells) && !is_narrow_toc {
         log::debug!("  validation 9 fail: paragraph content");
         return None;
     }
@@ -1705,6 +1729,21 @@ fn detect_table_in_region(
         item_indices.len()
     );
 
+    let (rows, cells, cell_items) = if wrapped.contains(&true) {
+        (
+            super::grid::fold_wrapped_rows(rows, &wrapped, |_, _| {}),
+            super::grid::fold_wrapped_rows(cells, &wrapped, |above, below| {
+                super::grid::join_wrapped_cells(above, below)
+            }),
+            super::grid::fold_wrapped_rows(cell_items, &wrapped, |above, below| {
+                for (cell, line) in above.iter_mut().zip(below) {
+                    cell.extend(line);
+                }
+            }),
+        )
+    } else {
+        (rows, cells, cell_items)
+    };
     let mut table = Table::new(columns, rows, cells, item_indices);
     let blocks = (table.kind == super::TableKind::Data)
         .then(|| layout_block_rows(&cell_items, &table.rows, &table.cells))
