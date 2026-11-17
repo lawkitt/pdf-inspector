@@ -96,6 +96,11 @@ version and date. Earlier releases are described in their
   merge: a run splits where its strike starts or ends, so `Old` struck
   beside a live `New` reads `<s>Old</s> New`. This changes upstream 1.26.0's
   merge rule (#663), which let such strikes run on.
+- The content-stream comment pre-pass reads unfiltered inline image data
+  by its declared length, as lopdf does, so pixel bytes that happen to
+  spell ` EI %` no longer end the image early and lose the rest of the line
+  as a comment. Images lopdf cannot size still end at a whitespace-delimited
+  `EI`.
 
 ## [1.26.1] - 2026-11-15
 

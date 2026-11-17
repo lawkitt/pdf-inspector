@@ -58,6 +58,121 @@ fn ends_token(byte: u8) -> bool {
     is_pdf_whitespace(byte) || matches!(byte, b'/' | b'[' | b'(' | b'<' | b'%')
 }
 
+/// The byte length lopdf reads for an inline image's data, given the bytes
+/// of its header between `BI` and `ID`: lopdf takes exactly
+/// `H * ceil(W * components * BPC / 8)` bytes when the header has integer
+/// `W`, `H` and `BPC`, no filter, and an image mask or a device colour
+/// space it knows (`DeviceGray`/`Gray`, `DeviceRGB`/`RGB`,
+/// `DeviceRGBA`/`RGBA`, `DeviceCMYK`/`CMYK`); otherwise it scans for `EI`
+/// between whitespace, and so does the comment pre-pass (`None`). The
+/// abbreviated key wins over the full one, as in lopdf.
+fn declared_inline_image_len(header: &[u8]) -> Option<usize> {
+    #[derive(Clone, PartialEq)]
+    enum Value {
+        Name(Vec<u8>),
+        Int(i64),
+        Bool(bool),
+        Other,
+    }
+    let is_delimiter = |b: u8| b"()<>[]{}/%".contains(&b);
+    let mut entries: Vec<(Vec<u8>, Value)> = Vec::new();
+    let mut key: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < header.len() {
+        let b = header[i];
+        if is_pdf_whitespace(b) {
+            i += 1;
+            continue;
+        }
+        let token_end = |from: usize| {
+            header[from..]
+                .iter()
+                .position(|&c| is_pdf_whitespace(c) || is_delimiter(c))
+                .map_or(header.len(), |n| from + n)
+        };
+        let value = match b {
+            b'/' => {
+                let end = token_end(i + 1);
+                let name = header[i + 1..end].to_vec();
+                i = end;
+                Value::Name(name)
+            }
+            b'[' | b'<' | b'(' => {
+                // Arrays, dictionaries and strings (Decode, DecodeParms,
+                // an indexed palette) are skipped whole; none is a value
+                // the length needs.
+                let (open, close) = match b {
+                    b'[' => (b'[', b']'),
+                    b'<' => (b'<', b'>'),
+                    _ => (b'(', b')'),
+                };
+                let mut depth = 0usize;
+                while i < header.len() {
+                    if header[i] == open {
+                        depth += 1;
+                    } else if header[i] == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                i += 1;
+                Value::Other
+            }
+            _ => {
+                let end = token_end(i).max(i + 1);
+                let token = &header[i..end];
+                i = end;
+                match token {
+                    b"true" => Value::Bool(true),
+                    b"false" => Value::Bool(false),
+                    _ => std::str::from_utf8(token)
+                        .ok()
+                        .and_then(|t| t.parse::<i64>().ok())
+                        .map_or(Value::Other, Value::Int),
+                }
+            }
+        };
+        match (key.take(), value) {
+            (None, Value::Name(name)) => key = Some(name),
+            (Some(k), value) => entries.push((k, value)),
+            // A value with no key before it: not a header lopdf reads.
+            (None, _) => return None,
+        }
+    }
+    let get = |abbr: &[u8], full: &[u8]| {
+        let find = |k: &[u8]| entries.iter().rev().find(|(e, _)| e == k).map(|(_, v)| v);
+        find(abbr).or_else(|| find(full)).cloned()
+    };
+    let int = |abbr: &[u8], full: &[u8]| match get(abbr, full) {
+        Some(Value::Int(n)) if n >= 0 => Some(n as usize),
+        _ => None,
+    };
+    let width = int(b"W", b"Width")?;
+    let height = int(b"H", b"Height")?;
+    let bpc = int(b"BPC", b"BitsPerComponent")?;
+    let components = if get(b"IM", b"ImageMask") == Some(Value::Bool(true)) {
+        1
+    } else {
+        match get(b"CS", b"ColorSpace")? {
+            Value::Name(name) => match name.as_slice() {
+                b"DeviceGray" | b"Gray" => 1,
+                b"DeviceRGB" | b"RGB" => 3,
+                b"DeviceRGBA" | b"RGBA" | b"DeviceCMYK" | b"CMYK" => 4,
+                _ => return None,
+            },
+            _ => return None,
+        }
+    };
+    if get(b"F", b"Filter").is_some() {
+        return None;
+    }
+    let stride = width.checked_mul(components)?.checked_mul(bpc)?.div_ceil(8);
+    height.checked_mul(stride)
+}
+
 fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
@@ -78,6 +193,8 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // `ID` begins image data only inside an inline image, which `BI` opens;
     // a bare `ID` elsewhere (or the name `/ID`) is left alone.
     let mut bi_open = false;
+    // Where the open inline image's header starts (just after `BI`).
+    let mut header_start = 0;
 
     while i < data.len() {
         let b = data[i];
@@ -105,6 +222,7 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
             result.push(b'I');
             bi_open = true;
             i += 2;
+            header_start = i;
             continue;
         }
         if in_string == 0
@@ -117,9 +235,24 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
         {
             result.push(b'I');
             result.push(b'D');
-            in_image_data = true;
             bi_open = false;
+            let declared = declared_inline_image_len(&data[header_start..i]);
             i += 2;
+            // Where lopdf reads the data by its declared length, copy
+            // exactly that: the bytes may hold a whitespace-delimited `EI`
+            // followed by `%`, which the scan below would end the data at.
+            if let Some(len) = declared {
+                while i < data.len() && b" \t\r\n".contains(&data[i]) {
+                    result.push(data[i]);
+                    i += 1;
+                }
+                if let Some(image) = data.get(i..i + len) {
+                    result.extend_from_slice(image);
+                    i += len;
+                    continue;
+                }
+            }
+            in_image_data = true;
             continue;
         }
         match b {
@@ -4993,6 +5126,45 @@ end"#;
         let input = b"(x\\\\) Tj % comment\nET\n";
         let output = strip_pdf_comments(input);
         assert_eq!(output, b"(x\\\\) Tj  \nET\n");
+    }
+
+    #[test]
+    fn inline_image_data_is_read_by_its_declared_length() {
+        // 16 unfiltered grey pixels whose bytes hold " EI %": lopdf reads
+        // them by length, so the pre-pass must not end the data at that
+        // `EI` and strip the rest of the line as a comment.
+        let mut pixels = b"\x80 EI %".to_vec();
+        pixels.extend_from_slice(&[0x80; 10]);
+        assert_eq!(pixels.len(), 16);
+        let mut input = b"q BI /W 16 /H 1 /BPC 8 /CS /DeviceGray ID ".to_vec();
+        input.extend_from_slice(&pixels);
+        input.extend_from_slice(b" EI Q\nBT /F1 12 Tf (After) Tj ET % note\n");
+        let output = strip_pdf_comments(&input);
+        let mut expected = input.clone();
+        let comment = expected.len() - b"% note\n".len();
+        expected.splice(comment..expected.len() - 1, *b" ");
+        assert_eq!(output, expected);
+        let content = lopdf::content::Content::decode(&output).expect("decodes");
+        let operators: Vec<&str> = content
+            .operations
+            .iter()
+            .map(|op| op.operator.as_str())
+            .collect();
+        assert_eq!(operators, ["q", "BI", "Q", "BT", "Tf", "Tj", "ET"]);
+
+        // The header's sizes: abbreviated keys, an image mask, packed bits.
+        let len = |header: &[u8]| declared_inline_image_len(header);
+        assert_eq!(len(b" /W 16 /H 1 /BPC 8 /CS /DeviceGray "), Some(16));
+        assert_eq!(
+            len(b"/Width 3 /Height 2 /BitsPerComponent 8 /ColorSpace /RGB"),
+            Some(18)
+        );
+        assert_eq!(len(b"/IM true /W 10 /H 2 /BPC 1 /D [1 0]"), Some(4));
+        // Where lopdf scans for `EI` instead, so does the pre-pass.
+        assert_eq!(len(b"/W 2 /H 1 /BPC 8"), None); // no colour space
+        assert_eq!(len(b"/W 2 /H 1 /BPC 8 /CS /G"), None); // lopdf knows no /G
+        assert_eq!(len(b"/W 2 /H 1 /BPC 8 /CS /DeviceGray /F /AHx"), None);
+        assert_eq!(len(b"/W 2.0 /H 1 /BPC 8 /CS /DeviceGray"), None);
     }
 
     #[test]
