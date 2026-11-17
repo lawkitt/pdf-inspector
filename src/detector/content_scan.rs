@@ -52,6 +52,10 @@ pub(super) struct ExecutedContent {
     /// while the images drawn cover the page — and nothing went unread
     /// that could say otherwise.
     pub(super) shows_only_a_hidden_text_layer: bool,
+    /// The pictures the page shows: the image draws that landed within the
+    /// clip in force, joined where they overlap or touch (see
+    /// [`count_pictures`]).
+    pub(super) pictures: u32,
     /// Bytes of form and pattern-cell content executed.
     pub(super) form_bytes: usize,
     /// Whether a form, or a pattern's cell, went unread because its
@@ -319,6 +323,10 @@ struct ContentScanState<'a> {
     drew_image: bool,
     /// Whether an image draw landed within the clip in force.
     drew_image_on_page: bool,
+    /// Where image draws landed within the clip in force, those at least
+    /// `MIN_COUNTED_IMAGE_SIDE_PT` on each side, up to `PICTURE_BOXES_MAX`
+    /// of them.
+    picture_boxes: Vec<UserBox>,
     /// The clip-only text whose clip was set at the current level and has
     /// not been painted through, a text object at a time; that of outer
     /// levels sits in `saved`.
@@ -403,6 +411,7 @@ impl<'a> ContentScanState<'a> {
             pattern_verdicts: HashMap::new(),
             drew_image: false,
             drew_image_on_page: false,
+            picture_boxes: Vec::new(),
             clip_text: Vec::new(),
             pending_clip_text_ops: 0,
             clip_text_ops_open: 0,
@@ -682,6 +691,20 @@ impl<'a> ContentScanState<'a> {
         self.drew_image_on_page = true;
         self.own_image_area += painted.area();
         self.mark_cells(&painted);
+        self.picture_landed(painted);
+    }
+
+    /// Keep where an image draw landed, for [`count_pictures`]: a rule or
+    /// a spacer drawn as an image is not a picture.
+    fn picture_landed(&mut self, on_page: UserBox) {
+        let min_side = f64::from(crate::MIN_COUNTED_IMAGE_SIDE_PT);
+        if on_page.x1 - on_page.x0 >= min_side
+            && on_page.y1 - on_page.y0 >= min_side
+            && self.picture_boxes.len() < PICTURE_BOXES_MAX
+            && self.picture_boxes.last() != Some(&on_page)
+        {
+            self.picture_boxes.push(on_page);
+        }
     }
 
     /// Whether the clip in force has any extent for a paint to land in.
@@ -777,6 +800,7 @@ impl<'a> ContentScanState<'a> {
         let [a, b, c, d, _, _] = self.ctm;
         self.own_image_area += (a * d - b * c).abs().min(on_page.area());
         self.mark_cells(&on_page);
+        self.picture_landed(on_page);
     }
 
     /// Mark the grid cells whose centres lie within `on_page`.
@@ -999,11 +1023,56 @@ impl<'a> ContentScanState<'a> {
             hidden_text_ops: self.executed_hidden_text_ops,
             draws_image: self.drew_image_on_page,
             covers_page: self.covers_page(),
+            pictures: count_pictures(&self.picture_boxes),
             shows_only_a_hidden_text_layer: self.shows_only_a_hidden_text_layer(),
             form_bytes: self.executed_form_bytes,
             form_bytes_exceeded: self.form_bytes_exceeded,
         }
     }
+}
+
+/// The most image draws a page's scan keeps for [`count_pictures`]; past
+/// it the count covers the draws kept.
+const PICTURE_BOXES_MAX: usize = 65_536;
+
+/// The pictures among image draws' boxes on a page: a box joins a picture
+/// when it overlaps, or comes within `TOUCHING_IMAGES_GAP_PT` of, the box
+/// around the draws the picture already holds. A sweep in left-edge order
+/// keeps only the pictures still open at the current edge; as each box is
+/// at least `MIN_COUNTED_IMAGE_SIDE_PT` on a side and within the page,
+/// and open pictures never touch, few are open at once, and a draw
+/// repeated in place costs one comparison.
+pub(super) fn count_pictures(boxes: &[UserBox]) -> u32 {
+    let gap = f64::from(crate::TOUCHING_IMAGES_GAP_PT);
+    let near = |a: &UserBox, b: &UserBox| {
+        a.x0 <= b.x1 + gap && b.x0 <= a.x1 + gap && a.y0 <= b.y1 + gap && b.y0 <= a.y1 + gap
+    };
+    let mut sorted = boxes.to_vec();
+    sorted.sort_by(|a, b| a.x0.total_cmp(&b.x0));
+    let mut open: Vec<UserBox> = Vec::new();
+    let mut closed = 0usize;
+    for drawn in sorted {
+        let before = open.len();
+        open.retain(|picture| picture.x1 + gap >= drawn.x0);
+        closed += before - open.len();
+        let mut picture = drawn;
+        loop {
+            let before = open.len();
+            let mut index = 0;
+            while index < open.len() {
+                if near(&open[index], &picture) {
+                    picture = picture.union(&open.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if open.len() == before {
+                break;
+            }
+        }
+        open.push(picture);
+    }
+    u32::try_from(closed + open.len()).unwrap_or(u32::MAX)
 }
 
 /// Fast scan of content stream bytes for text operators

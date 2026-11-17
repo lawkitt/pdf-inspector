@@ -6598,57 +6598,47 @@ fn test_image_emission_does_not_change_default_markdown() {
     );
 }
 
-/// A two-page PDF. Page 1 draws `Im0` twice, apart; `Im1` as a 2 pt square;
-/// `Im1` again as two strips that meet, like a scan stored in strips; and
-/// the form `Fm0`, whose own resources name a third image `Im2`, over the
-/// second `Im0`. Page 2 draws text only.
-fn make_pdf_with_counted_images() -> Vec<u8> {
+/// A PDF with a page per content stream, each with the font `F1`, the 1×1
+/// images `Im0` and `Im1`, and the form `Fm0` whose own resources name a
+/// third image `Im2`, drawn over its 100×100 box. Pages are 612×792.
+fn make_pdf_with_image_pages(pages: &[&str]) -> Vec<u8> {
     let image = "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
                  /ColorSpace /DeviceGray /BitsPerComponent 8";
-    let page_one = "BT /F1 12 Tf 100 700 Td (Pictures) Tj ET\n\
-                    q 200 0 0 100 50 500 cm /Im0 Do Q\n\
-                    q 200 0 0 100 50 300 cm /Im0 Do Q\n\
-                    q 2 0 0 2 400 400 cm /Im1 Do Q\n\
-                    q 100 0 0 50 400 650 cm /Im1 Do Q\n\
-                    q 100 0 0 50 400 600.5 cm /Im1 Do Q\n\
-                    q 1 0 0 1 100 350 cm /Fm0 Do Q";
-    let form = "q 100 0 0 100 0 0 cm /Im2 Do Q";
-    let page_two = "BT /F1 12 Tf 100 700 Td (Only words) Tj ET";
-    let objects: Vec<(String, Option<&[u8]>)> = vec![
+    let kids: String = (0..pages.len())
+        .map(|index| format!("{} 0 R ", 8 + 2 * index))
+        .collect();
+    let mut objects: Vec<(String, Option<Vec<u8>>)> = vec![
         ("<< /Type /Catalog /Pages 2 0 R >>".into(), None),
         (
-            "<< /Type /Pages /Kids [3 0 R 9 0 R] /Count 2 >>".into(),
+            format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()),
             None,
         ),
-        (
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-             /Resources << /Font << /F1 5 0 R >> \
-             /XObject << /Im0 6 0 R /Im1 7 0 R /Fm0 8 0 R >> >> /Contents 4 0 R >>"
-                .into(),
-            None,
-        ),
-        (String::new(), Some(page_one.as_bytes())),
         (
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
             None,
         ),
-        (image.into(), Some(&[128u8][..])),
-        (image.into(), Some(&[64u8][..])),
+        (image.into(), Some(vec![128])),
+        (image.into(), Some(vec![64])),
+        (image.into(), Some(vec![32])),
         (
             "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
-             /Resources << /XObject << /Im2 11 0 R >> >>"
+             /Resources << /XObject << /Im2 6 0 R >> >>"
                 .into(),
-            Some(form.as_bytes()),
+            Some(b"q 100 0 0 100 0 0 cm /Im2 Do Q".to_vec()),
         ),
-        (
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-             /Resources << /Font << /F1 5 0 R >> >> /Contents 10 0 R >>"
-                .into(),
-            None,
-        ),
-        (String::new(), Some(page_two.as_bytes())),
-        (image.into(), Some(&[32u8][..])),
     ];
+    for (index, content) in pages.iter().enumerate() {
+        objects.push((
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 3 0 R >> \
+                 /XObject << /Im0 4 0 R /Im1 5 0 R /Fm0 7 0 R >> >> /Contents {} 0 R >>",
+                9 + 2 * index
+            ),
+            None,
+        ));
+        objects.push((String::new(), Some(content.as_bytes().to_vec())));
+    }
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
     for (index, (dict, stream)) in objects.iter().enumerate() {
@@ -6683,21 +6673,49 @@ fn make_pdf_with_counted_images() -> Vec<u8> {
 }
 
 #[test]
-fn per_page_markdown_counts_the_images_each_page_draws() {
-    let pdf = make_pdf_with_counted_images();
+fn per_page_markdown_counts_the_pictures_each_page_shows() {
+    let repeated = format!(
+        "BT /F1 12 Tf 100 700 Td (Repeated) Tj ET\n{}",
+        "q 200 0 0 100 50 500 cm /Im0 Do Q\n".repeat(100_000)
+    );
+    let pages = [
+        // 1: `Im0` twice, apart; the second with `Im2` drawn over it through
+        // the form; `Im1` as two strips that meet, like a scan in strips;
+        // `Im1` as a 2 pt square, a rule rather than a picture. Three.
+        "BT /F1 12 Tf 100 700 Td (Pictures) Tj ET\n\
+         q 200 0 0 100 50 500 cm /Im0 Do Q\n\
+         q 200 0 0 100 50 300 cm /Im0 Do Q\n\
+         q 1 0 0 1 100 350 cm /Fm0 Do Q\n\
+         q 100 0 0 50 400 650 cm /Im1 Do Q\n\
+         q 100 0 0 50 400 600.5 cm /Im1 Do Q\n\
+         q 2 0 0 2 400 400 cm /Im1 Do Q",
+        // 2: text only.
+        "BT /F1 12 Tf 100 700 Td (Only words) Tj ET",
+        // 3: a 20×2 pt rule meeting a 100×100 picture: the picture alone.
+        "BT /F1 12 Tf 100 700 Td (Rule) Tj ET\n\
+         q 20 0 0 2 50 300 cm /Im0 Do Q\n\
+         q 100 0 0 100 70 300 cm /Im1 Do Q",
+        // 4: drawn off the page, and clipped away: none shown.
+        "BT /F1 12 Tf 100 700 Td (Hidden) Tj ET\n\
+         q 100 0 0 100 1000 1000 cm /Im0 Do Q\n\
+         q 0 0 10 10 re W n 100 0 0 100 300 300 cm /Im1 Do Q",
+        // 5: one image drawn in place 100,000 times.
+        &repeated,
+    ];
+    let pdf = make_pdf_with_image_pages(&pages);
+    let started = std::time::Instant::now();
     let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
-    // The first `Im0`; the second with `Im2` drawn over it through the form;
-    // the two strips. The 2 pt `Im1` is a rule, not a picture. Page 2 draws
-    // none.
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    let page = |page, images| pdf_inspector::PageImages { page, images };
     assert_eq!(
         result.images_by_page,
-        vec![pdf_inspector::PageImages { page: 1, images: 3 }]
+        vec![page(1, 3), page(3, 1), page(5, 1)]
     );
     assert!(result.pages[0].markdown.contains("Pictures"));
     assert!(!result.pages[0].markdown.contains("Image:"));
     // A page selection counts only the selected pages.
-    let second = extract_pages_markdown_mem(&pdf, Some(&[1])).expect("extract");
-    assert!(second.images_by_page.is_empty());
+    let selected = extract_pages_markdown_mem(&pdf, Some(&[1, 2])).expect("extract");
+    assert_eq!(selected.images_by_page, vec![page(3, 1)]);
 }
 
 #[test]

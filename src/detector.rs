@@ -646,6 +646,8 @@ struct PageAnalysis {
     /// `has_invisible_text_layer`.
     executed_form_bytes: usize,
     form_bytes_exceeded: bool,
+    /// The pictures the page shows (see `PageImages`).
+    pictures: u32,
     /// Total image area in pixels (reserved for future use)
     #[allow(dead_code)]
     total_image_area: u64,
@@ -1017,6 +1019,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_invisible_text_layer,
         executed_form_bytes,
         form_bytes_exceeded,
+        pictures: executed.pictures,
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
@@ -2263,6 +2266,7 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> PageOcrSign
         template_image_needs_ocr: needs_ocr_for_template_image,
         has_vector_text: analysis.has_vector_text,
         has_invisible_text_layer: analysis.has_invisible_text_layer,
+        pictures: analysis.pictures,
     }
 }
 
@@ -2278,6 +2282,8 @@ pub(crate) struct PageOcrSignals {
     /// Every text-showing operator on the page is invisible while an image
     /// covers the page.
     pub(crate) has_invisible_text_layer: bool,
+    /// The pictures the page shows (see `PageImages`).
+    pub(crate) pictures: u32,
 }
 
 /// Recursively collect image dimensions from XObject resources,

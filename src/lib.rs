@@ -155,11 +155,14 @@ pub struct PageOcrReasons {
 pub struct PageImages {
     /// 1-indexed page number.
     pub page: u32,
-    /// The pictures the page shows: image XObjects its content draws,
-    /// directly or through form XObjects, with draws that overlap or touch
-    /// counted as one picture (a scan stored in strips or tiles, an image
-    /// over a background). An image drawn smaller than
-    /// [`MIN_COUNTED_IMAGE_SIDE_PT`] on a side (a rule or spacer) is left out.
+    /// The pictures the page shows: the images its content draws (image
+    /// XObjects, inline images, paths painted with a pattern that draws an
+    /// image), directly or through form XObjects, where they land within
+    /// the clip in force and the visible page box. Draws that overlap or
+    /// come within [`TOUCHING_IMAGES_GAP_PT`] count as one picture (a scan
+    /// stored in strips or tiles, an image over a background); a draw
+    /// smaller than [`MIN_COUNTED_IMAGE_SIDE_PT`] on a side where it lands
+    /// (a rule or spacer) is left out.
     pub images: u32,
 }
 
@@ -750,14 +753,6 @@ fn extract_pages_markdown_mem_impl(
             .map(|(item, remove)| (item.clone(), *remove))
             .unzip();
 
-        let images = counted_images(&page_items);
-        if images > 0 {
-            images_by_page.push(PageImages {
-                page: page_1idx,
-                images,
-            });
-        }
-
         let page_rects: Vec<PdfRect> = all_rects
             .iter()
             .filter(|r| r.page == page_1idx)
@@ -808,6 +803,12 @@ fn extract_pages_markdown_mem_impl(
         let has_template_image = signals.template_image_needs_ocr;
         let has_vector_text = signals.has_vector_text;
         let has_invisible_text_layer = signals.has_invisible_text_layer;
+        if signals.pictures > 0 {
+            images_by_page.push(PageImages {
+                page: page_1idx,
+                images: signals.pictures,
+            });
+        }
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -926,58 +927,6 @@ fn extract_pages_markdown_mem_impl(
             None
         },
     })
-}
-
-/// The pictures among a page's items: image draws at least
-/// [`MIN_COUNTED_IMAGE_SIDE_PT`] on each side, with draws whose boxes overlap
-/// or come within [`TOUCHING_IMAGES_GAP_PT`] of each other joined into one.
-fn counted_images(items: &[TextItem]) -> u32 {
-    let mut boxes: Vec<[f32; 4]> = items
-        .iter()
-        .filter(|item| {
-            matches!(item.item_type, types::ItemType::Image)
-                && [item.x, item.y, item.width, item.height]
-                    .iter()
-                    .all(|value| value.is_finite())
-                && item.width.abs() >= MIN_COUNTED_IMAGE_SIDE_PT
-                && item.height.abs() >= MIN_COUNTED_IMAGE_SIDE_PT
-        })
-        .map(|item| {
-            let x = item.x.min(item.x + item.width);
-            let y = item.y.min(item.y + item.height);
-            [x, y, x + item.width.abs(), y + item.height.abs()]
-        })
-        .collect();
-    boxes.sort_by(|a, b| a[0].total_cmp(&b[0]));
-    // Union-find over boxes in left-edge order: a box can only touch the
-    // boxes that start before its right edge does (plus the gap).
-    let mut parent: Vec<usize> = (0..boxes.len()).collect();
-    fn root(parent: &mut [usize], mut at: usize) -> usize {
-        while parent[at] != at {
-            parent[at] = parent[parent[at]];
-            at = parent[at];
-        }
-        at
-    }
-    let mut pictures = boxes.len();
-    for (index, a) in boxes.iter().enumerate() {
-        for (offset, b) in boxes[index + 1..].iter().enumerate() {
-            if b[0] > a[2] + TOUCHING_IMAGES_GAP_PT {
-                break;
-            }
-            if b[1] <= a[3] + TOUCHING_IMAGES_GAP_PT && a[1] <= b[3] + TOUCHING_IMAGES_GAP_PT {
-                let (ra, rb) = (
-                    root(&mut parent, index),
-                    root(&mut parent, index + 1 + offset),
-                );
-                if ra != rb {
-                    parent[rb] = ra;
-                    pictures -= 1;
-                }
-            }
-        }
-    }
-    u32::try_from(pictures).unwrap_or(u32::MAX)
 }
 
 /// Image regions large enough to plausibly contain rasterized document
