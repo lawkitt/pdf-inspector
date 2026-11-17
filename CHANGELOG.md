@@ -132,6 +132,14 @@ version and date. Earlier releases are described in their
   Short glyph fragments out of the box and runs continuing an on-page line
   still stay. ([#437](https://github.com/firecrawl/pdf-inspector/pull/437),
   ported: the threshold change only; the fork already clips turned pages)
+- A page of decodable native text whose form rules are dotted lines drawn
+  as thousands of tiny shapes is no longer taken for vector-outlined text:
+  it kept no Markdown and was routed to OCR with reason `vector_text`. Text
+  in a decodable font with ten or more text operators now exempts the page,
+  as long as there are at most 100 path operators per decoded character, so
+  a few live header lines over outlined body text still go to OCR.
+  ([#361](https://github.com/firecrawl/pdf-inspector/pull/361), ported: the
+  exemption only, with the fork's path-operator ratio)
 
 ## [1.26.1] - 2026-11-15
 
