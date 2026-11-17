@@ -158,9 +158,11 @@ pub struct PageImages {
     /// The pictures the page shows: the images its content draws (image
     /// XObjects, inline images, paths painted with a pattern that draws an
     /// image), directly or through form XObjects, where they land within
-    /// the clip in force and the visible page box. Draws that overlap or
-    /// come within [`TOUCHING_IMAGES_GAP_PT`] count as one picture (a scan
-    /// stored in strips or tiles, an image over a background); a draw
+    /// the clip in force (as the content scan holds it, by its bounding
+    /// box) and the visible page box. A draw that overlaps, or comes within
+    /// [`TOUCHING_IMAGES_GAP_PT`] of, the box around a picture's draws
+    /// joins that picture (a scan stored in strips or tiles, an image over
+    /// a background, an image within another's box); a draw
     /// smaller than [`MIN_COUNTED_IMAGE_SIDE_PT`] on a side where it lands
     /// (a rule or spacer) is left out.
     pub images: u32,

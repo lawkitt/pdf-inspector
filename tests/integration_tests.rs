@@ -6678,6 +6678,10 @@ fn per_page_markdown_counts_the_pictures_each_page_shows() {
         "BT /F1 12 Tf 100 700 Td (Repeated) Tj ET\n{}",
         "q 200 0 0 100 50 500 cm /Im0 Do Q\n".repeat(100_000)
     );
+    let alternating = format!(
+        "BT /F1 12 Tf 100 700 Td (Alternating) Tj ET\n{}q 100 0 0 100 400 100 cm /Im1 Do Q",
+        "q 200 0 0 100 50 500 cm /Im0 Do Q\nq 200 0 0 100 51 501 cm /Im0 Do Q\n".repeat(35_000)
+    );
     let pages = [
         // 1: `Im0` twice, apart; the second with `Im2` drawn over it through
         // the form; `Im1` as two strips that meet, like a scan in strips;
@@ -6701,6 +6705,9 @@ fn per_page_markdown_counts_the_pictures_each_page_shows() {
          q 0 0 10 10 re W n 100 0 0 100 300 300 cm /Im1 Do Q",
         // 5: one image drawn in place 100,000 times.
         &repeated,
+        // 6: two overlapping boxes drawn by turns 70,000 times, then a
+        // picture apart from them: two.
+        &alternating,
     ];
     let pdf = make_pdf_with_image_pages(&pages);
     let started = std::time::Instant::now();
@@ -6709,7 +6716,7 @@ fn per_page_markdown_counts_the_pictures_each_page_shows() {
     let page = |page, images| pdf_inspector::PageImages { page, images };
     assert_eq!(
         result.images_by_page,
-        vec![page(1, 3), page(3, 1), page(5, 1)]
+        vec![page(1, 3), page(3, 1), page(5, 1), page(6, 2)]
     );
     assert!(result.pages[0].markdown.contains("Pictures"));
     assert!(!result.pages[0].markdown.contains("Image:"));

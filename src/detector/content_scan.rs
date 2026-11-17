@@ -324,9 +324,11 @@ struct ContentScanState<'a> {
     /// Whether an image draw landed within the clip in force.
     drew_image_on_page: bool,
     /// Where image draws landed within the clip in force, those at least
-    /// `MIN_COUNTED_IMAGE_SIDE_PT` on each side, up to `PICTURE_BOXES_MAX`
-    /// of them.
+    /// `MIN_COUNTED_IMAGE_SIDE_PT` on each side, each distinct box once, up
+    /// to `PICTURE_BOXES_MAX` of them.
     picture_boxes: Vec<UserBox>,
+    /// The boxes in `picture_boxes`, by their coordinates' bits.
+    picture_box_keys: HashSet<[u64; 4]>,
     /// The clip-only text whose clip was set at the current level and has
     /// not been painted through, a text object at a time; that of outer
     /// levels sits in `saved`.
@@ -412,6 +414,7 @@ impl<'a> ContentScanState<'a> {
             drew_image: false,
             drew_image_on_page: false,
             picture_boxes: Vec::new(),
+            picture_box_keys: HashSet::new(),
             clip_text: Vec::new(),
             pending_clip_text_ops: 0,
             clip_text_ops_open: 0,
@@ -698,10 +701,11 @@ impl<'a> ContentScanState<'a> {
     /// a spacer drawn as an image is not a picture.
     fn picture_landed(&mut self, on_page: UserBox) {
         let min_side = f64::from(crate::MIN_COUNTED_IMAGE_SIDE_PT);
+        let key = [on_page.x0, on_page.y0, on_page.x1, on_page.y1].map(f64::to_bits);
         if on_page.x1 - on_page.x0 >= min_side
             && on_page.y1 - on_page.y0 >= min_side
             && self.picture_boxes.len() < PICTURE_BOXES_MAX
-            && self.picture_boxes.last() != Some(&on_page)
+            && self.picture_box_keys.insert(key)
         {
             self.picture_boxes.push(on_page);
         }
@@ -1031,8 +1035,9 @@ impl<'a> ContentScanState<'a> {
     }
 }
 
-/// The most image draws a page's scan keeps for [`count_pictures`]; past
-/// it the count covers the draws kept.
+/// The most distinct image-draw boxes a page's scan keeps for
+/// [`count_pictures`]; past it the count covers the boxes kept. A box drawn
+/// again, anywhere in the content, is kept once.
 const PICTURE_BOXES_MAX: usize = 65_536;
 
 /// The pictures among image draws' boxes on a page: a box joins a picture
