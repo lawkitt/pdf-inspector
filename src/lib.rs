@@ -920,6 +920,7 @@ fn extract_pages_markdown_mem_impl(
         let has_template_image = signals.template_image_needs_ocr;
         let has_vector_text = signals.has_vector_text;
         let has_invisible_text_layer = signals.has_invisible_text_layer;
+        let page_has_items = !page_items.is_empty();
         if signals.pictures > 0 {
             images_by_page.push(PageImages {
                 page: page_1idx,
@@ -1003,13 +1004,20 @@ fn extract_pages_markdown_mem_impl(
         }
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
-        let needs_ocr = ocr_reason.is_some()
-            || md.trim().is_empty()
-            || has_gid
-            || is_garbage_text(&md)
-            || has_template_image
-            || has_vector_text
-            || has_invisible_text_layer;
+        // A truly blank page — nothing painted and nothing extracted — has
+        // nothing for OCR to recover; recognising it only costs time and
+        // risks text invented from noise (upstream #339, issue #319). A page
+        // that paints an image, a path or text but extracts empty still goes
+        // to OCR as before.
+        let is_blank_page = !signals.has_painted_content && !page_has_items;
+        let needs_ocr = !is_blank_page
+            && (ocr_reason.is_some()
+                || md.trim().is_empty()
+                || has_gid
+                || is_garbage_text(&md)
+                || has_template_image
+                || has_vector_text
+                || has_invisible_text_layer);
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);

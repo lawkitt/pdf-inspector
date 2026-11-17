@@ -155,6 +155,11 @@ version and date. Earlier releases are described in their
   a few live header lines over outlined body text still go to OCR.
   ([#361](https://github.com/firecrawl/pdf-inspector/pull/361), ported: the
   exemption only, with the fork's path-operator ratio)
+- Per-page Markdown extraction and the OCR pipeline no longer recommend
+  OCR for a blank page: one that paints no image, path or text and yields
+  no text items. A page that paints something but extracts empty still
+  goes to OCR. ([#339](https://github.com/firecrawl/pdf-inspector/pull/339),
+  ported)
 
 ## [1.26.1] - 2026-11-15
 

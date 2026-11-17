@@ -2282,6 +2282,9 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> PageOcrSign
         has_vector_text: analysis.has_vector_text,
         has_invisible_text_layer: analysis.has_invisible_text_layer,
         pictures: analysis.pictures,
+        has_painted_content: analysis.has_images
+            || analysis.path_op_count > 0
+            || analysis.text_operator_count > 0,
     }
 }
 
@@ -2299,6 +2302,9 @@ pub(crate) struct PageOcrSignals {
     pub(crate) has_invisible_text_layer: bool,
     /// The pictures the page shows (see `PageImages`).
     pub(crate) pictures: u32,
+    /// The page paints something: an image, a path or a text-showing
+    /// operator. A page painting nothing has nothing for OCR to read.
+    pub(crate) has_painted_content: bool,
 }
 
 /// Recursively collect image dimensions from XObject resources,
@@ -4762,7 +4768,13 @@ mod tests {
                 analysis.unique_alphanum_chars
             );
             assert!(!analysis.has_vector_text, "layout {}", layout as u8);
-            assert_eq!(page_ocr_signals(&doc, page_id), PageOcrSignals::default());
+            assert_eq!(
+                page_ocr_signals(&doc, page_id),
+                PageOcrSignals {
+                    has_painted_content: true,
+                    ..PageOcrSignals::default()
+                }
+            );
         }
     }
 
