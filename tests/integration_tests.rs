@@ -2226,6 +2226,145 @@ fn test_snapshot_shannon_entropy() {
     assert_snapshot("shannon-entropy-p1-2");
 }
 
+/// The clauses of `bilingual_contract_en_ru.pdf` in reading order, English
+/// and Russian, each a stretch of text that wraps inside its own cell.
+const BILINGUAL_EN: [&str; 15] = [
+    "SERVICES AGREEMENT No. 17/2026",
+    "Moscow, 1 December 2026",
+    "Northwind Analytics LLC (the \"Customer\") and Severny Code LLC (the \"Contractor\") have entered into this Agreement as follows.",
+    "1. Subject of the Agreement",
+    "1.1. The Contractor undertakes to provide software maintenance services, and the Customer undertakes to accept and pay for them.",
+    "1.2. The scope and timing of the services are set out in Appendix No. 1.",
+    "2.1. The monthly fee is 150,000 rubles, VAT included.",
+    "2.2. The Customer pays within ten business days after signing the acceptance certificate.",
+    "3.1. The Contractor shall respond to a support request within four business hours.",
+    "3.2. The Customer shall grant the Contractor access to the systems needed for the services.",
+    "4.1. For late payment the Customer pays a penalty of 0.1 percent of the overdue amount per day.",
+    "4.2. Neither Party is liable for failures caused by force majeure.",
+    "5.1. This Agreement takes effect on signing and remains in force until 31 December 2027.",
+    "5.2. Either Party may terminate this Agreement with thirty days' written notice.",
+    "6.1. This Agreement is governed by the laws of the Russian Federation.",
+];
+const BILINGUAL_RU: [&str; 15] = [
+    "ДОГОВОР ОКАЗАНИЯ УСЛУГ № 17/2026",
+    "г. Москва, 1 декабря 2026 г.",
+    "ООО «Нортвинд Аналитика» (далее – «Заказчик») и ООО «Северный Код» (далее – «Исполнитель») заключили настоящий Договор о нижеследующем.",
+    "1. Предмет договора",
+    "1.1. Исполнитель обязуется оказывать услуги по сопровождению программного обеспечения, а Заказчик обязуется принимать и оплачивать эти услуги.",
+    "1.2. Объем и сроки оказания услуг определяются в Приложении № 1.",
+    "2.1. Ежемесячная стоимость услуг составляет 150 000 рублей, включая НДС.",
+    "2.2. Заказчик оплачивает услуги в течение десяти рабочих дней после подписания акта сдачи-приемки.",
+    "3.1. Исполнитель обязан отвечать на запрос о поддержке в течение четырех рабочих часов.",
+    "3.2. Заказчик обязан предоставить Исполнителю доступ к системам, необходимым для оказания услуг.",
+    "4.1. За просрочку оплаты Заказчик уплачивает неустойку в размере 0,1 процента от просроченной суммы за каждый день.",
+    "4.2. Стороны не несут ответственности за неисполнение обязательств вследствие обстоятельств непреодолимой силы.",
+    "5.1. Настоящий Договор вступает в силу с момента подписания и действует до 31 декабря 2027 г.",
+    "5.2. Каждая из сторон вправе расторгнуть настоящий Договор, письменно уведомив другую сторону за тридцать дней.",
+    "6.1. Настоящий Договор регулируется законодательством Российской Федерации.",
+];
+
+/// The grid row of each clause of `BILINGUAL_EN` and `BILINGUAL_RU`.
+const BILINGUAL_ROWS: [usize; 15] = [0, 1, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8];
+
+/// Checks that `markdown` keeps each language's clauses whole and in reading
+/// order, and never puts both languages in one table cell or paragraph line.
+fn assert_bilingual_reading_order(markdown: &str) {
+    // Table pipes, heading marks and line breaks are layout, not text.
+    let flat = markdown
+        .lines()
+        .map(|line| line.trim_start_matches('#').replace('|', " "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Where each clause starts, by language; each must be whole and after
+    // the clause before it in its own language.
+    let mut starts: Vec<(usize, usize, usize)> = Vec::new(); // (at, language, index)
+    for (language, clauses) in [&BILINGUAL_EN, &BILINGUAL_RU].into_iter().enumerate() {
+        let mut previous = 0;
+        for (index, clause) in clauses.iter().enumerate() {
+            let at = flat[previous..]
+                .find(clause)
+                .map(|offset| previous + offset)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{clause:?} is not whole, or not after the clause before it:\n{markdown}"
+                    )
+                });
+            starts.push((at, language, index));
+            previous = at + clause.len();
+        }
+    }
+    // The two languages are read either one after the other (one column,
+    // then the other) or side by side, row by row (a table row per grid
+    // row: its English clauses, then its Russian ones) — never one column
+    // cut in two around the other.
+    starts.sort_unstable();
+    let order: Vec<(usize, usize)> = starts.iter().map(|&(_, l, i)| (l, i)).collect();
+    let switches = |seq: &[(usize, usize)]| seq.windows(2).filter(|w| w[0].0 != w[1].0).count();
+    let one_after_the_other = switches(&order) == 1;
+    let row_of = |index: usize| BILINGUAL_ROWS[index];
+    let rows_in_order = order.windows(2).all(|w| row_of(w[0].1) <= row_of(w[1].1));
+    let row_by_row = rows_in_order
+        && (0..=row_of(BILINGUAL_EN.len() - 1)).all(|row| {
+            let in_row: Vec<(usize, usize)> = order
+                .iter()
+                .copied()
+                .filter(|&(_, i)| row_of(i) == row)
+                .collect();
+            switches(&in_row) == 1
+        });
+    assert!(
+        one_after_the_other || row_by_row,
+        "the languages interleave out of order: {order:?}\n{markdown}"
+    );
+    let cyrillic = |text: &str| text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+    let latin = |text: &str| text.chars().any(|c| c.is_ascii_alphabetic());
+    for line in markdown.lines() {
+        let cells: Vec<&str> = if line.starts_with('|') {
+            line.trim_matches('|').split('|').collect()
+        } else {
+            vec![line]
+        };
+        assert!(
+            cells.len() <= 2,
+            "a row of more than the two language columns: {line:?}"
+        );
+        for cell in cells {
+            assert!(
+                !(cyrillic(cell) && latin(cell)),
+                "English and Russian merged in one cell or line: {cell:?}"
+            );
+        }
+    }
+}
+
+/// A bilingual services agreement in a bordered EN|RU grid, the layout of
+/// most Russian–English contracts (generated by
+/// `examples/bilingual_contract_fixture.rs`). Each language's clauses stay
+/// whole and in reading order, and the two columns are never merged into
+/// one cell or reordered around each other — the risk lawkitt/mdoc#925 W4
+/// checked upstream #274 for. The base read the English column's last two
+/// clauses after the whole Russian column.
+#[test]
+fn test_bilingual_contract_grid_keeps_each_language_in_order() {
+    let markdown = assert_snapshot("bilingual_contract_en_ru");
+    assert_bilingual_reading_order(&markdown);
+
+    let buf = std::fs::read("tests/fixtures/bilingual_contract_en_ru.pdf").unwrap();
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
+    assert_bilingual_reading_order(&pages.pages[0].markdown);
+
+    // mdoc's native pass.
+    #[cfg(feature = "ocr")]
+    {
+        use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+        let native = process_pdf_with_ocr_mem(&buf, OcrPdfOptions::new()).expect("native");
+        assert!(native.pages_recommended_for_ocr.is_empty());
+        assert_bilingual_reading_order(&native.markdown);
+    }
+}
+
 /// Upstream #274 (issue #270): wrapped cells must not split a seven-column
 /// ruled table into partial tables along a text-only gutter.
 #[test]
