@@ -669,10 +669,26 @@ fn default_onnx_runtime_library() -> PathBuf {
 /// a failure or panic, threads stop claiming further pages. A panic in `f`
 /// is caught and re-raised on the caller's thread after every dispatch
 /// thread has stopped, matching rayon's panic propagation.
+///
+/// A dispatch thread that cannot be started (the process is at its thread
+/// limit) is logged and skipped: the threads that did start claim its
+/// pages, and if none started, the calling thread dispatches them all
+/// through the first worker, as the single-worker path does.
 fn map_pages_on_workers<W: PageWorker, P: Sync, R: Send>(
     workers: &[W],
     pages: &[P],
     f: impl Fn(&W, &P) -> Result<R, W::Error> + Sync,
+) -> Result<Vec<R>, W::Error> {
+    map_pages_on_workers_spawning(workers, pages, f, |_| true)
+}
+
+/// [`map_pages_on_workers`], where `may_spawn(index)` returning false stands
+/// for the operating system refusing worker `index`'s dispatch thread.
+fn map_pages_on_workers_spawning<W: PageWorker, P: Sync, R: Send>(
+    workers: &[W],
+    pages: &[P],
+    f: impl Fn(&W, &P) -> Result<R, W::Error> + Sync,
+    may_spawn: impl Fn(usize) -> bool,
 ) -> Result<Vec<R>, W::Error> {
     if pages.is_empty() {
         return Ok(Vec::new());
@@ -685,39 +701,60 @@ fn map_pages_on_workers<W: PageWorker, P: Sync, R: Send>(
     let panic_slot: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
     let results: Vec<Mutex<Option<R>>> = (0..pages.len()).map(|_| Mutex::new(None)).collect();
 
+    let dispatch = |worker: &W| loop {
+        if failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let index = cursor.fetch_add(1, Ordering::Relaxed);
+        if index >= pages.len() {
+            return;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker.install(|| f(worker, &pages[index]))
+        }));
+        match outcome {
+            Ok(Ok(value)) => {
+                *results[index].lock().unwrap() = Some(value);
+            }
+            Ok(Err(error)) => {
+                failed.store(true, Ordering::Relaxed);
+                let mut slot = error_slot.lock().unwrap();
+                if slot.as_ref().is_none_or(|(existing, _)| index < *existing) {
+                    *slot = Some((index, error));
+                }
+            }
+            Err(payload) => {
+                failed.store(true, Ordering::Relaxed);
+                let mut slot = panic_slot.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(payload);
+                }
+            }
+        }
+    };
+
     std::thread::scope(|scope| {
-        for worker in workers {
-            scope.spawn(|| loop {
-                if failed.load(Ordering::Relaxed) {
-                    return;
-                }
-                let index = cursor.fetch_add(1, Ordering::Relaxed);
-                if index >= pages.len() {
-                    return;
-                }
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker.install(|| f(worker, &pages[index]))
-                }));
-                match outcome {
-                    Ok(Ok(value)) => {
-                        *results[index].lock().unwrap() = Some(value);
-                    }
-                    Ok(Err(error)) => {
-                        failed.store(true, Ordering::Relaxed);
-                        let mut slot = error_slot.lock().unwrap();
-                        if slot.as_ref().is_none_or(|(existing, _)| index < *existing) {
-                            *slot = Some((index, error));
-                        }
-                    }
-                    Err(payload) => {
-                        failed.store(true, Ordering::Relaxed);
-                        let mut slot = panic_slot.lock().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(payload);
-                        }
-                    }
-                }
-            });
+        let dispatch = &dispatch;
+        let mut started = 0;
+        for (index, worker) in workers.iter().enumerate() {
+            let spawned = if may_spawn(index) {
+                std::thread::Builder::new()
+                    .name(format!("pdf-inspector-ocr-dispatch-{index}"))
+                    .spawn_scoped(scope, move || dispatch(worker))
+                    .map_err(|error| error.to_string())
+            } else {
+                Err("refused".to_string())
+            };
+            match spawned {
+                Ok(_) => started += 1,
+                Err(error) => log::warn!(
+                    "OCR dispatch thread {index} could not start; its pages go to the \
+                     other workers: {error}"
+                ),
+            }
+        }
+        if started == 0 {
+            dispatch(&workers[0]);
         }
     });
 
@@ -1300,6 +1337,35 @@ mod tests {
         .unwrap();
         let expected: Vec<usize> = pages.iter().map(|page| page * 2).collect();
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn map_pages_on_workers_survives_dispatch_threads_that_cannot_start() {
+        let workers = [DirectWorker, DirectWorker, DirectWorker];
+        let pages: Vec<usize> = (0..23).collect();
+        let expected: Vec<usize> = pages.iter().map(|page| page * 3).collect();
+        let threads = |may_spawn: &dyn Fn(usize) -> bool| {
+            let seen = Mutex::new(std::collections::HashSet::new());
+            let result = map_pages_on_workers_spawning(
+                &workers,
+                &pages,
+                |_worker, page| {
+                    seen.lock().unwrap().insert(std::thread::current().id());
+                    Ok::<usize, usize>(page * 3)
+                },
+                may_spawn,
+            )
+            .unwrap();
+            assert_eq!(result, expected);
+            seen.into_inner().unwrap()
+        };
+        // No dispatch thread starts: the calling thread runs every page.
+        let caller = std::thread::current().id();
+        assert_eq!(threads(&|_| false), [caller].into_iter().collect());
+        // Only the third starts: it alone claims every page.
+        let one = threads(&|index| index == 2);
+        assert_eq!(one.len(), 1);
+        assert!(!one.contains(&caller));
     }
 
     #[test]

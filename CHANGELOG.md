@@ -88,6 +88,9 @@ version and date. Earlier releases are described in their
   single-thread pool instead of a shared rayon pool, closing a
   self-deadlock.
   ([#540](https://github.com/firecrawl/pdf-inspector/pull/540), ported)
+- Multi-page OCR whose extra dispatch threads cannot start (the process is
+  at its thread limit) runs the pages on the threads that did start, or on
+  the calling thread, instead of panicking.
 
 ## [1.26.1] - 2026-11-15
 
