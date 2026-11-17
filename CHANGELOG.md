@@ -152,6 +152,15 @@ version and date. Earlier releases are described in their
   characters by the density policy the text-quality analysis already
   applies; a dense or long run of them still routes the page to OCR.
   ([#206](https://github.com/firecrawl/pdf-inspector/pull/206), ported)
+- A ruled table whose long cells wrap is no longer split into partial
+  tables along a text-only gutter, with the remaining columns emitted as
+  prose: horizontal rules crossing the proposed gutter on three or more
+  rows veto the side-by-side split, as a crossing rect cluster already
+  did. Disjoint side-by-side grids keep their split. A bilingual contract
+  laid out as a bordered EN|RU grid now reads as one two-column table, row
+  by row, instead of its English column being cut in two around the
+  Russian one. ([#274](https://github.com/firecrawl/pdf-inspector/pull/274),
+  ported)
 
 ## [1.26.1] - 2026-11-15
 
