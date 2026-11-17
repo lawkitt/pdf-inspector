@@ -171,3 +171,95 @@ fn headings_between_a_title_rule_and_a_ruled_table_stay_outside_it() {
         .collect();
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{markdown}");
 }
+
+/// A filled rectangle, as Word draws a 0.5 pt table border.
+fn fill(x: f32, y: f32, width: f32, height: f32) -> String {
+    format!("{x} {y} {width} {height} re f\n")
+}
+
+/// The 3 x 4 "Table Grid" of upstream #669: three body cells wrap onto a
+/// second line, the last one in the last row. `borders` draws Word's 0.5 pt
+/// filled border rectangles; without them the table is borderless.
+fn wrapped_last_row_page(borders: bool) -> String {
+    let columns = [72.0, 228.0, 384.0, 540.0];
+    let edges = [368.1, 354.2, 327.9, 301.6, 275.3];
+    let mut page = text("F2", 14.0, 72.0, 420.0, "Table section");
+    page += &text(
+        "F1",
+        11.0,
+        72.0,
+        395.0,
+        "The table below lists three rows of sample content for the report.",
+    );
+    if borders {
+        for y in edges {
+            page += &fill(71.75, y - 0.25, 468.5, 0.5);
+        }
+        for x in columns {
+            page += &fill(x - 0.25, 275.05, 0.5, 93.3);
+        }
+    }
+    let lines: [(f32, [&str; 3]); 7] = [
+        (357.9, ["[10] Name", "[11] Description", "[12] Notes"]),
+        (
+            344.0,
+            ["[13] One", "[14] A cell that wraps into", "[15] Short"],
+        ),
+        (330.9, ["", "the right column.", ""]),
+        (
+            317.7,
+            ["[16] Two", "[17] Another wrapped cell", "[18] Also short"],
+        ),
+        (304.6, ["", "on the right.", ""]),
+        (
+            291.4,
+            [
+                "[19] Three",
+                "[20] The text after the table",
+                "[21] Across both columns",
+            ],
+        ),
+        (278.3, ["", "comes next.", ""]),
+    ];
+    for (y, cells) in lines {
+        for (x, cell) in columns.iter().zip(cells) {
+            if !cell.is_empty() {
+                page += &text("F1", 11.0, x + 5.4, y, cell);
+            }
+        }
+    }
+    page += &text(
+        "F1",
+        11.0,
+        72.0,
+        250.0,
+        "After the table the document continues with an ordinary paragraph.",
+    );
+    page
+}
+
+/// Upstream #669 (reported by motchie): the heuristic detector bounds a
+/// table by its rows with items in two or more columns, so the wrapped line
+/// of the last row's cell fell below the table and came out as a paragraph.
+#[test]
+fn a_wrapped_last_row_stays_in_its_cell() {
+    for borders in [true, false] {
+        let markdown = page_markdown(&make_pdf(&[wrapped_last_row_page(borders)])).remove(0);
+        assert_eq!(
+            table_rows(&markdown),
+            [
+                "|[10] Name|[11] Description|[12] Notes|",
+                "|[13] One|[14] A cell that wraps into the right column.|[15] Short|",
+                "|[16] Two|[17] Another wrapped cell on the right.|[18] Also short|",
+                "|[19] Three|[20] The text after the table comes next.|[21] Across both columns|",
+            ],
+            "borders: {borders}\n{markdown}"
+        );
+        assert_eq!(markdown.matches("comes next.").count(), 1, "{markdown}");
+        let after = markdown
+            .lines()
+            .find(|line| line.contains("After the table the document continues"))
+            .unwrap_or_else(|| panic!("paragraph after the table missing:\n{markdown}"));
+        assert!(!after.starts_with('|'), "{markdown}");
+    }
+}
