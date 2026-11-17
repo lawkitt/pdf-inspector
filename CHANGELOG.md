@@ -141,6 +141,12 @@ version and date. Earlier releases are described in their
   spell ` EI %` no longer end the image early and lose the rest of the line
   as a comment. Images lopdf cannot size still end at a whitespace-delimited
   `EI`.
+- Text outside the visible page box is left out however little of it there
+  is: a single off-page phrase on a page with a nonzero CropBox no longer
+  reaches the text, as a neighbouring page's paragraphs already did not.
+  Short glyph fragments out of the box and runs continuing an on-page line
+  still stay. ([#437](https://github.com/firecrawl/pdf-inspector/pull/437),
+  ported: the threshold change only; the fork already clips turned pages)
 
 ## [1.26.1] - 2026-11-15
 

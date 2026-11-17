@@ -6627,6 +6627,76 @@ fn test_text_outside_the_page_box_takes_its_cmap_coverage_with_it() {
     );
 }
 
+/// Joined text of a document's positioned items.
+fn joined_item_text(pdf: &[u8]) -> String {
+    extract_text_with_positions_mem(pdf)
+        .expect("extract positioned text")
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Upstream #437 (issue #318): one coherent phrase outside the CropBox is
+/// left out as surely as a neighbouring page's paragraphs are, however few
+/// items it has, and under every page rotation.
+#[test]
+fn test_sparse_off_page_text_is_clipped_for_all_page_rotations() {
+    let content = "BT /F1 10 Tf 1 0 0 1 60 700 Tm (VISIBLE-PAGE) Tj                    1 0 0 1 -200 650 Tm (HIDDEN-OFF-PAGE) Tj ET";
+    for rotation in [0, 90, 180, 270] {
+        let pdf = make_text_pdf_with_rotate(
+            content,
+            "0 0 612 792",
+            Some("50 50 562 742"),
+            Some(rotation),
+            None,
+            HELVETICA_FONT,
+        );
+        let text = joined_item_text(&pdf);
+        assert!(
+            text.contains("VISIBLE-PAGE"),
+            "rotation {rotation}: visible text was dropped: {text}"
+        );
+        assert!(
+            !text.contains("HIDDEN-OFF-PAGE"),
+            "rotation {rotation}: sparse off-page text survived: {text}"
+        );
+
+        let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+        assert!(pages.pages[0].markdown.contains("VISIBLE-PAGE"));
+        assert!(!pages.pages[0].markdown.contains("HIDDEN-OFF-PAGE"));
+    }
+}
+
+/// The same for text an embedded rotation turned: the box is turned with it.
+#[test]
+fn test_sparse_off_page_text_is_clipped_after_embedded_rotation() {
+    let content = "BT /F1 10 Tf 0 10 -10 0 60 100 Tm (VISIBLE-ROTATED) Tj                    0 10 -10 0 -500 642 Tm (HIDDEN-ROTATED) Tj ET";
+    let pdf = make_text_pdf_with_boxes(content, "0 0 612 792", Some("50 50 562 742"));
+    let text = joined_item_text(&pdf);
+    assert!(text.contains("VISIBLE-ROTATED"), "{text}");
+    assert!(!text.contains("HIDDEN-ROTATED"), "{text}");
+}
+
+/// What the item count used to protect stays: short glyph fragments out of
+/// the box (curved or rotated display text) and a run continuing an on-page
+/// line are kept.
+#[test]
+fn test_sparse_clipping_keeps_continuations_and_short_fragments() {
+    let content = "BT /F1 10 Tf 1 0 0 1 520 700 Tm (Visible) Tj                    1 0 0 1 555 700 Tm (Continuation) Tj                    1 0 0 1 -100 650 Tm (a) Tj                    1 0 0 1 -80 650 Tm (b) Tj                    1 0 0 1 -60 650 Tm (c) Tj ET";
+    let pdf = make_text_pdf_with_boxes(content, "0 0 612 792", Some("50 50 562 742"));
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let text = joined_item_text(&pdf);
+    assert!(text.contains("Visible"), "{text}");
+    assert!(text.contains("Continuation"), "{text}");
+    let fragments: String = items
+        .iter()
+        .filter(|item| item.x < 0.0)
+        .map(|item| item.text.trim())
+        .collect();
+    assert_eq!(fragments.replace(' ', ""), "abc", "{text}");
+}
+
 // ============================================================================
 // Image XObject emission
 // ============================================================================

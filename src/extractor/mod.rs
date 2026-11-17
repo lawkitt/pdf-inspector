@@ -777,9 +777,11 @@ fn extract_positioned_text_impl(
                 !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
             };
             // Only clip when the off-page material reads as coherent text
-            // (neighboring-page paragraphs). Curved/rotated display text
-            // leaves short glyph fragments with artifact coordinates
-            // outside the box, and those must stay.
+            // (neighboring-page paragraphs, or a single off-page phrase).
+            // Curved/rotated display text leaves short glyph fragments with
+            // artifact coordinates outside the box, and those must stay.
+            // The character-mass test below tells the two apart; the item
+            // count does not, so a sparse phrase is clipped too (#437).
             let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
             // Judge by character mass: paragraphs are dominated by long
             // word runs even when interleaved with short math fragments,
@@ -799,7 +801,7 @@ fn extract_positioned_text_impl(
                     !outside(i) && (i.y - o.y).abs() <= 2.0 && (o.x - (i.x + i.width)).abs() <= 10.0
                 })
             });
-            let coherent = off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
+            let coherent = wordy_chars * 2 >= total_chars.max(1) && !straddles;
             if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
                 let before = items.len();
                 items.retain(|it| !outside(it));
