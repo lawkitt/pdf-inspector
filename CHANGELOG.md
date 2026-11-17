@@ -129,8 +129,9 @@ version and date. Earlier releases are described in their
 - Text outside the visible page box is left out however little of it there
   is: a single off-page phrase on a page with a nonzero CropBox no longer
   reaches the text, as a neighbouring page's paragraphs already did not.
-  Short glyph fragments out of the box and runs continuing an on-page line
-  still stay. ([#437](https://github.com/firecrawl/pdf-inspector/pull/437),
+  Short glyph fragments out of the box, runs continuing an on-page line on
+  either side, and runs the crop edge cuts through (partly visible) still
+  stay. ([#437](https://github.com/firecrawl/pdf-inspector/pull/437),
   ported: the threshold change only; the fork already clips turned pages)
 - A page of decodable native text whose form rules are dotted lines drawn
   as thousands of tiny shapes is no longer taken for vector-outlined text:
