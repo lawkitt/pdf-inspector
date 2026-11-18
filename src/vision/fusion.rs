@@ -3933,6 +3933,64 @@ mod tests {
         scanned
     }
 
+    /// [`scanned_page`] on a 600 x 1000 pt page rendered 300 x 500 px,
+    /// with its header's box `header_top_px` from the top.
+    fn tall_scanned_page(page: u32, header: &str, header_top_px: f32) -> RoutedOcrPage {
+        let mut scanned = tall_sparse_scanned_page(page, &[(header, header_top_px)]);
+        for line in 0..16u32 {
+            let top = 160.0 + line as f32 * 18.0;
+            scanned.ocr.spans.push(positioned_span(
+                &format!("Страница {page}, строка {line}: условия договора поставки."),
+                30.0,
+                top,
+                270.0,
+                top + 9.0,
+            ));
+        }
+        scanned
+    }
+
+    #[test]
+    fn page_runs_follow_the_edge_the_full_pages_agree_on() {
+        // Codex on mdoc#959: pages 1-3 are 800 pt tall, page 4 is 1000 pt,
+        // all with the header's foot at y=758: 42 pt below the top on the
+        // short pages, 242 pt on the tall one. From the top they average to
+        // 92 pt, a place no page uses; from the bottom they agree. On sparse
+        // page 5 (800 pt) the sentence 92 pt below the top is body text and
+        // stays; at the header's real place it goes.
+        let header = "Please sign and return this form";
+        let pages = |top_px: f32| {
+            move || {
+                let mut pages: Vec<RoutedOcrPage> = (1..=3)
+                    .map(|page| scanned_page(page, Some(header), 9.0))
+                    .collect();
+                pages.push(tall_scanned_page(4, header, 112.0));
+                pages.push(sparse_scanned_page(
+                    5,
+                    &[(header, top_px), ("Thank you for your order", 220.0)],
+                ));
+                pages
+            }
+        };
+        let natives = scanned_natives(5);
+        let whole = assert_page_runs_match_one_run(
+            pages(37.0),
+            &natives,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, header), [1, 5]);
+        assert_eq!(repeated_lines(&whole), [0, 1, 1, 1, 0]);
+        let whole = assert_page_runs_match_one_run(
+            pages(12.0),
+            &natives,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, header), [1]);
+        assert_eq!(repeated_lines(&whole), [0, 1, 1, 1, 1]);
+    }
+
     #[test]
     fn page_runs_judge_a_sparse_page_of_another_size_from_its_edge() {
         // Codex on #22: pages 1-3 are 800 pt tall with the header 24 pt

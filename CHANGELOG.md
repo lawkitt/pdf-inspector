@@ -95,7 +95,11 @@ version and date. Earlier releases are described in their
   edge (a footer), so pages of another size compare, within 5% of the full
   pages' span, the tolerance their own positions must keep. The same
   sentence elsewhere on that page is body text and stays, uncounted. Before,
-  it was removed and counted wherever it stood.
+  it was removed and counted wherever it stood. The edge is the one the
+  full pages keep the row at a steady distance from (within the same 5%):
+  full pages of mixed sizes with the header at one height agree from the
+  bottom, not from the top, and when they agree on neither edge a sparse
+  page loses nothing.
 - Repeated headers and footers need at least 30% of the pages, rounded up,
   as the rule states: on 11 pages, 4 pages, not 3.
 - Repeated headers and footers: a page whose native text never reaches the

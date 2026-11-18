@@ -703,30 +703,52 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // `key`: within the same share of the full pages' span of its mean
     // place. A sparse page has no edge rows to judge by, so this is its only
     // position check. With every frame known, the place is the distance
-    // from the edge the row keeps to (the top for a header, the bottom for
-    // a footer), so pages of other sizes compare; without, the height.
+    // from the edge the full pages keep the row at: the top or the bottom,
+    // whichever they agree on (spread within the same share), the nearer
+    // one when they agree on both. Full pages of mixed sizes with the row at
+    // one height agree on neither, or on the bottom only: a distance from
+    // the top averaged over them is a place no page uses. When they agree on
+    // neither edge, a sparse page loses nothing. Without frames, the height.
     let at_learned_position = |key: &str, page: u32, y: f32| -> bool {
         let Some(seen) = placements.get(key).filter(|seen| !seen.is_empty()) else {
             return false;
         };
-        let mean = |values: &mut dyn Iterator<Item = f32>| {
-            let (sum, count) = values.fold((0.0, 0usize), |(sum, count), v| (sum + v, count + 1));
-            sum / count as f32
+        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        let agree = |values: &[f32]| {
+            let center = mean(values);
+            let variance =
+                values.iter().map(|v| (v - center).powi(2)).sum::<f32>() / values.len() as f32;
+            variance.sqrt() / full_page_span < POSITION_TOLERANCE
         };
+        let close = |offset: f32| offset.abs() / full_page_span < POSITION_TOLERANCE;
         let frames: Option<Vec<(f32, (f32, f32))>> = seen
             .iter()
             .map(|&(seen_page, seen_y)| page_frames.get(&seen_page).map(|&f| (seen_y, f)))
             .collect();
-        let offset = match (frames, page_frames.get(&page)) {
-            (Some(frames), Some(&(bottom, top))) if frames.iter().all(|(_, (b, t))| t > b) => {
-                let header = mean(&mut frames.iter().map(|&(y, (b, t))| (y - b) / (t - b))) > 0.5;
-                let from_edge = |y: f32, (b, t): (f32, f32)| if header { t - y } else { y - b };
-                let learned = mean(&mut frames.iter().map(|&(y, frame)| from_edge(y, frame)));
-                from_edge(y, (bottom, top)) - learned
+        match (frames, page_frames.get(&page)) {
+            (Some(frames), Some(&(bottom, top)))
+                if top > bottom && frames.iter().all(|(_, (b, t))| t > b) =>
+            {
+                let from_top: Vec<f32> = frames.iter().map(|&(y, (_, t))| t - y).collect();
+                let from_bottom: Vec<f32> = frames.iter().map(|&(y, (b, _))| y - b).collect();
+                let edge = match (agree(&from_top), agree(&from_bottom)) {
+                    (true, true) if mean(&from_top) <= mean(&from_bottom) => Some(true),
+                    (true, true) => Some(false),
+                    (true, false) => Some(true),
+                    (false, true) => Some(false),
+                    (false, false) => None,
+                };
+                match edge {
+                    Some(true) => close((top - y) - mean(&from_top)),
+                    Some(false) => close((y - bottom) - mean(&from_bottom)),
+                    None => false,
+                }
             }
-            _ => y - mean(&mut seen.iter().map(|&(_, seen_y)| seen_y)),
-        };
-        offset.abs() / full_page_span < POSITION_TOLERANCE
+            _ => {
+                let heights: Vec<f32> = seen.iter().map(|&(_, seen_y)| seen_y).collect();
+                close(y - mean(&heights))
+            }
+        }
     };
 
     // Identify candidates from individual frequency map
@@ -1928,6 +1950,42 @@ mod tests {
         assert_eq!(header_pages(&with_page_4(750.0), header), [1, 4]);
         // 42 pt below Legal's top it is the header.
         assert_eq!(header_pages(&with_page_4(966.0), header), [1]);
+    }
+
+    #[test]
+    fn a_sparse_page_follows_the_edge_the_full_pages_agree_on() {
+        // Codex on mdoc#959: Letter pages 1-3 and a Legal page 4 carry the
+        // header at y=750, the same height: 42 pt below the top on Letter,
+        // 258 pt on Legal. Their distance from the top averages to 96 pt, a
+        // place no page uses; from the bottom they agree (750 pt).
+        let header = "Please sign and return this form";
+        let letter_and_legal = |legal_bottom: f32| -> HashMap<u32, (f32, f32)> {
+            (1..=5)
+                .map(|page| {
+                    let frame = if page == 4 {
+                        (legal_bottom, legal_bottom + 1008.0)
+                    } else {
+                        (0.0, 792.0)
+                    };
+                    (page, frame)
+                })
+                .collect()
+        };
+        let with_page_5 = |y: f32, frames: &HashMap<u32, (f32, f32)>| {
+            let mut lines = headed_pages(4, |_| header.into());
+            lines.push(make_line(header, 10.0, 5, y, None));
+            lines.push(make_line("Thank you for your order", 10.0, 5, 380.0, None));
+            strip_repeated_lines_in_frames(lines, 5, frames)
+        };
+        let frames = letter_and_legal(0.0);
+        // 96 pt below the top of sparse Letter page 5: body text, kept.
+        assert_eq!(header_pages(&with_page_5(696.0, &frames), header), [1, 5]);
+        // At the header's real place, 750 pt from the bottom: removed.
+        assert_eq!(header_pages(&with_page_5(750.0, &frames), header), [1]);
+        // A Legal box raised by 100 pt: the full pages agree on neither
+        // edge, so a sparse page loses nothing.
+        let frames = letter_and_legal(100.0);
+        assert_eq!(header_pages(&with_page_5(750.0, &frames), header), [1, 5]);
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header(page)`.
