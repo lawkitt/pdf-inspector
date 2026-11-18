@@ -108,8 +108,8 @@ const ESCALATION_MINIMUM_REGIONS: usize = 80;
 const ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 15.0;
 
 /// A page is on its side when at least this many detected lines run
-/// vertically...
-const SIDEWAYS_MINIMUM_LINES: usize = 3;
+/// vertically (a sideways note of two lines is still a page on its side)...
+const SIDEWAYS_MINIMUM_LINES: usize = 2;
 
 /// ...and they outnumber the horizontal lines by more than this factor. A
 /// line counts in either direction only when it is at least
@@ -550,12 +550,34 @@ impl OarOcrEngine {
         // so it is always checked; an unturned page only when it reads
         // poorly.
         let checked = turns != 0 || mean_region_confidence(&regions) < UPSIDE_DOWN_CHECK_CONFIDENCE;
+        let mut retry_failed = false;
         if checked && reads_upside_down(&image, &regions, worker)? {
-            turns += 2;
-            image = Arc::new(image::imageops::rotate180(&*image));
-            boxes = self.detect_boxes(page, &image, worker)?;
-            regions = recognize_regions(&image, boxes, worker)?;
+            // The sample says half turned; the whole page turned must agree
+            // before it replaces the first reading, which is kept if the
+            // retry fails.
+            let flipped = Arc::new(image::imageops::rotate180(&*image));
+            match self
+                .detect_boxes(page, &flipped, worker)
+                .and_then(|boxes| recognize_regions(&flipped, boxes, worker))
+            {
+                Ok(flipped_regions) if reads_better(&flipped_regions, &regions) => {
+                    turns += 2;
+                    image = flipped;
+                    regions = flipped_regions;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::warn!(
+                        "page {}: half-turned retry failed, keeping the first reading: {error}",
+                        page.page()
+                    );
+                    retry_failed = true;
+                }
+            }
         }
+        // Judged on every region, before the confidence filter below drops
+        // the weak ones.
+        let checked_confidence = mean_region_confidence(&regions);
         let (turned_width, turned_height) = image.dimensions();
         drop(image);
 
@@ -621,8 +643,13 @@ impl OarOcrEngine {
         warnings.extend(orientation_warning(
             orientation_degrees,
             checked,
-            mean_confidence,
+            Some(checked_confidence),
         ));
+        if retry_failed {
+            warnings.push(
+                "page text may be upside down; reading it turned half round failed".to_string(),
+            );
+        }
         let processing_time_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         Ok(OcrPage {
@@ -753,6 +780,19 @@ fn mean_region_confidence(regions: &[RecognizedRegion]) -> f32 {
     } else {
         recognized.iter().sum::<f32>() / recognized.len() as f32
     }
+}
+
+/// True when `candidate` reads better than `current`: a higher mean
+/// confidence over at least half as many recognized regions.
+fn reads_better(candidate: &[RecognizedRegion], current: &[RecognizedRegion]) -> bool {
+    let recognized = |regions: &[RecognizedRegion]| {
+        regions
+            .iter()
+            .filter(|region| matches!(region.outcome, RegionOutcome::Recognized { .. }))
+            .count()
+    };
+    mean_region_confidence(candidate) > mean_region_confidence(current)
+        && recognized(candidate) * 2 >= recognized(current)
 }
 
 /// Length and thickness of a detected region: its longer and shorter edge,
@@ -1918,9 +1958,9 @@ mod tests {
             .collect();
         assert!(lines_run_vertically(&sideways));
 
-        // Three is the least that counts.
-        assert!(!lines_run_vertically(&sideways[..2]));
-        assert!(lines_run_vertically(&sideways[..3]));
+        // Two is the least that counts.
+        assert!(!lines_run_vertically(&sideways[..1]));
+        assert!(lines_run_vertically(&sideways[..2]));
     }
 
     #[test]
@@ -2003,6 +2043,33 @@ mod tests {
         // A page read at 0.9 or better is never checked.
         assert_eq!(orientation_warning(None, false, Some(0.7)), None);
         assert_eq!(orientation_warning(None, true, Some(0.85)), None);
+    }
+
+    #[test]
+    fn a_turn_replaces_the_first_reading_only_when_it_reads_better() {
+        let regions = |confidences: &[Option<f32>]| -> Vec<RecognizedRegion> {
+            confidences
+                .iter()
+                .map(|confidence| RecognizedRegion {
+                    bounding_box: rectangle(0.0, 0.0, 100.0, 10.0),
+                    outcome: match confidence {
+                        Some(confidence) => RegionOutcome::Recognized {
+                            text: "a".to_string(),
+                            confidence: *confidence,
+                        },
+                        None => RegionOutcome::Unrecognized,
+                    },
+                })
+                .collect()
+        };
+        let first = regions(&[Some(0.6), Some(0.6), Some(0.6), Some(0.6)]);
+        assert!(reads_better(&regions(&[Some(0.95); 4]), &first));
+        // Fewer regions read (a few long stamps) at higher confidence: no.
+        assert!(!reads_better(
+            &regions(&[Some(0.95), None, None, None]),
+            &first
+        ));
+        assert!(!reads_better(&regions(&[Some(0.5); 4]), &first));
     }
 
     #[test]
