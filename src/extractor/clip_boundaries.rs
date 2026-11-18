@@ -111,11 +111,51 @@ pub(super) struct ClipTracker {
     text_clip_pending: bool,
 }
 
+/// The clip a paint is cut by, for `hidden_paint`: none, a known
+/// rectangle (`[left, bottom, right, top]`), or a clip whose shape is not
+/// known — which may cut any part of a paint away.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum ClipBounds {
+    None,
+    Rect([f32; 4]),
+    Unknown,
+}
+
 impl ClipTracker {
     pub(super) fn rect(&self) -> Option<ClipRect> {
         match self.active {
             Clip::Rect(rect) if !self.text_clip_pending => Some(rect),
             _ => None,
+        }
+    }
+
+    /// A tracker whose clip starts as `bounds`: the clip a form XObject
+    /// inherits from the stream that invokes it.
+    pub(super) fn starting_with(bounds: ClipBounds) -> Self {
+        let active = match bounds {
+            ClipBounds::None => Clip::Unbounded,
+            ClipBounds::Rect([left, bottom, right, top]) => Clip::Rect(ClipRect {
+                left,
+                bottom,
+                right,
+                top,
+            }),
+            ClipBounds::Unknown => Clip::Unknown,
+        };
+        Self {
+            active,
+            ..Self::default()
+        }
+    }
+
+    /// The clip in force for a paint, before the current operator applies
+    /// any clip of its own.
+    pub(super) fn bounds(&self) -> ClipBounds {
+        match self.active {
+            _ if self.text_clip_pending => ClipBounds::Unknown,
+            Clip::Unbounded => ClipBounds::None,
+            Clip::Rect(r) => ClipBounds::Rect([r.left, r.bottom, r.right, r.top]),
+            Clip::Unknown => ClipBounds::Unknown,
         }
     }
 

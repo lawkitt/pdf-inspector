@@ -213,6 +213,39 @@ pub struct PageRepeatedLines {
     pub lines: u32,
 }
 
+/// The text a single 1-indexed page paints where no reader can see it, which
+/// the Markdown leaves out.
+///
+/// A run is hidden when every colour it paints with is within
+/// [`HIDDEN_TEXT_COLOUR_TOLERANCE`] on each 8-bit sRGB channel of what lies
+/// under its whole box — white on the unpainted page, white on a white
+/// fill, red on a red band — or when a later opaque solid fill or opaque
+/// image covers its whole box. Conservative: text over an image, a
+/// shading or anything else whose colour is not read stays,
+/// whatever its own colour, as does text in a colour space or font (Type3)
+/// whose colours are not read, rotated text, text in optional content and
+/// text under a translucent, blended or masked paint. Render-mode-3 text is
+/// left out separately and not counted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageHiddenText {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// How many stretches of hidden text the page's text leaves out, counted
+    /// as for [`PageInvisibleText`]: hidden text with nothing kept between
+    /// its parts counts once, however many runs it spans, and visible text
+    /// or an image between hidden runs starts a new stretch. Text of spaces
+    /// only counts nothing. Stretches rather than characters or runs:
+    /// producers split text into runs arbitrarily, and the unit matches the
+    /// invisible-text and hidden Word text counts, so a caller can add them.
+    pub stretches: u32,
+}
+
+/// The widest difference, on any 8-bit sRGB channel, between a text run's
+/// colour and what lies under it for [`PageHiddenText`] to call the run
+/// hidden: 6 of 255, about 2.4 %. 0.98 gray on white is hidden; 0.96 gray
+/// stays.
+pub const HIDDEN_TEXT_COLOUR_TOLERANCE: u8 = extractor::hidden_paint::SAME_COLOUR_TOLERANCE;
+
 /// The shortest side, in points, an image must be drawn at to count in
 /// [`PageImages`]: about 1.4 mm.
 pub const MIN_COUNTED_IMAGE_SIDE_PT: f32 = 4.0;
@@ -626,6 +659,9 @@ pub struct PagesExtractionResult {
     /// The requested pages whose text leaves out invisible (render mode 3)
     /// text, with how many stretches, in request order.
     pub invisible_text_by_page: Vec<PageInvisibleText>,
+    /// The requested pages that left hidden text out of their Markdown,
+    /// with how much, in request order (see [`PageHiddenText`]).
+    pub hidden_text_by_page: Vec<PageHiddenText>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -737,6 +773,7 @@ fn extract_pages_markdown_mem_impl(
         _page_rotations,
         _,
         invisible_text_by_page,
+        hidden_text,
     ) = if let Some(required_pages) = required_pages.as_ref() {
         extractor::extract_positioned_text_for_document_analysis(&doc, &font_cmaps, required_pages)?
     } else {
@@ -796,6 +833,7 @@ fn extract_pages_markdown_mem_impl(
     let mut images_by_page = Vec::new();
     let mut form_field_names_by_page = Vec::new();
     let mut invisible_text_pages = Vec::new();
+    let mut hidden_text_by_page = Vec::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
@@ -900,6 +938,12 @@ fn extract_pages_markdown_mem_impl(
                 names,
             });
         }
+        if let Some(hidden) = hidden_text.get(&page_1idx) {
+            hidden_text_by_page.push(PageHiddenText {
+                page: page_1idx,
+                stretches: hidden.stretches,
+            });
+        }
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -997,6 +1041,7 @@ fn extract_pages_markdown_mem_impl(
             images_by_page,
             form_field_names_by_page,
             invisible_text_by_page: invisible_text_pages,
+            hidden_text_by_page,
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -4898,7 +4943,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4974,6 +5019,7 @@ fn process_document(
             _page_rotations,
             cmap_coverage,
             _invisible_text_by_page,
+            _hidden_text,
         )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 

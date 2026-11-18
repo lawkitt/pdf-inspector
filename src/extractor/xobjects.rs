@@ -1,6 +1,7 @@
 //! Form XObject and image XObject extraction.
 
 use super::fonts::{font_style, FontStyle};
+use super::hidden_paint::{PaintLog, ShownRun};
 use super::invisible::{blank_show, InvisibleText};
 use super::text_paint::{PaintResources, TextPaint};
 use crate::text_utils::{effective_font_size, expand_ligatures};
@@ -199,6 +200,9 @@ pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
     /// The CMap coverage of each item, parallel to `items`.
     pub(crate) item_coverage: ItemCoverage,
+    /// How each item was shown against what the page had painted, parallel
+    /// to `items` (see `hidden_paint`).
+    pub(crate) item_runs: Vec<ShownRun>,
     pub(crate) rtl_visual_candidates: Vec<usize>,
     pub(crate) rtl_logical_runs: Vec<usize>,
     /// Indexes of the items shown by visible ops of several RTL letters
@@ -219,6 +223,7 @@ impl ExtractedText {
         Self {
             items: Vec::new(),
             item_coverage: Vec::new(),
+            item_runs: Vec::new(),
             rtl_visual_candidates: Vec::new(),
             rtl_logical_runs: Vec::new(),
             rtl_visual_runs: Vec::new(),
@@ -236,6 +241,7 @@ impl ExtractedText {
         self,
         items: &mut Vec<TextItem>,
         item_coverage: &mut ItemCoverage,
+        item_runs: &mut Vec<ShownRun>,
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_runs: &mut Vec<usize>,
         rtl_visual_runs: &mut Vec<usize>,
@@ -249,8 +255,11 @@ impl ExtractedText {
         run_rotations.extend(self.run_rotations);
         invisible.absorb(self.invisible, base);
         debug_assert_eq!(self.items.len(), self.item_coverage.len());
+        debug_assert_eq!(self.items.len(), self.item_runs.len());
+        debug_assert_eq!(items.len(), item_runs.len());
         items.extend(self.items);
         item_coverage.extend(self.item_coverage);
+        item_runs.extend(self.item_runs);
     }
 }
 
@@ -274,6 +283,7 @@ pub(crate) fn extract_form_xobject_text(
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
+    paint_log: &mut PaintLog,
 ) -> ExtractedText {
     extract_form_xobject_text_inner(
         doc,
@@ -294,6 +304,7 @@ pub(crate) fn extract_form_xobject_text(
         style_cache,
         0,
         budget,
+        paint_log,
     )
 }
 
@@ -317,6 +328,7 @@ fn extract_form_xobject_text_inner(
     style_cache: &mut FontStyleCache,
     depth: u8,
     budget: &mut FormWalkBudget,
+    paint_log: &mut PaintLog,
 ) -> ExtractedText {
     let mut extracted = ExtractedText::new();
 
@@ -366,6 +378,7 @@ fn extract_form_xobject_text_inner(
     };
     let items = &mut extracted.items;
     let item_coverage = &mut extracted.item_coverage;
+    let item_runs = &mut extracted.item_runs;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_runs = &mut extracted.rtl_logical_runs;
     let rtl_visual_runs = &mut extracted.rtl_visual_runs;
@@ -524,15 +537,41 @@ fn extract_form_xobject_text_inner(
     }
     let mut ctm_stack: Vec<GraphicsState> = Vec::new();
 
+    // What the form paints joins the page's log, cut by the clip it was
+    // invoked under and its bounding box; its runs are judged against it
+    // like the page's own (see `hidden_paint`).
+    let type3_fonts: std::collections::HashSet<String> = form_fonts
+        .iter()
+        .filter(|(_, font)| {
+            font.get(b"Subtype")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .is_some_and(|subtype| subtype == b"Type3")
+        })
+        .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+        .collect();
+    paint_log.enter_form(doc, &stream.dict, &base_ctm);
+    let mut shown_run = paint_log.unjudged();
+    let mut walked_all = true;
+
     for op in &content.operations {
         // The coverage of the preceding operator's decodes goes to the first
         // item it appended (see `attach_run_coverage`).
         attach_run_coverage(item_coverage, items.len(), || {
             cmap_decisions.take_run_coverage()
         });
+        item_runs.resize(items.len(), shown_run);
         if !budget.charge_operation() {
+            walked_all = false;
             break;
         }
+        paint_log.observe_in_form(&op.operator, &op.operands, &ctm, text_paint.run_paint());
+        shown_run = match op.operator.as_str() {
+            "Tj" | "TJ" | "'" | "\"" => {
+                paint_log.shown_run(text_paint.run_paint(), type3_fonts.contains(&current_font))
+            }
+            _ => paint_log.unjudged(),
+        };
         text_paint.observe(&op.operator, &op.operands, &paint_resources);
         match op.operator.as_str() {
             "q" => {
@@ -603,10 +642,12 @@ fn extract_form_xobject_text_inner(
                                         style_cache,
                                         depth + 1,
                                         budget,
+                                        paint_log,
                                     )
                                     .append_into(
                                         items,
                                         item_coverage,
+                                        item_runs,
                                         rtl_visual_candidates,
                                         rtl_logical_runs,
                                         rtl_visual_runs,
@@ -816,9 +857,13 @@ fn extract_form_xobject_text_inner(
                     {
                         invisible_text.skip(items.len(), blank_show(raw));
                     }
-                    if crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
-                        || invisible
-                    {
+                    // Text painted with the fill is judged against what lies
+                    // under it once the page is walked (see `hidden_paint`);
+                    // clipping-only text under a white fill keeps its old
+                    // rule and is skipped here.
+                    let clip_only_under_white = text_rendering_mode == 7
+                        && crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white);
+                    if clip_only_under_white || invisible {
                         if let Some(font_info) = font_widths.get(&current_font) {
                             if let Some(raw_bytes) = get_operand_bytes(show_operand) {
                                 let w_ts = compute_string_width_ts(
@@ -1043,9 +1088,14 @@ fn extract_form_xobject_text_inner(
                             let blank = array.iter().filter_map(get_operand_bytes).all(blank_show);
                             invisible_text.skip(items.len(), blank);
                         }
-                        let hidden =
-                            crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
-                                || invisible;
+                        // As for `Tj`: only clipping-only text under a white
+                        // fill is skipped here.
+                        let hidden = (text_rendering_mode == 7
+                            && crate::text_utils::white_fill_hides(
+                                text_rendering_mode,
+                                fill_is_white,
+                            ))
+                            || invisible;
                         let font_info = font_widths.get(&current_font);
 
                         // Word-space threshold for `TJ` offsets and character
@@ -1518,6 +1568,8 @@ fn extract_form_xobject_text_inner(
     attach_run_coverage(item_coverage, items.len(), || {
         cmap_decisions.take_run_coverage()
     });
+    item_runs.resize(items.len(), shown_run);
+    paint_log.leave_form(walked_all);
 
     extracted
 }
@@ -1679,6 +1731,7 @@ mod tests {
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,
+            &mut PaintLog::detached(),
         )
         .items
     }

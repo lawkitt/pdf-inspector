@@ -23,6 +23,7 @@ use super::geometry::{
     advanced_tm, estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees,
     reading_direction, rise_adjusted, scaled_run_geometry, PageRotation, RunGeometry,
 };
+use super::hidden_paint::{drop_hidden_runs, HiddenText, PaintLog, ShownRun, SpanRuns};
 use super::invisible::{blank_show, InvisibleText};
 use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
@@ -636,14 +637,24 @@ pub(crate) fn extract_page_text_items(
         form_budget,
     )
     .map(
-        |(extraction, has_gid_fonts, rotation, invisible, _coverage)| {
+        |(extraction, has_gid_fonts, rotation, invisible, _coverage, _hidden)| {
             (extraction, has_gid_fonts, rotation, invisible.any())
         },
     )
 }
 
+/// What [`extract_page_text_items_with_options`] returns for one page.
+pub(crate) type PageTextExtraction = (
+    PageExtraction,
+    bool,
+    PageRotation,
+    InvisibleText,
+    Vec<RunCoverage>,
+    HiddenText,
+);
+
 /// Returns `(page_extraction, has_gid_fonts, page_rotation, invisible_text,
-/// run_coverage)` where `has_gid_fonts` indicates the page uses fonts with
+/// run_coverage, hidden_text)` where `has_gid_fonts` indicates the page uses fonts with
 /// unresolvable gid-encoded glyphs, `page_rotation` says whether (and which
 /// way) the coordinate frame was turned so predominantly rotated text reads
 /// along +x — region boxes must follow it (see `PageRotation`) —
@@ -654,7 +665,9 @@ pub(crate) fn extract_page_text_items(
 /// of text, the codes the run showed through its font's CMap and how many
 /// of them the CMap had no entry for, with the run's geometry in the
 /// items' frame so a caller that leaves runs out can leave their codes
-/// out too.
+/// out too, and `hidden_text` counts the runs left out because they are
+/// drawn in the colour of what lies under them or covered by a later
+/// opaque paint (see `hidden_paint`).
 pub(crate) fn extract_page_text_items_with_options(
     doc: &Document,
     page_id: ObjectId,
@@ -663,16 +676,7 @@ pub(crate) fn extract_page_text_items_with_options(
     options: TextExtractionOptions,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
-) -> Result<
-    (
-        PageExtraction,
-        bool,
-        PageRotation,
-        InvisibleText,
-        Vec<RunCoverage>,
-    ),
-    PdfError,
-> {
+) -> Result<PageTextExtraction, PdfError> {
     let include_invisible = options.include_invisible;
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
@@ -823,6 +827,7 @@ pub(crate) fn extract_page_text_items_with_options(
                 PageRotation::Upright,
                 InvisibleText::default(),
                 Vec::new(),
+                HiddenText::default(),
             ));
         }
     };
@@ -849,6 +854,7 @@ pub(crate) fn extract_page_text_items_with_options(
                 PageRotation::Upright,
                 InvisibleText::default(),
                 Vec::new(),
+                HiddenText::default(),
             ));
         }
     };
@@ -933,6 +939,23 @@ pub(crate) fn extract_page_text_items_with_options(
 
     let mut clips = super::clip_boundaries::ClipTracker::default();
     let mut item_clips = Vec::new();
+    // What the page has painted so far, and how each item was shown against
+    // it, parallel to `items` like its clip (see `hidden_paint`).
+    let mut paint_log = PaintLog::page(doc, page_id);
+    let mut item_runs: Vec<ShownRun> = Vec::new();
+    let mut shown_run = ShownRun::default();
+    let mut span_runs: Option<SpanRuns> = None;
+    // Type3 glyphs may paint in colours of their own.
+    let type3_fonts: std::collections::HashSet<String> = fonts
+        .iter()
+        .filter(|(_, font)| {
+            font.get(b"Subtype")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .is_some_and(|subtype| subtype == b"Type3")
+        })
+        .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+        .collect();
     // The CMap coverage of each item, parallel to `items` like its clip.
     let mut item_coverage: ItemCoverage = Vec::new();
     let mut shown_clip = None;
@@ -940,9 +963,40 @@ pub(crate) fn extract_page_text_items_with_options(
         // Record all items appended by the preceding operator, including paths
         // that continue the loop early. Forms and ActualText remain unproven.
         item_clips.resize(items.len(), shown_clip);
+        item_runs.resize(items.len(), shown_run);
         attach_run_coverage(&mut item_coverage, items.len(), || {
             cmap_decisions.take_run_coverage()
         });
+        paint_log.observe(
+            &op.operator,
+            &op.operands,
+            &ctm,
+            clips.bounds(),
+            text_paint.run_paint(),
+        );
+        shown_run = match op.operator.as_str() {
+            "Tj" | "TJ" | "'" | "\"" => {
+                paint_log.shown_run(text_paint.run_paint(), type3_fonts.contains(&current_font))
+            }
+            _ => paint_log.unjudged(),
+        };
+        // An ActualText span emits its replacement at EMC, in place of its
+        // glyphs: it is judged as they were shown.
+        match op.operator.as_str() {
+            "Tj" | "TJ" | "'" | "\"" if suppress_glyph_extraction => {
+                span_runs.get_or_insert_default().glyph(shown_run);
+            }
+            "EMC"
+                if marked_content_stack
+                    .last()
+                    .is_some_and(|entry| entry.actual_text.is_some()) =>
+            {
+                shown_run = span_runs
+                    .take()
+                    .map_or_else(|| paint_log.unjudged(), |span| span.close(&paint_log));
+            }
+            _ => {}
+        }
         clips.observe(&op.operator, &op.operands, ctm);
         shown_clip = match op.operator.as_str() {
             "Tj" | "TJ" | "'" | "\"" => clips.rect(),
@@ -2329,10 +2383,12 @@ pub(crate) fn extract_page_text_items_with_options(
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
+                                        &mut paint_log,
                                     )
                                     .append_into(
                                         &mut items,
                                         &mut item_coverage,
+                                        &mut item_runs,
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_runs,
                                         &mut rtl_visual_runs,
@@ -2894,6 +2950,7 @@ pub(crate) fn extract_page_text_items_with_options(
     }
 
     item_clips.resize(items.len(), shown_clip);
+    item_runs.resize(items.len(), shown_run);
     attach_run_coverage(&mut item_coverage, items.len(), || {
         cmap_decisions.take_run_coverage()
     });
@@ -2955,6 +3012,31 @@ pub(crate) fn extract_page_text_items_with_options(
         if let Some(flag) = replaced_text.get_mut(index) {
             *flag = true;
         }
+    }
+    // Runs drawn in the colour of what lies under them, or covered by a
+    // later opaque paint, show nothing either. Like render-mode-3 text they
+    // come back with `include_invisible`; unlike it they are counted for
+    // the caller (see `hidden_paint`). Before the clip test, which leaves
+    // out runs that are not on the page at all and must not count here.
+    paint_log.finish();
+    let hidden_text = if include_invisible {
+        HiddenText::default()
+    } else {
+        drop_hidden_runs(
+            &mut items,
+            &mut item_clips,
+            &mut replaced_text,
+            &mut item_coverage,
+            &item_runs,
+            &paint_log,
+        )
+    };
+    if hidden_text.runs > 0 {
+        log::debug!(
+            "page {page_num}: {} hidden text run(s) in {} stretch(es) left out",
+            hidden_text.runs,
+            hidden_text.stretches
+        );
     }
     let dropped = super::clip_boundaries::drop_clipped_away_runs(
         &mut items,
@@ -3026,6 +3108,7 @@ pub(crate) fn extract_page_text_items_with_options(
         page_rotation,
         invisible_text,
         run_coverage,
+        hidden_text,
     ))
 }
 
@@ -3350,7 +3433,7 @@ mod tests {
         cmap_coverage: bool,
     ) -> (Vec<TextItem>, Vec<crate::types::RunCoverage>) {
         let font_cmaps = crate::tounicode::FontCMaps::from_doc(doc);
-        let ((items, _, _), _, _, _, run_coverage) = extract_page_text_items_with_options(
+        let ((items, _, _), _, _, _, run_coverage, _) = extract_page_text_items_with_options(
             doc,
             page_id,
             1,
@@ -4680,10 +4763,13 @@ end"#;
     fn white_logical_order_hebrew_ops_cast_no_visual_vote() {
         // White text is not seen: like an invisible layer, logical-order
         // runs placed right to left in white cast no visual-storage vote
-        // and keep their reading.
+        // and keep their reading. White on the bare page they are left out
+        // (see `hidden_paint`); read with `include_invisible`, as the
+        // invisible-layer retry reads them, they come back unreversed.
         let content =
             b"BT 1 g /F1 12 Tf 1 0 0 1 160 700 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
-        let items = extract_hebrew_items(content);
+        assert!(extract_hebrew_items(content).is_empty());
+        let items = extract_hebrew_items_with(content, true);
         assert_eq!(items.len(), 2);
         for item in &items {
             assert_eq!(
