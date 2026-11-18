@@ -16,8 +16,9 @@ use crate::{
 };
 
 use super::fusion::{
-    assess_native_candidate, fuse_ocr_pages_adaptive_with_routes, NativeCandidateOrigin,
-    NativeFallbackCandidate, OcrFusionRoute,
+    assess_native_candidate, fuse_ocr_pages_adaptive_with_routes,
+    repeat_evidence as repeat_evidence_of, NativeCandidateOrigin, NativeFallbackCandidate,
+    OcrFusionRoute,
 };
 use super::image_analysis::region_has_document_like_ink;
 use super::oar::onnx_runtime_library_path;
@@ -26,8 +27,8 @@ use super::{
     route_ocr_pages, run_ocr_pages, FusedPageMarkdown, FusedPages, HttpModelDownloadError,
     HttpModelDownloader, ModelAcquireError, ModelManifest, ModelStore, ModelStoreError,
     OarOcrEngine, OarOcrError, OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions,
-    OcrPage, OcrRoutingError, OcrRun, OcrRunError, PageRenderer, PdfiumRenderer, RenderError,
-    RenderOptions, PP_OCR_V6_SMALL,
+    OcrPage, OcrRepeatEvidence, OcrRoutingError, OcrRun, OcrRunError, PageRenderer, PdfiumRenderer,
+    RenderError, RenderOptions, PP_OCR_V6_SMALL,
 };
 
 /// Bounds live rendered-page memory while preserving small OCR batches.
@@ -84,6 +85,12 @@ pub struct OcrPdfOptions {
     /// Retain raw recognition evidence before native fusion, for local QA.
     /// Disabled by default to avoid retaining extra text in normal conversion.
     pub retain_recognition: bool,
+    /// Keep each recognized page's [`OcrRepeatEvidence`] in
+    /// [`OcrPdfResult::repeat_evidence`], for a caller that recognizes a
+    /// document in several calls and then runs the repeated header/footer
+    /// pass across them ([`strip_repeats_across_pages`](super::strip_repeats_across_pages)).
+    /// Disabled by default; it changes nothing else in the result.
+    pub retain_repeat_evidence: bool,
     /// Weak OCR threshold for recommending the hosted pipeline.
     ///
     /// Pages with incomplete native coverage may also recommend the hosted
@@ -104,6 +111,7 @@ impl Default for OcrPdfOptions {
             password: None,
             hosted_recommendation_confidence: 0.5,
             retain_recognition: false,
+            retain_repeat_evidence: false,
         }
     }
 }
@@ -120,6 +128,7 @@ impl std::fmt::Debug for OcrPdfOptions {
             .field("markdown", &self.markdown)
             .field("page_numbers", &self.page_numbers)
             .field("retain_recognition", &self.retain_recognition)
+            .field("retain_repeat_evidence", &self.retain_repeat_evidence)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .field(
                 "hosted_recommendation_confidence",
@@ -181,6 +190,13 @@ impl OcrPdfOptions {
         self.hosted_recommendation_confidence = confidence;
         self
     }
+
+    /// Keeps each recognized page's repeat evidence; see
+    /// [`retain_repeat_evidence`](Self::retain_repeat_evidence).
+    pub fn retain_repeat_evidence(mut self, retain: bool) -> Self {
+        self.retain_repeat_evidence = retain;
+        self
+    }
 }
 
 /// Complete native/OCR Markdown output for a PDF request.
@@ -188,6 +204,12 @@ impl OcrPdfOptions {
 pub struct OcrPdfResult {
     /// Raw recognition evidence, before fusion; empty unless explicitly requested.
     pub recognition: Vec<OcrPage>,
+    /// With [`OcrPdfOptions::retain_repeat_evidence`] (and
+    /// `MarkdownOptions::strip_headers_footers`, the default), the evidence
+    /// of every recognized page that takes part in the repeated
+    /// header/footer pass, in page order: full-page OCR whose content is
+    /// that OCR, alone or beside clean native text. Otherwise empty.
+    pub repeat_evidence: Vec<OcrRepeatEvidence>,
     /// Final document Markdown in selected-page order.
     pub markdown: String,
     /// Final per-page Markdown and provenance, using 1-indexed page numbers.
@@ -466,6 +488,7 @@ pub fn process_pdf_with_ocr_mem(
         .render_dpi(options.render.dpi)
         .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
     let mut recognition = Vec::new();
+    let mut repeat_evidence = Vec::new();
     let mut fused = if routed.is_empty() {
         fuse_ocr_pages_adaptive_with_routes(
             &native.pages,
@@ -503,6 +526,9 @@ pub fn process_pdf_with_ocr_mem(
             &fusion_routes,
             &native_repeated,
             options.retain_recognition.then_some(&mut recognition),
+            options
+                .retain_repeat_evidence
+                .then_some(&mut repeat_evidence),
         )?
     };
     fused.render_time_ms = fused
@@ -542,6 +568,7 @@ pub fn process_pdf_with_ocr_mem(
 
     Ok(OcrPdfResult {
         recognition,
+        repeat_evidence,
         markdown,
         pages: fused.pages,
         page_count,
@@ -630,6 +657,7 @@ fn run_and_fuse_ocr_chunks<R, O>(
     fusion_routes: &BTreeMap<u32, OcrFusionRoute>,
     native_repeated: &BTreeMap<u32, Vec<String>>,
     mut recognition: Option<&mut Vec<OcrPage>>,
+    repeat_evidence: Option<&mut Vec<OcrRepeatEvidence>>,
 ) -> Result<FusedPages, OcrPipelineError>
 where
     R: PageRenderer,
@@ -672,6 +700,18 @@ where
         fusion_routes,
         native_repeated,
     )?;
+    if let Some(evidence) =
+        repeat_evidence.filter(|_| fusion_options.markdown.strip_headers_footers)
+    {
+        evidence.extend(repeat_evidence_of(
+            native_pages,
+            &run,
+            fusion_routes,
+            native_candidates,
+            native_repeated,
+            document_page_count,
+        ));
+    }
     if let Some(recognition) = recognition.as_mut() {
         recognition.extend(run.pages.into_iter().map(|page| page.ocr));
     }
@@ -1030,21 +1070,12 @@ fn canonical_table_text(text: &str) -> String {
 /// the whole: an empty page adds no blank lines, and a list running across
 /// pages stays tight.
 fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers: bool) -> String {
-    let mut document = String::new();
-    for (index, page) in pages.iter().enumerate() {
-        if index > 0 {
-            document.push_str("\n\n");
-        }
-        if include_page_numbers {
-            document.push_str(&format!("<!-- Page {} -->\n\n", page.page_number));
-        }
-        document.push_str(page.markdown.trim());
-    }
-    let mut document = crate::markdown::normalize_block_spacing(&document);
-    if !document.is_empty() {
-        document.push('\n');
-    }
-    document
+    super::fusion::assemble_document_markdown(
+        pages
+            .iter()
+            .map(|page| (page.page_number, page.markdown.as_str())),
+        include_page_numbers,
+    )
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -1307,6 +1338,7 @@ mod tests {
             &routes,
             &BTreeMap::new(),
             Some(&mut recognition),
+            None,
         )
         .unwrap();
 
@@ -1460,6 +1492,7 @@ mod tests {
             &routes,
             &BTreeMap::new(),
             Some(&mut recognition),
+            None,
         )
         .unwrap();
 
@@ -1488,6 +1521,121 @@ mod tests {
         assert!(recognition
             .iter()
             .all(|page| page.spans[0].text == "Дело № 2-123/2026"));
+    }
+
+    #[test]
+    fn pages_recognized_one_per_call_lose_repeats_as_one_call_does() {
+        // As mdoc's resumable OCR: each page in a run of its own, its
+        // evidence kept, then the pass across them all.
+        let native_page = |page: u32| PageMarkdown {
+            page,
+            markdown: String::new(),
+            needs_ocr: true,
+            ocr_reason: Some(crate::OCR_REASON_SCANNED.to_string()),
+        };
+        let engine = CourtFileEngine {
+            model: super::super::ModelIdentity::new("test-ocr", "v1"),
+        };
+        let markdown = MarkdownOptions::default();
+        let fusion_options = OcrFusionOptions::new().markdown(markdown.clone());
+        let recognize = |pages: &[u32], evidence: Option<&mut Vec<OcrRepeatEvidence>>| {
+            let routes = pages
+                .iter()
+                .map(|&page| (page, OcrFusionRoute::FullPage))
+                .collect();
+            let native: Vec<PageMarkdown> =
+                pages.iter().map(|&page| native_page(page - 1)).collect();
+            run_and_fuse_ocr_chunks(
+                &ScanRenderer,
+                &engine,
+                b"test",
+                pages,
+                None,
+                &RenderOptions::new(),
+                &OcrOptions::new().mode(OcrMode::Force),
+                &native,
+                6,
+                &fusion_options,
+                &BTreeMap::new(),
+                &routes,
+                &BTreeMap::new(),
+                None,
+                evidence,
+            )
+            .unwrap()
+        };
+        let whole = recognize(&[1, 2, 3, 4, 5, 6], None);
+
+        let mut evidence = Vec::new();
+        let mut kept: Vec<(String, u32)> = (1..=6)
+            .map(|page| {
+                let fused = recognize(&[page], Some(&mut evidence));
+                let markdown = assemble_document_markdown(&fused.pages, false);
+                // Alone, a page keeps its header and counts nothing.
+                assert!(markdown.contains("Дело № 2-123/2026"));
+                (markdown, fused.pages[0].provenance.repeated_lines)
+            })
+            .collect();
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|page| page.page_number())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
+        // Kept between calls as JSON, serde_json's defaults.
+        let evidence: Vec<OcrRepeatEvidence> =
+            serde_json::from_str(&serde_json::to_string(&evidence).unwrap()).unwrap();
+        let across = super::super::strip_repeats_across_pages(&evidence, &markdown).unwrap();
+        for page in across.pages {
+            kept[page.page_number as usize - 1] = (page.markdown, page.repeated_lines);
+        }
+
+        let expected: Vec<(String, u32)> = whole
+            .pages
+            .iter()
+            .map(|page| {
+                (
+                    assemble_document_markdown(std::slice::from_ref(page), false),
+                    page.provenance.repeated_lines,
+                )
+            })
+            .collect();
+        assert_eq!(kept, expected);
+        assert_eq!(
+            across
+                .repeated_lines_by_page
+                .iter()
+                .map(|page| (page.page, page.lines))
+                .collect::<Vec<_>>(),
+            [(2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+        );
+
+        // Without stripping, no page takes part in the pass: no evidence.
+        let mut evidence = Vec::new();
+        let unstripped = OcrFusionOptions::new().markdown(MarkdownOptions {
+            strip_headers_footers: false,
+            ..MarkdownOptions::default()
+        });
+        run_and_fuse_ocr_chunks(
+            &ScanRenderer,
+            &engine,
+            b"test",
+            &[1],
+            None,
+            &RenderOptions::new(),
+            &OcrOptions::new().mode(OcrMode::Force),
+            &[native_page(0)],
+            6,
+            &unstripped,
+            &BTreeMap::new(),
+            &BTreeMap::from([(1, OcrFusionRoute::FullPage)]),
+            &BTreeMap::new(),
+            None,
+            Some(&mut evidence),
+        )
+        .unwrap();
+        assert!(evidence.is_empty());
     }
 
     #[test]

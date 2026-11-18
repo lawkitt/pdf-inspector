@@ -42,6 +42,13 @@ version and date. Earlier releases are described in their
   list of `PageRepeatedLines`, and `PageProvenance::repeated_lines`), with
   header/footer stripping on, from native text and OCR alike. A fused page
   counts a row only when neither source shows it.
+- Repeated headers and footers across pages recognized in separate OCR
+  calls: with `OcrPdfOptions::retain_repeat_evidence`, each run returns its
+  recognized pages' `OcrRepeatEvidence` (serde-serializable: spans, page
+  geometry, and native text kept beside the OCR), and
+  `vision::strip_repeats_across_pages` runs the repeated header/footer pass
+  over all of it, giving each page the Markdown and `repeated_lines` a
+  whole-document run gives it. Whole-document output is unchanged.
 - Text a reader never sees is left out of the Markdown: a run drawn in the
   colour of what lies under its whole box (white on the unpainted page,
   white on a white fill, red on a red band; colours within 6 of 255 on every

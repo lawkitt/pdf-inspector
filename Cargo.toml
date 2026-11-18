@@ -54,6 +54,10 @@ unicode-bidi = "0.3"
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"
 
+# Serializable OCR evidence a caller keeps per page between recognition
+# calls (`vision::OcrRepeatEvidence`); only with the vision features.
+serde = { version = "1", features = ["derive"], optional = true }
+
 # Native builds keep lopdf's parallel parser and CLI logging. Browser WASM is
 # deliberately single-threaded so it works without cross-origin isolation.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -88,11 +92,14 @@ lopdf = { version = "0.45.0", default-features = false, features = ["wasm_js"] }
 
 [dev-dependencies]
 tempfile = "3.3"
+# JSON round-trip of OCR repeat evidence in tests; the version Cargo.lock
+# already holds.
+serde_json = "=1.0.154"
 
 [features]
 default = []
 python = ["pyo3", "ocr"]
-vision = []
+vision = ["dep:serde"]
 model-cache = ["vision", "dep:dirs", "dep:fs2", "dep:sha2", "dep:windows-sys"]
 model-download = ["model-cache", "dep:ureq"]
 ocr-oar = ["model-cache", "dep:image", "dep:oar-ocr", "dep:ort"]
