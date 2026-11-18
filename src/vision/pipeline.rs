@@ -1583,6 +1583,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 3, 4, 5, 6]
         );
+        // Kept between calls as JSON, serde_json's defaults.
+        let evidence: Vec<OcrRepeatEvidence> =
+            serde_json::from_str(&serde_json::to_string(&evidence).unwrap()).unwrap();
         let across = super::super::strip_repeats_across_pages(&evidence, &markdown).unwrap();
         for page in across.pages {
             kept[page.page_number as usize - 1] = (page.markdown, page.repeated_lines);

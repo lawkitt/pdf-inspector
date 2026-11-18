@@ -3785,6 +3785,10 @@ mod tests {
             ));
             page_runs.push(fused.pages.remove(0));
         }
+        // Kept between runs as a caller stores it: JSON, serde_json's
+        // defaults (no `float_roundtrip`).
+        let json = serde_json::to_string(&evidence).unwrap();
+        let mut evidence: Vec<OcrRepeatEvidence> = serde_json::from_str(&json).unwrap();
         // Any order: the pass sorts the pages.
         evidence.reverse();
         for page in strip_repeats_in_evidence(&evidence, &options.markdown).unwrap() {
@@ -3984,6 +3988,48 @@ mod tests {
                 .collect()
         };
         assert_eq!(spans(&restored), spans(&page));
+    }
+
+    #[test]
+    fn evidence_comes_back_exactly_from_json() {
+        // An A4 page (595.2756 x 841.8898 pt) drawn at 1240 x 1754 px: its
+        // coefficients have long decimals; polygons hold fractional pixels.
+        let transform = PageTransform::from_corners(
+            1240,
+            1754,
+            (0.0, 841.889_763_779_527_6),
+            (595.275_590_551_181_1, 841.889_763_779_527_6),
+            (0.0, 0.0),
+        )
+        .unwrap();
+        let mut page = scanned_page_with_footer(2, "Дело № 2-123/2026", "Acme");
+        page.rendered =
+            RenderedPage::without_pixels(2, 595.275_6, 841.889_8, 1240, 1754, transform).unwrap();
+        for (index, span) in page.ocr.spans.iter_mut().enumerate() {
+            span.polygon = ImageQuad::new(span.polygon.points.map(|point| {
+                ImagePoint::new(
+                    point.x * 4.133_3 + 0.1,
+                    point.y * 4.385_1 + index as f32 / 3.0,
+                )
+            }));
+            span.orientation_degrees = Some(0.000_1 * index as f32);
+        }
+        let native = RepeatEvidenceNative {
+            markdown: "Native \"text\"\n".to_string(),
+            repeated_rows: vec!["Дело № 2-123/2026".to_string()],
+        };
+        let evidence = OcrRepeatEvidence::from_page(&page, 9, Some(native));
+        let json = serde_json::to_string(&evidence).unwrap();
+        let restored: OcrRepeatEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, evidence);
+        assert_eq!(
+            restored.transform.map(f64::to_bits),
+            transform.forward().map(f64::to_bits)
+        );
+        assert_eq!(
+            restored.to_page().unwrap().rendered.transform(),
+            page.rendered.transform()
+        );
     }
 
     #[test]
