@@ -94,7 +94,7 @@ const DETECTION_LIMIT_ESCALATED: u32 = 2560;
 /// Hard ceiling protecting detection from out-of-memory on giant renders.
 const DETECTION_MAXIMUM_SIDE: u32 = 4000;
 
-/// Escalate only for pages dense with small text: at least this many detected
+/// Escalate pages dense with small text: at least this many detected
 /// regions in the standard pass...
 const ESCALATION_MINIMUM_REGIONS: usize = 80;
 
@@ -106,6 +106,29 @@ const ESCALATION_MINIMUM_REGIONS: usize = 80;
 /// 15.7 px, and prose/typewriter pages measure 14.5 px+ with too few
 /// regions to qualify at all.
 const ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 15.0;
+
+/// Also escalate sparse small print, however few its rows: a median height
+/// at detection scale below this...
+///
+/// At the standard limit a 6–7 pt page at 150 DPI is detected at about
+/// 82 DPI, where adjacent rows merge into one region and whole rows drop out
+/// of recognition (firecrawl/pdf-inspector#623). Measured heights come in
+/// steps of about 3 px (unclip 2.0 roughly triples the detector's kernel
+/// height, so this constant is coupled to [`detection_config`] like the one
+/// above): 6–9 pt Arial measures 12.0 px on A4 and 11.6 px on Letter, 10 pt
+/// and up 14.5 px or more. Every page measured below 13 px gained or was
+/// unchanged under escalation (30-row statements at 6–7 pt recover every
+/// dropped row); ordinary pages measure 14.1 px and up, and escalating those
+/// both gained and lost lines, so they stay on the standard pass. Detection
+/// cannot tell 8–9 pt from 6–7 pt at this scale, so those pages pay too.
+const SPARSE_ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 13.0;
+
+/// ...with at least this many regions. An 8-row statement at 6 pt (9 regions
+/// with its title) still garbled a row past use at the standard limit (its
+/// date and payee gone); 4-row ones (5 regions) and a scan with six tiny
+/// regions read the same either way, so pages with a stray caption or
+/// speckle stay on the standard pass.
+const SPARSE_ESCALATION_MINIMUM_REGIONS: usize = 8;
 
 /// A page is on its side when at least this many detected lines run
 /// vertically (a sideways note of two lines is still a page on its side)...
@@ -264,15 +287,18 @@ fn intra_threads_per_pipeline(concurrency: usize) -> usize {
 }
 
 /// True when a standard-limit detection pass over a downscaled page shows
-/// dense, small text: the page deserves a second pass at the escalated limit.
+/// dense small text, or very small text in any quantity: the page deserves a
+/// second pass at the escalated limit.
 fn should_escalate_detection(
     median_detection_height: f32,
     region_count: usize,
     downscale: f32,
 ) -> bool {
-    downscale < 1.0
-        && region_count >= ESCALATION_MINIMUM_REGIONS
-        && median_detection_height < ESCALATION_MAXIMUM_MEDIAN_HEIGHT
+    let dense = region_count >= ESCALATION_MINIMUM_REGIONS
+        && median_detection_height < ESCALATION_MAXIMUM_MEDIAN_HEIGHT;
+    let sparse_small_print = region_count >= SPARSE_ESCALATION_MINIMUM_REGIONS
+        && median_detection_height < SPARSE_ESCALATION_MAXIMUM_MEDIAN_HEIGHT;
+    downscale < 1.0 && (dense || sparse_small_print)
 }
 
 /// Median detected-region height in detection-input pixels: original-image
@@ -489,9 +515,11 @@ impl OarOcrEngine {
         let detections = detect_with(&worker.detector, image, page.page())?;
 
         // Dense fine-print pages (broadsheets, pricing sheets) lose most of
-        // their text when detection downscales them to the standard limit.
-        // When the standard pass shows many regions of tiny detection-scale
-        // height, rerun detection at the escalated limit.
+        // their text when detection downscales them to the standard limit,
+        // and sparse small print (a 6–7 pt statement) loses whole rows.
+        // When the standard pass shows many regions of small detection-scale
+        // height, or fewer regions of very small height, rerun detection at
+        // the escalated limit.
         let downscale = (DETECTION_LIMIT_STANDARD as f32 / longest_side).min(1.0);
         let mut heights: Vec<f32> = detections.iter().map(polygon_height).collect();
         let median = median_detection_height(&mut heights, downscale);
@@ -1436,6 +1464,30 @@ mod tests {
         assert!(!should_escalate_detection(17.5, 77, 0.55));
         // Page not downscaled at all: escalation cannot add pixels.
         assert!(!should_escalate_detection(9.0, 300, 1.0));
+        assert!(!should_escalate_detection(9.0, 30, 1.0));
+    }
+
+    #[test]
+    fn escalation_fires_for_sparse_small_print() {
+        // 30-row statements at 6–9 pt, A4 and Letter at 150 DPI: 6–7 pt drop
+        // whole rows on the standard pass and recover them all escalated.
+        assert!(should_escalate_detection(12.0, 30, 0.547));
+        assert!(should_escalate_detection(11.6, 44, 0.582));
+        // An 8-row statement at 6 pt (9 regions with its title) garbled a row.
+        assert!(should_escalate_detection(12.0, 9, 0.547));
+        // A dense table page measuring 12.2 px with 65 regions.
+        assert!(should_escalate_detection(12.2, 65, 0.582));
+    }
+
+    #[test]
+    fn sparse_escalation_skips_ordinary_and_near_empty_pages() {
+        // 10 pt statements and ordinary prose/table pages: 14.1 px and up.
+        assert!(!should_escalate_detection(14.8, 31, 0.547));
+        assert!(!should_escalate_detection(14.1, 43, 0.582));
+        assert!(!should_escalate_detection(13.0, 40, 0.547));
+        // A few tiny regions (a caption, a stamp, speckle): too few to pay.
+        assert!(!should_escalate_detection(11.6, 6, 0.582));
+        assert!(!should_escalate_detection(12.0, 7, 0.547));
     }
 
     #[test]
