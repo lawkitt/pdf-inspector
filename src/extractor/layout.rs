@@ -1829,6 +1829,14 @@ fn page_number_context_masks(
         }
     }
 
+    // A labelled number is content, so it is no anchor for another number
+    // in the cross-page passes below either.
+    for (index, &labelled) in labelled.iter().enumerate() {
+        if labelled {
+            contextual[index] = true;
+            explicit_folio[index] = false;
+        }
+    }
     mark_repeated_folio_candidates(
         occurrences_by_signature,
         document_page_count,
@@ -1842,9 +1850,9 @@ fn page_number_context_masks(
         document_page_count,
         &mut explicit_folio,
     );
+    // The recurrence check may still have marked one.
     for (index, labelled) in labelled.into_iter().enumerate() {
         if labelled {
-            contextual[index] = true;
             explicit_folio[index] = false;
         }
     }
