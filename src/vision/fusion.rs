@@ -182,7 +182,7 @@ pub fn ocr_page_to_markdown(
     document_page_count: u32,
     options: &MarkdownOptions,
 ) -> String {
-    let (items, _) = ocr_text_items(page, &HashSet::new());
+    let (items, _) = ocr_text_items(page, &HashSet::new(), true);
     let markdown = to_markdown_from_items_with_rects_and_page_count(
         items,
         options.clone(),
@@ -332,17 +332,24 @@ fn fuse_ocr_pages_impl(
 
         let (markdown, source, ocr_model, ocr_confidence, ocr_ms, hosted_recommended) =
             if let Some(local) = ocr_by_page.get(&page_number) {
+                let route = routes
+                    .get(&page_number)
+                    .ok_or(OcrFusionError::MissingOcrRoute { page: page_number })?;
                 let repeated_spans = repeated.spans.get(&page_number).unwrap_or(&no_spans);
-                let (ocr_items, discarded_spans) = ocr_text_items(local, repeated_spans);
+                // Image regions are matched against native PDF-space
+                // rectangles, so their spans keep the rendered page's own
+                // geometry; only full-page OCR is laid out level and upright.
+                let (ocr_items, discarded_spans) = ocr_text_items(
+                    local,
+                    repeated_spans,
+                    matches!(route, OcrFusionRoute::FullPage),
+                );
                 if discarded_spans > 0 {
                     warnings.push(format!(
                         "discarded {discarded_spans} OCR spans with unusable text or geometry"
                     ));
                 }
                 warnings.extend(local.ocr.warnings.iter().cloned());
-                let route = routes
-                    .get(&page_number)
-                    .ok_or(OcrFusionError::MissingOcrRoute { page: page_number })?;
                 let ocr_markdown = match route {
                     OcrFusionRoute::SupplementalRegions(regions) => {
                         let region_items = items_inside_regions(ocr_items, regions);
@@ -616,18 +623,33 @@ fn assess_text_candidate(markdown: &str) -> Option<TextCandidateQuality> {
 /// Converts recognized line polygons to ordinary PDF-space text items.
 /// The page's OCR spans as positioned text items, leaving out `skip` (span
 /// indices), and how many spans had unusable text or geometry.
-fn ocr_text_items(page: &RoutedOcrPage, skip: &HashSet<usize>) -> (Vec<TextItem>, usize) {
-    let (items, discarded) = indexed_ocr_text_items(page, skip);
+///
+/// With `layout`, lines are laid out as [`ocr_span_boxes`] describes and
+/// their sizes normalized ([`snap_ocr_body_sizes`]); without it, each span
+/// keeps the axis-aligned bounds of its polygon on the rendered page, so
+/// the items stay in that page's PDF space.
+fn ocr_text_items(
+    page: &RoutedOcrPage,
+    skip: &HashSet<usize>,
+    layout: bool,
+) -> (Vec<TextItem>, usize) {
+    let (items, discarded) = indexed_ocr_text_items(page, skip, layout);
     (items.into_iter().map(|(_, item)| item).collect(), discarded)
 }
 
 fn indexed_ocr_text_items(
     page: &RoutedOcrPage,
     skip: &HashSet<usize>,
+    layout: bool,
 ) -> (Vec<(usize, TextItem)>, usize) {
     let mut discarded = 0usize;
     let mut items = Vec::with_capacity(page.ocr.spans.len());
-    for (index, span) in page.ocr.spans.iter().enumerate() {
+    let frame = if layout {
+        ocr_span_boxes(page)
+    } else {
+        page_space_span_boxes(page)
+    };
+    for (index, (span, bounds)) in page.ocr.spans.iter().zip(&frame.boxes).enumerate() {
         if skip.contains(&index) {
             continue;
         }
@@ -635,20 +657,30 @@ fn indexed_ocr_text_items(
             discarded += 1;
             continue;
         }
-        let Some((left, top, right, bottom)) = image_quad_bounds(
-            &span.polygon.points,
-            page.rendered.width(),
-            page.rendered.height(),
-        ) else {
+        let Some((left, top, right, bottom)) = *bounds else {
             discarded += 1;
             continue;
         };
-        let rect = page.rendered.pixel_rect_to_pdf_rect(
-            f64::from(left),
-            f64::from(top),
-            f64::from(right - left),
-            f64::from(bottom - top),
-        );
+        let rect = if frame.turns == 0 {
+            page.rendered.pixel_rect_to_pdf_rect(
+                f64::from(left),
+                f64::from(top),
+                f64::from(right - left),
+                f64::from(bottom - top),
+            )
+        } else {
+            // A page read turned upright is laid out as an upright page of
+            // the same scale: its text runs left to right there, not on
+            // the page as it is stored.
+            let scale = page.rendered.page_width() / page.rendered.width() as f32;
+            PdfRect {
+                x: left * scale,
+                y: (frame.height as f32 - bottom) * scale,
+                width: (right - left) * scale,
+                height: (bottom - top) * scale,
+                page: page.rendered.page(),
+            }
+        };
         items.push((
             index,
             TextItem {
@@ -680,6 +712,11 @@ fn indexed_ocr_text_items(
                 baseline_shift: 0.0,
             },
         ));
+    }
+    if layout {
+        let (indices, mut plain): (Vec<usize>, Vec<TextItem>) = items.into_iter().unzip();
+        snap_ocr_body_sizes(&mut plain);
+        items = indices.into_iter().zip(plain).collect();
     }
     // OCR engines do not share an ordering contract. Geometry gives the
     // deterministic top-to-bottom seed expected by the existing layout
@@ -778,7 +815,7 @@ fn repeated_ocr_header_footer_spans(
     let mut spans_by_item: HashMap<crate::HeaderFooterItemKey, Vec<(u32, usize)>> = HashMap::new();
     let mut items = Vec::new();
     for page in full_pages {
-        let (page_items, _) = indexed_ocr_text_items(page, &HashSet::new());
+        let (page_items, _) = indexed_ocr_text_items(page, &HashSet::new(), false);
         let plain: Vec<TextItem> = page_items.iter().map(|(_, item)| item.clone()).collect();
         let base_size =
             crate::markdown::analysis::calculate_font_stats_from_items(&plain).most_common_size;
@@ -817,10 +854,327 @@ fn repeated_ocr_header_footer_spans(
     result
 }
 
+/// Recognized lines from this share of the page's body height up to (not
+/// including) [`OCR_BODY_SIZE_HIGH`] are body text. Detected boxes of one
+/// type size differ with the line's capitals, ascenders and descenders, a
+/// curl of the paper and a pixel or two of rounding. Native text has one
+/// exact size.
+const OCR_BODY_SIZE_LOW: f32 = 0.8;
+
+/// Up to here a line of any length is body text: the Markdown converter's
+/// size gate for headings is 1.2, and below it only bold text becomes a
+/// heading, which OCR does not report.
+const OCR_BODY_SIZE_HIGH: f32 = 1.2;
+
+/// Up to here a line at least [`OCR_LONG_LINE_SHARE`] as long as the page's
+/// median line, and set close above or below another line, is body text
+/// too: a line inside a paragraph.
+/// Long body lines of the scanned and photographed pages in mdoc's OCR
+/// corpus measure up to 1.31 times their page's median height, while a
+/// heading is rarely as long as the lines of the text under it, and a short
+/// heading measured against long body lines comes out low (its box spans
+/// only the capitals and ascenders it has).
+const OCR_LONG_LINE_BODY_SIZE_HIGH: f32 = 1.35;
+
+/// Share of the page's median line width from which a line counts as long.
+const OCR_LONG_LINE_SHARE: f32 = 0.75;
+
+/// Lines whose boxes are less than this share of the body height apart
+/// belong to one block of text. A heading has the space of a paragraph
+/// break around it.
+const OCR_BLOCK_GAP_SHARE: f32 = 0.5;
+
+/// Gives every line set at about the page's body height (the character-
+/// weighted median) exactly that size, as native text of one font has.
+/// Without it, a body line measured a few per cent short reads as smaller
+/// type to the size-based rules (edge furniture, captions) and one measured
+/// tall becomes a heading. Clearly larger or smaller type keeps its size.
+fn snap_ocr_body_sizes(items: &mut [TextItem]) {
+    let mut sizes: Vec<(f32, usize)> = items
+        .iter()
+        .map(|item| (item.font_size, item.text.chars().count()))
+        .collect();
+    sizes.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: usize = sizes.iter().map(|&(_, chars)| chars).sum();
+    let mut running = 0usize;
+    let Some(body) = sizes.iter().find_map(|&(size, chars)| {
+        running += chars;
+        (running * 2 >= total).then_some(size)
+    }) else {
+        return;
+    };
+    let mut widths: Vec<f32> = items.iter().map(|item| item.width).collect();
+    widths.sort_by(f32::total_cmp);
+    let typical_width = widths[widths.len() / 2];
+    let in_block = |index: usize| {
+        let item = &items[index];
+        items.iter().enumerate().any(|(other_index, other)| {
+            let overlap = (item.x + item.width).min(other.x + other.width) - item.x.max(other.x);
+            let gap = (other.y - (item.y + item.height)).max(item.y - (other.y + other.height));
+            other_index != index && overlap > 0.0 && gap < body * OCR_BLOCK_GAP_SHARE
+        })
+    };
+    let snapped: Vec<bool> = (0..items.len())
+        .map(|index| {
+            let item = &items[index];
+            let ratio = item.font_size / body;
+            if (OCR_BODY_SIZE_LOW..OCR_BODY_SIZE_HIGH).contains(&ratio) {
+                return true;
+            }
+            (OCR_BODY_SIZE_HIGH..OCR_LONG_LINE_BODY_SIZE_HIGH).contains(&ratio)
+                && item.width >= typical_width * OCR_LONG_LINE_SHARE
+                && in_block(index)
+        })
+        .collect();
+    for (item, snapped) in items.iter_mut().zip(snapped) {
+        if snapped {
+            item.font_size = body;
+        }
+    }
+}
+
+type Edge = (f32, f32);
+
+/// A quad's two pairs of opposite edges, `(along, across)`: the pair nearer
+/// horizontal runs along the text line, the other across it. Along edges
+/// point rightward.
+fn quad_edges(points: &[super::ImagePoint; 4]) -> ((Edge, Edge), (Edge, Edge)) {
+    let [p0, p1, p2, p3] = *points;
+    let edge = |a: super::ImagePoint, b: super::ImagePoint| (b.x - a.x, b.y - a.y);
+    let first = (edge(p0, p1), edge(p3, p2));
+    let second = (edge(p1, p2), edge(p0, p3));
+    let (along, across) = if horizontality(first.0) + horizontality(first.1)
+        >= horizontality(second.0) + horizontality(second.1)
+    {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let rightward = |(dx, dy): Edge| if dx < 0.0 { (-dx, -dy) } else { (dx, dy) };
+    ((rightward(along.0), rightward(along.1)), across)
+}
+
+fn edge_length((dx, dy): Edge) -> f32 {
+    dx.hypot(dy)
+}
+
+fn horizontality(edge: Edge) -> f32 {
+    let length = edge_length(edge);
+    if length > 0.0 {
+        edge.0.abs() / length
+    } else {
+        0.0
+    }
+}
+
+/// Largest tilt treated as skew of a scanned or photographed page. Beyond
+/// it the lines are not a tilted page but rotated text.
+const MAX_PAGE_SKEW_RADIANS: f32 = 10.0 * std::f32::consts::PI / 180.0;
+
+/// The page's skew in radians (image space, positive clockwise): the median
+/// baseline angle of its text lines, those at least three times as long as
+/// they are tall. Zero for fewer than three such lines or a tilt beyond
+/// [`MAX_PAGE_SKEW_RADIANS`].
+fn page_skew(quads: &[Option<[super::ImagePoint; 4]>]) -> f32 {
+    let mut angles: Vec<f32> = quads
+        .iter()
+        .flatten()
+        .filter(|points| points.iter().all(|p| p.x.is_finite() && p.y.is_finite()))
+        .filter_map(|points| {
+            let (along, across) = quad_edges(points);
+            let length = (edge_length(along.0) + edge_length(along.1)) / 2.0;
+            let thickness = (edge_length(across.0) + edge_length(across.1)) / 2.0;
+            (thickness > 0.0 && length >= thickness * 3.0).then(|| {
+                let (dx, dy) = (along.0 .0 + along.1 .0, along.0 .1 + along.1 .1);
+                dy.atan2(dx)
+            })
+        })
+        .collect();
+    if angles.len() < 3 {
+        return 0.0;
+    }
+    angles.sort_by(f32::total_cmp);
+    let median = angles[angles.len() / 2];
+    if median.abs() > MAX_PAGE_SKEW_RADIANS {
+        0.0
+    } else {
+        median
+    }
+}
+
+/// A page's recognized lines laid out upright.
+struct OcrLineFrame {
+    /// Quarter turns clockwise from the rendered page to the upright frame.
+    turns: u8,
+    /// Upright frame height in pixels.
+    height: u32,
+    /// Upright boxes `(left, top, right, bottom)` in frame pixels, in span
+    /// order; `None` for blank text or unusable geometry.
+    boxes: Vec<Option<(f32, f32, f32, f32)>>,
+}
+
+/// Quarter turns clockwise that bring the page's text upright: the turn
+/// most of its spans report through `orientation_degrees` (the clockwise
+/// angle the text is turned on the rendered page), none by default.
+fn page_upright_turns(page: &RoutedOcrPage) -> u8 {
+    let mut counts = [0usize; 4];
+    for span in &page.ocr.spans {
+        let turns = span
+            .orientation_degrees
+            .filter(|degrees| degrees.is_finite())
+            .map_or(0, |degrees| {
+                let quarters = (degrees / 90.0).round() as i64;
+                (4 - quarters.rem_euclid(4)) % 4
+            });
+        counts[turns as usize] += 1;
+    }
+    (0..4u8)
+        .max_by_key(|&turns| (counts[turns as usize], 3 - turns))
+        .unwrap_or(0)
+}
+
+/// A rendered-page point on the page turned `turns` quarter turns clockwise.
+fn turn_point(point: super::ImagePoint, turns: u8, width: f32, height: f32) -> super::ImagePoint {
+    match turns % 4 {
+        1 => super::ImagePoint::new(height - point.y, point.x),
+        2 => super::ImagePoint::new(width - point.x, height - point.y),
+        3 => super::ImagePoint::new(point.y, width - point.x),
+        _ => point,
+    }
+}
+
+/// The axis-aligned bounds of each span's polygon on the rendered page.
+fn page_space_span_boxes(page: &RoutedOcrPage) -> OcrLineFrame {
+    let (width, height) = (page.rendered.width() as f32, page.rendered.height() as f32);
+    let boxes = page
+        .ocr
+        .spans
+        .iter()
+        .map(|span| {
+            let points = &span.polygon.points;
+            if span.text.trim().is_empty()
+                || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite())
+            {
+                return None;
+            }
+            let xs = points.iter().map(|p| p.x);
+            let ys = points.iter().map(|p| p.y);
+            let left = xs.clone().fold(f32::INFINITY, f32::min).clamp(0.0, width);
+            let right = xs.fold(f32::NEG_INFINITY, f32::max).clamp(0.0, width);
+            let top = ys.clone().fold(f32::INFINITY, f32::min).clamp(0.0, height);
+            let bottom = ys.fold(f32::NEG_INFINITY, f32::max).clamp(0.0, height);
+            (right > left && bottom > top).then_some((left, top, right, bottom))
+        })
+        .collect();
+    OcrLineFrame {
+        turns: 0,
+        height: page.rendered.height(),
+        boxes,
+    }
+}
+
+/// Upright boxes of a page's recognized lines, in span order.
+fn ocr_span_boxes(page: &RoutedOcrPage) -> OcrLineFrame {
+    let turns = page_upright_turns(page);
+    let (width, height) = (page.rendered.width(), page.rendered.height());
+    let (frame_width, frame_height) = if turns % 2 == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let quads: Vec<Option<[super::ImagePoint; 4]>> = page
+        .ocr
+        .spans
+        .iter()
+        .map(|span| {
+            (!span.text.trim().is_empty()).then(|| {
+                span.polygon
+                    .points
+                    .map(|point| turn_point(point, turns, width as f32, height as f32))
+            })
+        })
+        .collect();
+    let skew = page_skew(&quads);
+    let mut boxes: Vec<_> = quads
+        .iter()
+        .map(|quad| {
+            quad.as_ref()
+                .and_then(|points| image_quad_bounds(points, frame_width, frame_height, skew))
+        })
+        .collect();
+    align_row_baselines(&mut boxes);
+    OcrLineFrame {
+        turns,
+        height: frame_height,
+        boxes,
+    }
+}
+
+/// Puts the pieces of one printed line on one baseline.
+///
+/// The detector often splits a line at a wide gap (a blank to fill in, a
+/// redaction, a tab stop), and each piece's box sits a pixel or two higher
+/// or lower than the next. Native text of one line shares an exact
+/// baseline; without one, the layout pipeline can read the right-hand piece
+/// as the line above and put it first. Pieces whose centres lie within a
+/// third of their height of each other, side by side without overlapping,
+/// move to the bottom of the row's widest piece.
+fn align_row_baselines(boxes: &mut [Option<(f32, f32, f32, f32)>]) {
+    let center = |b: &(f32, f32, f32, f32)| (b.1 + b.3) / 2.0;
+    let mut order: Vec<usize> = (0..boxes.len()).filter(|&i| boxes[i].is_some()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (boxes[a].unwrap(), boxes[b].unwrap());
+        center(&a).total_cmp(&center(&b))
+    });
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    for index in order {
+        let candidate = boxes[index].unwrap();
+        let joins = rows.last().is_some_and(|row| {
+            let first = boxes[row[0]].unwrap();
+            let height = (candidate.3 - candidate.1).min(first.3 - first.1);
+            (center(&candidate) - center(&first)).abs() <= height / 3.0
+                && row.iter().all(|&member| {
+                    let member = boxes[member].unwrap();
+                    candidate.2 <= member.0 || member.2 <= candidate.0
+                })
+        });
+        if joins {
+            rows.last_mut().unwrap().push(index);
+        } else {
+            rows.push(vec![index]);
+        }
+    }
+    for row in rows.iter().filter(|row| row.len() > 1) {
+        let widest = row
+            .iter()
+            .map(|&i| boxes[i].unwrap())
+            .max_by(|a, b| (a.2 - a.0).total_cmp(&(b.2 - b.0)))
+            .unwrap();
+        for &i in row {
+            if let Some(b) = boxes[i].as_mut() {
+                let shift = widest.3 - b.3;
+                b.1 += shift;
+                b.3 += shift;
+            }
+        }
+    }
+}
+
+/// The upright box `(left, top, right, bottom)` of one recognized line.
+///
+/// An axis-aligned quad on an unskewed page is its own box. On a skewed page
+/// (a photograph, or a scan fed in at a slant) the quad is first turned
+/// about the page centre by the page's skew, so the lines of a slanted page
+/// are level again and pieces of one line share a baseline. A quad still
+/// tilted after that is replaced by a box of the line's own length and
+/// height centred where it is: its axis-aligned bounds would be taller than
+/// the type by the tilt, overlap the neighbouring lines, close the gaps that
+/// separate paragraphs and promote long lines to headings by size.
 fn image_quad_bounds(
     points: &[super::ImagePoint; 4],
     width: u32,
     height: u32,
+    skew: f32,
 ) -> Option<(f32, f32, f32, f32)> {
     if points
         .iter()
@@ -828,26 +1182,57 @@ fn image_quad_bounds(
     {
         return None;
     }
-    let left = points
+    // Clip the quad to the page before it is turned: turned out of its
+    // slant, a line near a corner of the page may lie past the frame's edge
+    // and must stay whole.
+    let points = points.map(|p| {
+        super::ImagePoint::new(p.x.clamp(0.0, width as f32), p.y.clamp(0.0, height as f32))
+    });
+    let points = if skew == 0.0 {
+        points
+    } else {
+        let (sin, cos) = skew.sin_cos();
+        let (center_x, center_y) = (width as f32 / 2.0, height as f32 / 2.0);
+        points.map(|p| {
+            let (dx, dy) = (p.x - center_x, p.y - center_y);
+            super::ImagePoint::new(
+                center_x + dx * cos + dy * sin,
+                center_y - dx * sin + dy * cos,
+            )
+        })
+    };
+    let min_x = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    let max_x = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+    let min_y = points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+    let max_y = points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+    let axis_aligned = points
         .iter()
-        .map(|point| point.x)
-        .fold(f32::INFINITY, f32::min)
-        .clamp(0.0, width as f32);
-    let right = points
-        .iter()
-        .map(|point| point.x)
-        .fold(f32::NEG_INFINITY, f32::max)
-        .clamp(0.0, width as f32);
-    let top = points
-        .iter()
-        .map(|point| point.y)
-        .fold(f32::INFINITY, f32::min)
-        .clamp(0.0, height as f32);
-    let bottom = points
-        .iter()
-        .map(|point| point.y)
-        .fold(f32::NEG_INFINITY, f32::max)
-        .clamp(0.0, height as f32);
+        .all(|p| (p.x == min_x || p.x == max_x) && (p.y == min_y || p.y == max_y));
+    let (left, top, right, bottom) = if axis_aligned {
+        (min_x, min_y, max_x, max_y)
+    } else {
+        let (along, across) = quad_edges(&points);
+        let half_width = (edge_length(along.0) + edge_length(along.1)) / 4.0;
+        let half_height = (edge_length(across.0) + edge_length(across.1)) / 4.0;
+        let center_x = points.iter().map(|p| p.x).sum::<f32>() / 4.0;
+        let center_y = points.iter().map(|p| p.y).sum::<f32>() / 4.0;
+        (
+            center_x - half_width,
+            center_y - half_height,
+            center_x + half_width,
+            center_y + half_height,
+        )
+    };
+    let (left, top, right, bottom) = if skew == 0.0 {
+        (
+            left.clamp(0.0, width as f32),
+            top.clamp(0.0, height as f32),
+            right.clamp(0.0, width as f32),
+            bottom.clamp(0.0, height as f32),
+        )
+    } else {
+        (left, top, right, bottom)
+    };
     (right > left && bottom > top).then_some((left, top, right, bottom))
 }
 
@@ -866,14 +1251,11 @@ fn preserve_ocr_line_breaks_without(
         .ocr
         .spans
         .iter()
+        .zip(ocr_span_boxes(page).boxes)
         .enumerate()
         .filter(|(index, _)| !skip.contains(index))
-        .filter_map(|(_, span)| {
-            let (left, top, right, bottom) = image_quad_bounds(
-                &span.polygon.points,
-                page.rendered.width(),
-                page.rendered.height(),
-            )?;
+        .filter_map(|(_, (span, bounds))| {
+            let (left, top, right, bottom) = bounds?;
             (!span.text.trim().is_empty()).then_some((span.text.trim(), left, top, right, bottom))
         })
         .collect();
@@ -1502,6 +1884,134 @@ mod tests {
     }
 
     #[test]
+    fn supplemental_regions_match_spans_in_page_space() {
+        // Image regions are native PDF-space rectangles: a span's reported
+        // turn must not move it out of (or into) one.
+        let fuse = |orientation_degrees: Option<f32>| {
+            let native = [native(0, "Native article text\n", false)];
+            let mut spans = Vec::new();
+            for (row, (left, right)) in
+                [("Metric", "Value"), ("Accuracy", "95%"), ("Recall", "93%")]
+                    .into_iter()
+                    .enumerate()
+            {
+                let top = 10.0 + row as f32 * 20.0;
+                for (text, x) in [(left, 10.0), (right, 110.0)] {
+                    let mut span = positioned_span(text, x, top, x + 70.0, top + 10.0);
+                    span.orientation_degrees = orientation_degrees;
+                    spans.push(span);
+                }
+            }
+            let routes = BTreeMap::from([(
+                1,
+                OcrFusionRoute::SupplementalRegions(vec![PdfRect {
+                    x: 0.0,
+                    y: 30.0,
+                    width: 200.0,
+                    height: 70.0,
+                    page: 1,
+                }]),
+            )]);
+            fuse_ocr_pages_adaptive_with_routes(
+                &native,
+                &run(vec![routed_page(1, spans, Some(0.95))]),
+                1,
+                &OcrFusionOptions::new(),
+                &BTreeMap::new(),
+                &routes,
+                &BTreeMap::new(),
+            )
+            .unwrap()
+            .pages
+            .remove(0)
+            .markdown
+        };
+
+        let upright = fuse(None);
+        assert!(upright.contains("|Metric|Value|"), "{upright:?}");
+        assert_eq!(fuse(Some(90.0)), upright);
+    }
+
+    #[test]
+    fn a_line_near_the_corner_of_a_slanted_page_is_kept() {
+        let slope = 0.035;
+        let mut spans: Vec<OcrSpan> = (0..12)
+            .map(|i| {
+                let top = 200.0 + 40.0 * i as f32;
+                tilted_span(
+                    &format!("Body line number {i} of the slanted page runs across"),
+                    100.0,
+                    top,
+                    900.0,
+                    20.0,
+                    slope,
+                )
+            })
+            .collect();
+        // A folio in the top-left corner: turned out of the page's slant
+        // about the page centre, it lies partly past the frame's edge.
+        spans.push(positioned_span("A1", 5.0, 15.0, 25.0, 30.0));
+        let page = sized_routed_page(1000, 1400, spans);
+
+        let (items, discarded) = ocr_text_items(&page, &HashSet::new(), true);
+
+        assert_eq!(discarded, 0);
+        assert_eq!(items.len(), 13);
+        let folio = items.iter().find(|item| item.text == "A1").unwrap();
+        assert!(folio.width > 15.0 && folio.height > 10.0, "{folio:?}");
+    }
+
+    #[test]
+    fn a_wide_heading_set_apart_keeps_its_size() {
+        let page = sized_routed_page(
+            400,
+            300,
+            vec![
+                positioned_span(
+                    "Body text opens the page and runs on across",
+                    20.0,
+                    20.0,
+                    380.0,
+                    30.0,
+                ),
+                positioned_span(
+                    "the line to the end of a short paragraph.",
+                    20.0,
+                    33.0,
+                    380.0,
+                    43.0,
+                ),
+                // 1.3 times the body height, as wide as most of a body line,
+                // with a paragraph's space above and below.
+                positioned_span("Obligations of the parties", 20.0, 65.0, 320.0, 78.0),
+                positioned_span(
+                    "Each party keeps the other informed of any",
+                    20.0,
+                    100.0,
+                    380.0,
+                    110.0,
+                ),
+                positioned_span(
+                    "change that affects the delivery of goods.",
+                    20.0,
+                    113.0,
+                    380.0,
+                    123.0,
+                ),
+            ],
+        );
+
+        let markdown = ocr_page_to_markdown(&page, 1, &MarkdownOptions::default());
+
+        let headings: Vec<&str> = markdown.lines().filter(|l| l.starts_with('#')).collect();
+        assert_eq!(headings.len(), 1, "{markdown:?}");
+        assert_eq!(
+            headings[0].trim_start_matches('#').trim(),
+            "Obligations of the parties"
+        );
+    }
+
+    #[test]
     fn supplemental_table_detection_requires_multiple_rows() {
         let items = vec![
             TextItem {
@@ -1688,6 +2198,247 @@ mod tests {
 
         assert!(markdown.contains("Column A Column B\n\n"), "{markdown:?}");
         assert!(markdown.contains("First row value\n\n"), "{markdown:?}");
+    }
+
+    /// A page of `width` × `height` pixels, one PDF point per pixel.
+    fn sized_routed_page(width: u32, height: u32, spans: Vec<OcrSpan>) -> RoutedOcrPage {
+        let transform = PageTransform::from_corners(
+            width,
+            height,
+            (0.0, f64::from(height)),
+            (f64::from(width), f64::from(height)),
+            (0.0, 0.0),
+        )
+        .unwrap();
+        let rendered = RenderedPage::new(
+            1,
+            width as f32,
+            height as f32,
+            width,
+            height,
+            width as usize,
+            RenderPixelFormat::Gray8,
+            vec![255; width as usize * height as usize],
+            transform,
+        )
+        .unwrap();
+        RoutedOcrPage {
+            rendered,
+            ocr: OcrPage {
+                page_number: 1,
+                spans,
+                mean_confidence: Some(0.95),
+                model: ModelIdentity::new("test-ocr", "v1"),
+                processing_time_ms: 7,
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    /// A line `height` pixels tall from `left` to `right` whose top-left
+    /// corner is at `top`, rising or falling `slope` pixels per pixel.
+    fn tilted_span(
+        text: &str,
+        left: f32,
+        top: f32,
+        right: f32,
+        height: f32,
+        slope: f32,
+    ) -> OcrSpan {
+        let rise = (right - left) * slope;
+        OcrSpan {
+            text: text.to_string(),
+            polygon: ImageQuad::new([
+                ImagePoint::new(left, top),
+                ImagePoint::new(right, top + rise),
+                ImagePoint::new(right, top + rise + height),
+                ImagePoint::new(left, top + height),
+            ]),
+            confidence: 0.95,
+            orientation_degrees: None,
+        }
+    }
+
+    #[test]
+    fn a_slanted_page_keeps_its_paragraphs_and_gains_no_headings() {
+        // Lines falling 2 degrees to the right: each line's axis-aligned
+        // bounds are twice the type's height and overlap the next line.
+        let slope = 0.035;
+        let lines = [
+            ("The first paragraph opens on this line and runs", 20.0),
+            ("on to a second line of the same paragraph.", 34.0),
+            ("A second paragraph starts after the gap and goes", 62.0),
+            ("on to its own second line before it ends.", 76.0),
+            ("A third paragraph is one line long here.", 104.0),
+        ];
+        let spans = lines
+            .iter()
+            .map(|&(text, top)| tilted_span(text, 20.0, top, 380.0, 10.0, slope))
+            .collect();
+        let page = sized_routed_page(400, 200, spans);
+
+        let markdown = ocr_page_to_markdown(&page, 1, &MarkdownOptions::default());
+
+        assert!(!markdown.contains('#'), "{markdown:?}");
+        assert_eq!(
+            markdown.trim(),
+            "The first paragraph opens on this line and runs on to a second line of the same \
+             paragraph.\n\nA second paragraph starts after the gap and goes on to its own second \
+             line before it ends.\n\nA third paragraph is one line long here.",
+        );
+    }
+
+    #[test]
+    fn pieces_of_one_line_keep_their_order_across_a_blank() {
+        // A form line split at a blank: the right-hand piece's box sits
+        // three pixels higher than the left-hand one.
+        let page = sized_routed_page(
+            400,
+            200,
+            vec![
+                positioned_span(
+                    "The parties signed the contract below.",
+                    20.0,
+                    20.0,
+                    380.0,
+                    30.0,
+                ),
+                positioned_span("Contract No", 20.0, 40.0, 110.0, 50.0),
+                positioned_span("dated the first of March", 200.0, 37.0, 380.0, 47.0),
+                positioned_span("Both parties keep one copy of it.", 20.0, 60.0, 380.0, 70.0),
+            ],
+        );
+
+        let markdown = ocr_page_to_markdown(&page, 1, &MarkdownOptions::default());
+
+        let left = markdown.find("Contract No").unwrap();
+        let right = markdown.find("dated the first of March").unwrap();
+        let above = markdown.find("contract below.").unwrap();
+        assert!(above < left && left < right, "{markdown:?}");
+    }
+
+    #[test]
+    fn a_tall_body_line_is_body_text_and_a_short_large_line_a_heading() {
+        let page = sized_routed_page(
+            400,
+            300,
+            vec![
+                positioned_span("Delivery terms", 20.0, 20.0, 150.0, 36.0),
+                positioned_span(
+                    "The supplier delivers the goods to the buyer's",
+                    20.0,
+                    50.0,
+                    380.0,
+                    60.0,
+                ),
+                // Measured 1.3 times the body height, as photographed body
+                // lines can be.
+                positioned_span(
+                    "warehouse within ten working days of each order",
+                    20.0,
+                    63.0,
+                    380.0,
+                    76.0,
+                ),
+                positioned_span(
+                    "and bears the cost of transport and insurance.",
+                    20.0,
+                    79.0,
+                    380.0,
+                    89.0,
+                ),
+            ],
+        );
+
+        let markdown = ocr_page_to_markdown(&page, 1, &MarkdownOptions::default());
+
+        let headings: Vec<&str> = markdown.lines().filter(|l| l.starts_with('#')).collect();
+        assert_eq!(headings.len(), 1, "{markdown:?}");
+        assert_eq!(headings[0].trim_start_matches('#').trim(), "Delivery terms");
+        assert!(
+            markdown.contains("buyer's warehouse within ten working days of each order and bears"),
+            "{markdown:?}"
+        );
+    }
+
+    #[test]
+    fn a_page_read_turned_upright_is_laid_out_upright() {
+        // The same three lines, once on an upright 200 × 400 page and once
+        // on that page stored turned 90 degrees clockwise (400 × 200), as
+        // the engine reports a sideways scan it read turned upright.
+        let upright = [
+            positioned_span("Notice of delivery", 20.0, 20.0, 120.0, 32.0),
+            positioned_span(
+                "The goods arrive on Monday morning.",
+                20.0,
+                60.0,
+                180.0,
+                70.0,
+            ),
+            positioned_span("Please sign the delivery note.", 20.0, 100.0, 180.0, 110.0),
+        ];
+        let expected = ocr_page_to_markdown(
+            &sized_routed_page(200, 400, upright.to_vec()),
+            1,
+            &MarkdownOptions::default(),
+        );
+        // Upright (u, v) on the 200 × 400 page is (400 - v, u) on the page
+        // turned 90 degrees clockwise.
+        let turned = upright
+            .iter()
+            .map(|span| OcrSpan {
+                polygon: ImageQuad::new(
+                    span.polygon
+                        .points
+                        .map(|point| ImagePoint::new(400.0 - point.y, point.x)),
+                ),
+                orientation_degrees: Some(90.0),
+                ..span.clone()
+            })
+            .collect();
+
+        let markdown = ocr_page_to_markdown(
+            &sized_routed_page(400, 200, turned),
+            1,
+            &MarkdownOptions::default(),
+        );
+
+        assert_eq!(markdown, expected);
+        assert!(markdown.contains("Notice of delivery"), "{markdown:?}");
+        assert!(
+            markdown.find("Monday").unwrap() < markdown.find("Please sign").unwrap(),
+            "{markdown:?}"
+        );
+    }
+
+    #[test]
+    fn upright_turns_follow_the_spans_reported_orientation() {
+        let with = |degrees: Option<f32>| {
+            let mut span = positioned_span("Line", 10.0, 10.0, 90.0, 20.0);
+            span.orientation_degrees = degrees;
+            sized_routed_page(100, 100, vec![span])
+        };
+        assert_eq!(page_upright_turns(&with(None)), 0);
+        assert_eq!(page_upright_turns(&with(Some(0.0))), 0);
+        assert_eq!(page_upright_turns(&with(Some(90.0))), 3);
+        assert_eq!(page_upright_turns(&with(Some(180.0))), 2);
+        assert_eq!(page_upright_turns(&with(Some(270.0))), 1);
+        assert_eq!(page_upright_turns(&with(Some(-90.0))), 1);
+        assert_eq!(page_upright_turns(&with(Some(f32::NAN))), 0);
+    }
+
+    #[test]
+    fn axis_aligned_quads_on_an_unskewed_page_keep_their_bounds() {
+        let points = [
+            ImagePoint::new(10.5, 20.25),
+            ImagePoint::new(90.75, 20.25),
+            ImagePoint::new(90.75, 31.0),
+            ImagePoint::new(10.5, 31.0),
+        ];
+        assert_eq!(
+            image_quad_bounds(&points, 100, 100, 0.0),
+            Some((10.5, 20.25, 90.75, 31.0))
+        );
     }
 
     #[test]

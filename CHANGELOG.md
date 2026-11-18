@@ -181,6 +181,26 @@ version and date. Earlier releases are described in their
   by row, instead of its English column being cut in two around the
   Russian one. ([#274](https://github.com/firecrawl/pdf-inspector/pull/274),
   ported)
+- OCR keeps the paragraphs of a photographed or slanted scan apart and no
+  longer turns its long lines into headings. Recognized lines are laid out
+  level (the page's median slant is turned out, and a still-tilted line
+  gets a box of its own height rather than its axis-aligned bounds), pieces
+  of one line split at a blank share a baseline, and lines measured within
+  the noise of the page's body height (0.8–1.2 times it, up to 1.35 for a
+  long line set inside a paragraph) take that body size, as native text of
+  one font has. Axis-aligned lines on an unslanted page keep their boxes,
+  and OCR of image regions on native pages keeps its page geometry.
+  ([#624](https://github.com/firecrawl/pdf-inspector/issues/624), reported
+  by ryanduguid)
+- OCR reads a page scanned sideways or upside down instead of returning
+  garbled or no text. Lines that run vertically put the page on its side,
+  and a page that reads below 0.9 mean confidence is tried half turned on a
+  sample of its longest lines; the page is then turned upright and
+  detected again. Every span of a turned page reports the turn in
+  `orientation_degrees` (clockwise). A checked page that still reads below
+  0.8, turned or not, keeps a warning. No orientation model is loaded.
+  ([#622](https://github.com/firecrawl/pdf-inspector/issues/622), reported
+  by ryanduguid)
 
 ## [1.26.1] - 2026-11-15
 
