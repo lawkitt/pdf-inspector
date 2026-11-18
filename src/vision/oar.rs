@@ -124,9 +124,10 @@ const ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 15.0;
 const SPARSE_ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 13.0;
 
 /// ...with at least this many regions. An 8-row statement at 6 pt (9 regions
-/// with its title) still lost a row at the standard limit; 4-row ones (5
-/// regions) and a scan with six tiny regions lost nothing, so pages with a
-/// stray caption or speckle stay on the standard pass.
+/// with its title) still garbled a row past use at the standard limit (its
+/// date and payee gone); 4-row ones (5 regions) and a scan with six tiny
+/// regions read the same either way, so pages with a stray caption or
+/// speckle stay on the standard pass.
 const SPARSE_ESCALATION_MINIMUM_REGIONS: usize = 8;
 
 /// A page is on its side when at least this many detected lines run
@@ -1472,7 +1473,7 @@ mod tests {
         // whole rows on the standard pass and recover them all escalated.
         assert!(should_escalate_detection(12.0, 30, 0.547));
         assert!(should_escalate_detection(11.6, 44, 0.582));
-        // An 8-row statement at 6 pt (9 regions with its title) lost a row.
+        // An 8-row statement at 6 pt (9 regions with its title) garbled a row.
         assert!(should_escalate_detection(12.0, 9, 0.547));
         // A dense table page measuring 12.2 px with 65 regions.
         assert!(should_escalate_detection(12.2, 65, 0.582));
