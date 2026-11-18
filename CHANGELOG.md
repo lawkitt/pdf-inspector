@@ -85,6 +85,16 @@ version and date. Earlier releases are described in their
   two-page document keeps its edge lines, where the per-page fallback could
   leave out even their first occurrence with nothing to report. Whole-
   document Markdown conversion (`process_pdf`) keeps that fallback.
+- A page rendered for OCR leaves out comment-type annotations: sticky notes
+  (`/Text`), FreeText boxes, popups and text markup (`/Highlight`,
+  `/Underline`, `/StrikeOut`, `/Squiggly`), so their text is no longer
+  recognized into the page's Markdown; it is reported in `annotations`.
+  Stamps, ink, file attachments, links, shapes and form widgets are still
+  drawn. The renderer reads a copy of the file whose comment annotations
+  carry the Hidden flag, written as one incremental update after the
+  original bytes (encrypted files included). `RenderOptions::comment_annotations`
+  (off by default) draws them again; `annotations(false)` still leaves out
+  every annotation. Pages without comment annotations render as before.
 - A word hyphenated at a line wrap inside one paragraph is joined without
   the document having to use it elsewhere, when a lowercase letter meets a
   lowercase letter of the same script ("contrac-" + "tion", "дого-" +

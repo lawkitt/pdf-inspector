@@ -44,6 +44,13 @@ pub struct RenderOptions {
     pub pixel_format: RenderPixelFormat,
     /// Include PDF annotations in the rendered bitmap.
     pub annotations: bool,
+    /// When `annotations` is on, also draw comment-type annotations: notes
+    /// (`Text`), `FreeText`, `Popup` and text markup (`Highlight`,
+    /// `Underline`, `StrikeOut`, `Squiggly`). Off by default, so OCR does not
+    /// read a comment's text into the page: their text is reported as
+    /// annotations beside the Markdown instead. Stamps, ink, file
+    /// attachments, links, shapes and form widgets are drawn either way.
+    pub comment_annotations: bool,
     /// Include visible static AcroForm field appearances.
     pub form_fields: bool,
     /// Maximum allocation for each rendered page.
@@ -56,6 +63,7 @@ impl Default for RenderOptions {
             dpi: DEFAULT_RENDER_DPI,
             pixel_format: RenderPixelFormat::Rgb8,
             annotations: true,
+            comment_annotations: false,
             form_fields: true,
             max_output_bytes_per_page: DEFAULT_MAX_OUTPUT_BYTES,
         }
@@ -83,6 +91,13 @@ impl RenderOptions {
     /// Toggles annotation rendering.
     pub fn annotations(mut self, annotations: bool) -> Self {
         self.annotations = annotations;
+        self
+    }
+
+    /// Toggles drawing comment-type annotations; see
+    /// [`RenderOptions::comment_annotations`].
+    pub fn comment_annotations(mut self, comment_annotations: bool) -> Self {
+        self.comment_annotations = comment_annotations;
         self
     }
 

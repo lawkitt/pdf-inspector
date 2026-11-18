@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::types::{ItemType, TextItem};
 
+use super::comment_annotations::hide_comment_annotations;
 use super::{
     PageRenderer, PageTransform, RenderBufferError, RenderOptions, RenderPixelFormat, RenderedPage,
 };
@@ -186,7 +187,7 @@ impl PdfiumRenderer {
             return Err(RenderError::InvalidPageNumber);
         }
 
-        let document = self.pdfium.load_document(pdf_bytes.to_vec(), password)?;
+        let document = self.load_render_document(pdf_bytes, password, options)?;
         let page_count = document.page_count();
 
         if let Some(&page) = pages.iter().find(|&&page| page as usize > page_count) {
@@ -213,6 +214,34 @@ impl PdfiumRenderer {
         }
 
         Ok(rendered_pages)
+    }
+
+    /// The document to render: unless `options` asks for comment-type
+    /// annotations, a copy with them hidden (see `comment_annotations`).
+    /// When no copy can be made, or PDFium cannot open it, the original is
+    /// rendered and the reason logged.
+    fn load_render_document(
+        &self,
+        pdf_bytes: &[u8],
+        password: Option<&str>,
+        options: &RenderOptions,
+    ) -> Result<firecrawl_pdfium::PdfDocument, RenderError> {
+        if options.annotations && !options.comment_annotations {
+            match hide_comment_annotations(pdf_bytes, password) {
+                Ok(Some(copy)) => match self.pdfium.load_document(copy, password) {
+                    Ok(document) => return Ok(document),
+                    Err(error) => log::warn!(
+                        "rendering with comment annotations drawn: PDFium could not open \
+                         the copy that hides them: {error}"
+                    ),
+                },
+                Ok(None) => {}
+                Err(error) => log::warn!(
+                    "rendering with comment annotations drawn: could not hide them: {error}"
+                ),
+            }
+        }
+        Ok(self.pdfium.load_document(pdf_bytes.to_vec(), password)?)
     }
 }
 

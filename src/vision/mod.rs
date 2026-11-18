@@ -28,6 +28,8 @@ mod render;
 mod routing;
 
 #[cfg(all(feature = "render-pdfium", not(target_arch = "wasm32")))]
+mod comment_annotations;
+#[cfg(all(feature = "render-pdfium", not(target_arch = "wasm32")))]
 mod pdfium;
 
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
