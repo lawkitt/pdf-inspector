@@ -120,9 +120,9 @@ version and date. Earlier releases are described in their
   1.2 GiB at 150 dpi and 2.2 GiB at 200 dpi on a 10-core Mac (1.7 and
   2.9 GiB on an iPhone 17 Pro). Sessions now run without the arena and
   without memory patterns: 0.25 and 0.54 GiB on the Mac (0.76 and
-  0.98 GiB on the iPhone), with byte-identical output and at most 4% more
-  time.
-
+  0.98 GiB on the iPhone), with byte-identical output. Recognition takes
+  1–4% longer on the iPhone and about 12% longer on the Mac, which now
+  gets fresh memory for every page.
 - A simple font's ToUnicode CMap of fewer than ten entries keeps its say
   for the codes the embedded program does not read. Such a CMap yields to
   the program's own reading, and its entries were then dropped, so a code
