@@ -2,6 +2,7 @@
 //!
 //! This module extracts text with position information for structure detection.
 
+pub(crate) mod annotations;
 mod base14;
 mod clip_boundaries;
 pub(crate) mod content_decode;

@@ -1,0 +1,129 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Title (Text annotations) /Subject (Synthetic fixture: text-bearing annotations) /Producer (scripts/make_annotation_fixture.py) >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 126 /Widths [278 0 0 0 0 0 0 0 0 0 0 0 278 0 278 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 722 0 0 0 0 0 0 0 0 0 0 0 667 0 0 667 611 0 0 0 0 0 0 0 0 0 0 0 0 556 556 500 556 556 278 556 556 222 0 0 222 833 556 556 556 0 333 500 278 556 500 722 0 500 0 0 0 0 0] >>
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /CropBox [36 36 576 756] /Resources << /Font << /F1 4 0 R >> >> /Contents 26 0 R /Annots [7 0 R 8 0 R 10 0 R 11 0 R 12 0 R 13 0 R 14 0 R 15 0 R 16 0 R 17 0 R 18 0 R 19 0 R 20 0 R 21 0 R 22 0 R] >>
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 27 0 R /Annots [23 0 R 24 0 R 25 0 R] >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Text /Rect [40 694 58 712] /P 5 0 R /Name /Comment /C [1 0.8 0] /T (Alice) /M (D:20261118093000+07'00') /CreationDate (D:20261118090000+07'00') /Contents (Check the delivery term.) /Popup 8 0 R >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Popup /Rect [580 600 760 700] /Parent 7 0 R /Open false >>
+endobj
+9 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 180 30] /Resources << /Font << /F1 4 0 R >> >> /Length 45 >>
+stream
+BT /F1 10 Tf 4 11 Td (Draft for review) Tj ET
+endstream
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /FreeText /Rect [360 600 540 630] /P 5 0 R /T (Bob) /M (D:20261118094500+07'00') /Contents (Draft for review) /DA (/Helv 10 Tf 0 g) /AP << /N 9 0 R >> >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [298.092 697 352.776 710] /P 5 0 R /QuadPoints [298.092 710 352.776 710 298.092 697 352.776 697] /C [1 1 0] /T (Alice) /CreationDate (D:20261118091500Z) /Contents (Should this be 30 business days?) /Popup 12 0 R >>
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /Popup /Rect [580 500 760 600] /Parent 11 0 R /Open false >>
+endobj
+13 0 obj
+<< /Type /Annot /Subtype /Text /Rect [540 680 558 698] /P 5 0 R /IRT 11 0 R /T <FEFF0411043E044004380441> /M (D:20261118100000+03'00') /Contents <FEFF04140430002C0020044004300431043E04470438044500200434043D04350439002E> >>
+endobj
+14 0 obj
+<< /Type /Annot /Subtype /Text /Rect [40 694 58 712] /P 5 0 R /IRT 7 0 R /F 30 /State (Completed) /StateModel (Review) /T (Alice) /M (D:20261118110000+07'00') /Contents (Completed set by Alice) >>
+endobj
+15 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [168.708 657 213.396 670] /P 5 0 R /QuadPoints [168.708 670 213.396 670 168.708 657 213.396 657] /C [1 1 0] /T (Alice) >>
+endobj
+16 0 obj
+<< /Type /Annot /Subtype /Underline /Rect [72 677 154.704 690] /P 5 0 R /QuadPoints [72 690 154.704 690 72 677 154.704 677] /C [0 0 1] /T <FEFF041804400438043D0430> /M (D:20261118120000+03'00') /RC <FEFF003C003F0078006D006C002000760065007200730069006F006E003D00220031002E00300022003F003E003C0062006F0064007900200078006D006C006E0073003D00220068007400740070003A002F002F007700770077002E00770033002E006F00720067002F0031003900390039002F007800680074006D006C002200200078006D006C006E0073003A007800660061003D00220068007400740070003A002F002F007700770077002E007800660061002E006F00720067002F0073006300680065006D0061002F007800660061002D0064006100740061002F0031002E0030002F00220020007800660061003A00410050004900560065007200730069006F006E003D0022004100630072006F006200610074003A00310031002E0030002E003000220020007800660061003A0073007000650063003D00220032002E0030002E00320022003E003C00700020006400690072003D0022006C007400720022003E00440075006500200064006100740065002000260061006D0070003B0020003C007300700061006E0020007300740079006C0065003D00220066006F006E0074002D007700650069006700680074003A0062006F006C00640022003E00700065006E0061006C00740079003C002F007300700061006E003E003C002F0070003E003C0070003E04210440043E043A0020043E043F043B04300442044B003C002F0070003E003C002F0062006F00640079003E> >>
+endobj
+17 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect (not a rectangle) /P 5 0 R /T (Alice) /Contents (Malformed rectangle) >>
+endobj
+18 0 obj
+<< /Type /Annot /Subtype /StrikeOut /Rect [141.36 697 166.032 710] /P 5 0 R /QuadPoints [141.36 710 166.032 710 141.36 697 166.032 697] /C [1 0 0] /T (Bob) /M (D:20261118095000+07'00') /Contents (Delete) >>
+endobj
+19 0 obj
+<< /Type /Annot /Subtype /Squiggly /Rect [260.772 677 298.116 690] /P 5 0 R /QuadPoints [260.772 690 298.116 690 260.772 677 298.116 677] /C [0 1 0] /T (Bob) /M (D:20261118095500+07'00') /Contents (Wrong word?) >>
+endobj
+20 0 obj
+<< /Type /Annot /Subtype /Text /Rect [540 680 558 698] /P 5 0 R /IRT 11 0 R /F 30 /State (Rejected) /StateModel (Review) /T (Bob) /M (D:20261118103000+07'00') /Contents (Rejected set by Bob) >>
+endobj
+21 0 obj
+<< /Type /Annot /Subtype /Text /Rect [540 680 558 698] /P 5 0 R /IRT 20 0 R /F 30 /State /Completed /StateModel /Review /T (Bob) /M (D:20261118104500+07'00') /Contents (Completed set by Bob) >>
+endobj
+22 0 obj
+42
+endobj
+23 0 obj
+<< /Type /Annot /Subtype /Text /Rect [40 694 58 712] /P 6 0 R /T (Bob) /M (D:20261118130000+07'00') /Contents (Second page note) >>
+endobj
+24 0 obj
+<< /Type /Annot /Subtype /Text /Rect [40 694 58 712] /P 6 0 R /IRT 23 0 R /F 30 /State (Accepted) /StateModel (Review) /T (Alice) /M (D:20261118131000+07'00') /Contents (Accepted set by Alice) >>
+endobj
+25 0 obj
+<< /Type /Annot /Subtype /Text /Rect [40 694 58 712] /P 6 0 R /IRT 24 0 R /F 30 /State (Rejected) /StateModel (Review) /T (Alice) /M (D:20261118132000+07'00') /Contents (Rejected set by Alice) >>
+endobj
+26 0 obj
+<<  /Length 238 >>
+stream
+BT /F1 12 Tf 72 700 Td (The supplier shall deliver the goods within thirty days.) Tj ET
+BT /F1 12 Tf 72 680 Td (Payment is due upon receipt of the invoice.) Tj ET
+BT /F1 12 Tf 72 660 Td (This clause has a highlight with no comment.) Tj ET
+endstream
+endobj
+27 0 obj
+<<  /Length 55 >>
+stream
+BT /F1 12 Tf 72 700 Td (Second page with a note.) Tj ET
+endstream
+endobj
+xref
+0 28
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000127 00000 n 
+0000000276 00000 n 
+0000000657 00000 n 
+0000000922 00000 n 
+0000001080 00000 n 
+0000001318 00000 n 
+0000001418 00000 n 
+0000001601 00000 n 
+0000001796 00000 n 
+0000002069 00000 n 
+0000002171 00000 n 
+0000002410 00000 n 
+0000002623 00000 n 
+0000002803 00000 n 
+0000004095 00000 n 
+0000004226 00000 n 
+0000004449 00000 n 
+0000004679 00000 n 
+0000004889 00000 n 
+0000005099 00000 n 
+0000005118 00000 n 
+0000005266 00000 n 
+0000005478 00000 n 
+0000005690 00000 n 
+0000005981 00000 n 
+trailer
+<< /Size 28 /Root 1 0 R /Info 3 0 R >>
+startxref
+6088
+%%EOF

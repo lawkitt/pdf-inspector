@@ -225,6 +225,10 @@ pub struct OcrPdfResult {
     /// extraction. Left out of the native Markdown whether or not the page
     /// was then recognized.
     pub hidden_text_by_page: Vec<crate::PageHiddenText>,
+    /// The selected pages' annotations that carry text (notes, FreeText,
+    /// markup with a comment), from native extraction; never in the
+    /// Markdown. `in_reply_to` indexes this list.
+    pub annotations: Vec<crate::PdfAnnotation>,
     /// Selected pages where deterministic table detection found tables.
     pub pages_with_tables: Vec<u32>,
     /// Selected pages where deterministic layout found multiple columns.
@@ -550,6 +554,7 @@ pub fn process_pdf_with_ocr_mem(
         invisible_text_by_page: native.invisible_text_by_page,
         repeated_lines_by_page,
         hidden_text_by_page: native.hidden_text_by_page,
+        annotations: native.annotations,
         pages_with_tables: pages_with_tables.clone(),
         pages_with_columns: native.pages_with_columns,
         is_complex: native.is_complex || !pages_with_tables.is_empty(),
