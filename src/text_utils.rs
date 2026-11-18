@@ -56,31 +56,65 @@ pub(crate) fn is_explicit_page_number_expression(text: &str) -> bool {
     }
 }
 
-/// Return whether a completed Markdown line looks like a page number or a
-/// labeled running header.
+/// Return whether a completed Markdown line is a page number, and nothing
+/// else: "3", "- 3 -", "Page 3", "Page 3 of 9", "3 of 9", and their Russian
+/// forms "Страница 3", "Стр. 3", "Стр. 3 из 9", "3 из 9".
 ///
-/// At this stage the complete line and surrounding breaks are available, so a
-/// leading `Page N` remains compatible with the existing header cleanup even
-/// when the PDF appends a chapter or document title.
+/// Only the whole line counts. A line that starts with a page label and goes
+/// on ("Page 1 line 0: ...", "Page 3 of 10 Report header") is text, and
+/// stays; a running header that carries its page number is the repetition
+/// pass's to judge, which counts what it removes.
 pub(crate) fn is_page_number_line(text: &str) -> bool {
-    if is_explicit_page_number_expression(text) {
+    let lowercase = text.trim().to_lowercase();
+    if lowercase.is_empty() {
+        return false;
+    }
+    let is_number = |value: &str| {
+        !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+    };
+    if lowercase.len() <= 4 && is_number(&lowercase) {
         return true;
     }
-
-    let lowercase = text.trim().to_ascii_lowercase();
-    lowercase.strip_prefix("page").is_some_and(|rest| {
-        let mut characters = rest.trim_start().chars().peekable();
-        let mut has_page_number = false;
-        while characters
-            .peek()
-            .is_some_and(|character| character.is_ascii_digit())
-        {
-            has_page_number = true;
-            characters.next();
+    if let Some(inner) = lowercase
+        .strip_prefix('-')
+        .and_then(|rest| rest.strip_suffix('-'))
+    {
+        if is_number(inner.trim()) {
+            return true;
         }
-
-        has_page_number && characters.next().is_none_or(char::is_whitespace)
-    })
+    }
+    let is_of = |word: &str| word == "of" || word == "из";
+    let labelled = ["page", "страница", "стр.", "стр"]
+        .iter()
+        .find_map(|label| Some((*label, lowercase.strip_prefix(label)?)));
+    if let Some((label, rest)) = labelled {
+        // "Page" must not run into a word ("Pages", "Pager"); a number may
+        // follow it directly ("Page3").
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && !c.is_ascii_digit())
+        {
+            return false;
+        }
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        // "Page", "Page of" and "Page of 9", their number missing, are kept
+        // from the English rule before; a Russian label needs its number, so
+        // a form's own "Страница" or "Стр." caption stays.
+        let english = label == "page";
+        return match words.as_slice() {
+            [] => english,
+            [word] => is_number(word) || (english && is_of(word)),
+            [of, total] => english && is_of(of) && is_number(total),
+            [number, of, total] => is_number(number) && is_of(of) && is_number(total),
+            _ => false,
+        };
+    }
+    let words: Vec<&str> = lowercase.split_whitespace().collect();
+    matches!(
+        words.as_slice(),
+        [number, of, total] if is_number(number) && is_of(of) && is_number(total)
+    )
 }
 
 /// Check if a character is CJK (Chinese, Japanese, Korean).

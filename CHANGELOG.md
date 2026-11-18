@@ -72,6 +72,30 @@ version and date. Earlier releases are described in their
   number opening or closing the row still lets it repeat when it rises with
   the page ("Annual Report 5", "Annual Report 6"). The first page that shows
   a repeated row keeps it, as before.
+- Repeated headers and footers: only a plausible page number may differ. It
+  equals the page index or trails it by up to 10 pages of unnumbered front
+  matter, the same on every page, and is not labelled as a document's own
+  number ("No.", "№", "#", "Invoice", "Case", "Annex", "Дело", "Счёт",
+  "Приложение" and similar). "Invoice 4171" to "Invoice 4174" on pages 1 to
+  4, "Invoice No. 1" to "No. 4", or a header numbered ahead of the page index
+  (carried over from a longer document) now stay on every page. The number
+  must keep that step on the page being judged too, and a piece of the row
+  that changes from page to page ("Invoice No. 4172" beside a repeated
+  "Acme Holdings") stays when the repeated piece goes.
+- Repeated headers and footers need at least 30% of the pages, rounded up,
+  as the rule states: on 11 pages, 4 pages, not 3.
+- Repeated headers and footers: a page whose native text never reaches the
+  Markdown (it needs OCR: a scan, garbled or outlined text, a text layer
+  hidden under an image) takes no part in the native pass. Before, it could
+  keep a header that was dropped from every other page, so no copy was left
+  when OCR did not run, and its repeats were counted; or its out-of-step
+  number could stop the other pages' page-numbered header from repeating.
+- A Markdown line is removed as a page number only when the whole line is
+  one ("3", "- 3 -", "Page 3", "Page 3 of 9", "3 of 9", and the Russian
+  "Страница 3", "Стр. 3 из 9", "3 из 9"; a Russian label alone stays). A
+  line that only starts with
+  "Page N" ("Page 1 line 0: ...", "Page 42 explains the result") is text and
+  stays.
 - OCR: a scan's running header or footer stays on the first recognized page
   that shows it and its exact repeats in the same place go, on three or
   more recognized pages; before, each recognized page was converted on its

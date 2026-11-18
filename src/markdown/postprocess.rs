@@ -1426,7 +1426,49 @@ mod tests {
     fn test_is_page_number_page_x_of_y() {
         assert!(is_page_number_line("Page 3 of 10"));
         assert!(is_page_number_line("page 1 of 5"));
-        assert!(is_page_number_line("Page 3 of 10 Report header"));
+    }
+
+    #[test]
+    fn page_number_lines_are_whole_lines() {
+        // Russian folios.
+        for folio in [
+            "Страница 3",
+            "страница 12",
+            "Стр. 3",
+            "стр 3",
+            "Стр. 3 из 9",
+            "3 из 9",
+        ] {
+            assert!(is_page_number_line(folio), "{folio}");
+        }
+        // A line that starts like a folio and goes on is text.
+        for text in [
+            "Page 1 line 0: the parties agree",
+            "Page 3 of 10 Report header",
+            "Page 12 explains the result",
+            "Страница 3 договора поставки",
+            "Стр. 3 из 9 Приложение",
+            "Pages 3",
+            "Pager 3",
+            // A Russian label needs its number.
+            "Страница",
+            "Стр.",
+            "стр из 9",
+        ] {
+            assert!(!is_page_number_line(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_body_line_that_starts_with_page_n_is_kept() {
+        let markdown =
+            "Intro paragraph.\n\nPage 1 line 0: the parties agree.\n\nPage 3\n\n---\n\nMore text.";
+        let cleaned = remove_page_numbers(markdown);
+        assert!(
+            cleaned.contains("Page 1 line 0: the parties agree."),
+            "{cleaned}"
+        );
+        assert!(!cleaned.contains("\nPage 3\n"), "{cleaned}");
     }
 
     #[test]
@@ -1461,8 +1503,10 @@ mod tests {
 
     #[test]
     fn test_is_page_number_labeled_running_header() {
-        assert!(is_page_number_line("Page 42 Chapter 5"));
-        assert!(is_page_number_line("Page 42 explains the result"));
+        // Only a whole-line folio is a page number; a running header that
+        // carries one is the repetition pass's to judge.
+        assert!(!is_page_number_line("Page 42 Chapter 5"));
+        assert!(!is_page_number_line("Page 42 explains the result"));
     }
 
     // --- remove_page_numbers ---
@@ -1492,10 +1536,11 @@ mod tests {
 
     #[test]
     fn test_remove_page_numbers_labeled_header_with_content() {
+        // Text that starts with a page label is kept, even before a break.
         let input = "Content\n\nPage 42 explains the result\n---\nEnd";
         let result = remove_page_numbers(input);
 
-        assert!(!result.contains("Page 42 explains the result"));
+        assert!(result.contains("Page 42 explains the result"));
         assert!(result.contains("Content"));
         assert!(result.contains("End"));
     }
