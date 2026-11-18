@@ -308,24 +308,28 @@ pub(crate) fn find_row_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
     rows
 }
 
-/// Whether `below`, the next line of a table cell, reads as a continuation
-/// of `above`: it starts in lowercase, or `above` breaks off on a hyphen,
-/// dash, comma or slash, or on a lowercase word with no closing punctuation.
-pub(crate) fn continues_cell_text(above: &str, below: &str) -> bool {
-    let above = above.trim_end();
-    let below = below.trim_start();
-    if above.is_empty() || below.is_empty() {
-        return false;
-    }
-    if below.chars().next().is_some_and(char::is_lowercase) {
+/// Whether `text`, a line of a table cell, breaks off unfinished: on a
+/// hyphen, dash, comma, slash or ampersand, or on a lowercase word with no
+/// closing punctuation.
+pub(crate) fn ends_unfinished(text: &str) -> bool {
+    let text = text.trim_end();
+    if text.ends_with(['-', '\u{2010}', '\u{2013}', '\u{2014}', ',', '/', '&']) {
         return true;
     }
-    if above.ends_with(['-', '\u{2010}', '\u{2013}', '\u{2014}', ',', '/', '&']) {
-        return true;
-    }
-    above.split_whitespace().last().is_some_and(|word| {
+    text.split_whitespace().last().is_some_and(|word| {
         word.chars().all(char::is_alphabetic) && word.chars().next().is_some_and(char::is_lowercase)
     })
+}
+
+/// Whether `below`, the next line of a table cell, reads as a continuation
+/// of `above`: it starts in lowercase, or `above` ends unfinished
+/// (`ends_unfinished`).
+pub(crate) fn continues_cell_text(above: &str, below: &str) -> bool {
+    let below = below.trim_start();
+    if above.trim().is_empty() || below.is_empty() {
+        return false;
+    }
+    below.chars().next().is_some_and(char::is_lowercase) || ends_unfinished(above)
 }
 
 /// Which rows of a borderless table are only the next line of the row
@@ -334,8 +338,11 @@ pub(crate) fn continues_cell_text(above: &str, below: &str) -> bool {
 /// line when the table's baselines fall into two spacings, line pitch and a
 /// looser row pitch, and the row sits at line pitch under the row above,
 /// fills fewer cells than it, only cells the row above fills too, has no
-/// cell that is a bare number, and at least half of its cells continue the text above
-/// (`continues_cell_text`). `rows` are the rows' baselines, top to bottom.
+/// cell that is a bare number, and at least half of its cells continue the
+/// text above (`continues_cell_text`), one of them because the text above
+/// ends unfinished. The header row takes no line: a record set close under
+/// it would otherwise read as its wrap. `rows` are the rows' baselines, top
+/// to bottom.
 pub(crate) fn wrapped_line_rows(rows: &[f32], cells: &[Vec<String>]) -> Vec<bool> {
     let mut wrapped = vec![false; rows.len()];
     if rows.len() < 3 || cells.len() != rows.len() {
@@ -359,7 +366,7 @@ pub(crate) fn wrapped_line_rows(rows: &[f32], cells: &[Vec<String>]) -> Vec<bool
                     || matches!(ch, '.' | ',' | '-' | '%' | '$')
             })
     };
-    for row in 1..rows.len() {
+    for row in 2..rows.len() {
         if gaps[row - 1] > line_pitch * 1.15 {
             continue;
         }
@@ -378,7 +385,8 @@ pub(crate) fn wrapped_line_rows(rows: &[f32], cells: &[Vec<String>]) -> Vec<bool
             .iter()
             .filter(|&&col| continues_cell_text(&above[col], &below[col]))
             .count();
-        wrapped[row] = continuing * 2 >= lines.len();
+        wrapped[row] =
+            continuing * 2 >= lines.len() && lines.iter().any(|&col| ends_unfinished(&above[col]));
     }
     wrapped
 }
@@ -777,6 +785,25 @@ mod tests {
             row(&["Cost of sales", "60", "70"]),
             row(&["Operating expenses", "", ""]),
             row(&["Salaries", "20", "22"]),
+        ];
+        assert_eq!(wrapped_line_rows(&rows, &cells), [false; 4]);
+        // A text-only record set close under the header is a row, not the
+        // header's wrap.
+        let rows = [720.0, 708.0, 688.0, 668.0];
+        let cells = vec![
+            row(&["Product", "Colour", "Size", "Status", "Notes"]),
+            row(&["widget", "blue", "compact", "pending", ""]),
+            row(&["gadget", "red", "large", "shipped", "new"]),
+            row(&["sprocket", "green", "small", "held", "old"]),
+        ];
+        assert_eq!(wrapped_line_rows(&rows, &cells), [false; 4]);
+        // Lowercase starts alone are no wrap: the text above must break off.
+        let rows = [720.0, 700.0, 688.0, 668.0];
+        let cells = vec![
+            row(&["Item", "Colour", "Finish"]),
+            row(&["Widget", "Blue.", "Matte."]),
+            row(&["", "navy", "gloss"]),
+            row(&["Gadget", "Red.", "Satin."]),
         ];
         assert_eq!(wrapped_line_rows(&rows, &cells), [false; 4]);
         // A record under the header at line pitch is data once it holds a
