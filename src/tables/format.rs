@@ -440,16 +440,21 @@ fn clean_cells(cells: &[Vec<String>], layout_rows: &[bool]) -> (Vec<Vec<String>>
             && looks_like_plain_section_label(first_cell);
         // A table on a page after a page break can open with the rest of a
         // row split by the break (upstream #588): its first cell is empty
-        // like this row's, and each of this row's cells continues the text
-        // above it, so this row is that fragment's next line, not a first
-        // data row under a header.
+        // like this row's, each of this row's cells continues the text above
+        // it, and the text above breaks off unfinished in one of them, so
+        // this row is that fragment's next line, not a first data row under
+        // a header. A two-row header ("Revenue | Profit" over "net | gross")
+        // does not break off and stays two rows.
         let continues_split_row = cleaned.len() == 1
             && cleaned[0].first().is_some_and(|cell| cell.is_empty())
             && row
                 .iter()
                 .zip(&cleaned[0])
                 .filter(|(below, _)| !below.trim().is_empty())
-                .all(|(below, above)| super::grid::continues_cell_text(above, below.trim()));
+                .all(|(below, above)| super::grid::continues_cell_text(above, below.trim()))
+            && row.iter().zip(&cleaned[0]).any(|(below, above)| {
+                !below.trim().is_empty() && super::grid::ends_unfinished(above)
+            });
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
@@ -1023,6 +1028,11 @@ mod tests {
         let cells = vec![
             vec!["".into(), "Revenue".into(), "Profit".into()],
             vec!["".into(), "Group".into(), "Company".into()],
+        ];
+        assert_eq!(clean_table_cells(&cells).0.len(), 2);
+        let cells = vec![
+            vec!["".into(), "Revenue".into(), "Profit".into()],
+            vec!["".into(), "net".into(), "gross".into()],
         ];
         assert_eq!(clean_table_cells(&cells).0.len(), 2);
     }
