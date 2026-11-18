@@ -164,10 +164,24 @@ impl PageTransform {
         let b = (y_axis.0 - origin.0) / height;
         let d = (y_axis.1 - origin.1) / height;
         let (e, f) = origin;
-        let forward = [a, b, c, d, e, f];
+        Self::from_forward(pixel_width, pixel_height, [a, b, c, d, e, f])
+    }
+
+    /// Rebuilds a transform from its pixel-to-page coefficients
+    /// `[a, b, c, d, e, f]` ([`forward`](Self::forward)): `x' = a·x + b·y + e`,
+    /// `y' = c·x + d·y + f`.
+    pub(crate) fn from_forward(
+        pixel_width: u32,
+        pixel_height: u32,
+        forward: [f64; 6],
+    ) -> Option<Self> {
+        if pixel_width == 0 || pixel_height == 0 {
+            return None;
+        }
         if forward.iter().any(|coefficient| !coefficient.is_finite()) {
             return None;
         }
+        let [a, b, c, d, e, f] = forward;
         let determinant = a * d - b * c;
         if determinant == 0.0 || !determinant.is_finite() {
             return None;
@@ -192,6 +206,12 @@ impl PageTransform {
             pixel_width,
             pixel_height,
         })
+    }
+
+    /// The pixel-to-page coefficients `[a, b, c, d, e, f]`; see
+    /// [`from_forward`](Self::from_forward).
+    pub(crate) fn forward(&self) -> [f64; 6] {
+        self.forward
     }
 
     /// Width of the bitmap this transform describes.
@@ -277,6 +297,34 @@ pub struct RenderedPage {
     transform: PageTransform,
 }
 
+/// The checks [`RenderedPage::new`] makes on a page's geometry.
+fn check_geometry(
+    page: u32,
+    page_width: f32,
+    page_height: f32,
+    width: u32,
+    height: u32,
+    transform: &PageTransform,
+) -> Result<(), RenderBufferError> {
+    if page == 0 {
+        return Err(RenderBufferError::InvalidPageNumber);
+    }
+    if width == 0 || height == 0 {
+        return Err(RenderBufferError::InvalidDimensions);
+    }
+    if page_width <= 0.0
+        || page_height <= 0.0
+        || !page_width.is_finite()
+        || !page_height.is_finite()
+    {
+        return Err(RenderBufferError::InvalidPageDimensions);
+    }
+    if transform.pixel_width() != width || transform.pixel_height() != height {
+        return Err(RenderBufferError::TransformDimensions);
+    }
+    Ok(())
+}
+
 impl RenderedPage {
     /// Creates a renderer-neutral owned page after validating its buffer.
     #[allow(clippy::too_many_arguments)]
@@ -291,22 +339,7 @@ impl RenderedPage {
         pixels: Vec<u8>,
         transform: PageTransform,
     ) -> Result<Self, RenderBufferError> {
-        if page == 0 {
-            return Err(RenderBufferError::InvalidPageNumber);
-        }
-        if width == 0 || height == 0 {
-            return Err(RenderBufferError::InvalidDimensions);
-        }
-        if page_width <= 0.0
-            || page_height <= 0.0
-            || !page_width.is_finite()
-            || !page_height.is_finite()
-        {
-            return Err(RenderBufferError::InvalidPageDimensions);
-        }
-        if transform.pixel_width() != width || transform.pixel_height() != height {
-            return Err(RenderBufferError::TransformDimensions);
-        }
+        check_geometry(page, page_width, page_height, width, height, &transform)?;
 
         let row_bytes = (width as usize)
             .checked_mul(format.bytes_per_pixel())
@@ -336,6 +369,31 @@ impl RenderedPage {
             stride,
             format,
             pixels,
+            transform,
+        })
+    }
+
+    /// A page's size and transform without a bitmap, as
+    /// [`release_pixels`](Self::release_pixels) leaves a rendered page:
+    /// enough to place its recognized text, nothing to recognize.
+    pub(crate) fn without_pixels(
+        page: u32,
+        page_width: f32,
+        page_height: f32,
+        width: u32,
+        height: u32,
+        transform: PageTransform,
+    ) -> Result<Self, RenderBufferError> {
+        check_geometry(page, page_width, page_height, width, height, &transform)?;
+        Ok(Self {
+            page,
+            page_width,
+            page_height,
+            width,
+            height,
+            stride: width as usize,
+            format: RenderPixelFormat::Gray8,
+            pixels: Vec::new(),
             transform,
         })
     }

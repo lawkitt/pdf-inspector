@@ -366,15 +366,13 @@ fn fuse_ocr_pages_impl(
                         }
                         table_markdown
                     }
-                    OcrFusionRoute::FullPage => {
-                        let markdown = to_markdown_from_items_with_rects_and_page_count(
-                            ocr_items,
-                            ocr_markdown_options.clone(),
-                            &[],
-                            document_page_count,
-                        );
-                        preserve_ocr_line_breaks_without(&markdown, local, repeated_spans)
-                    }
+                    OcrFusionRoute::FullPage => full_page_ocr_markdown(
+                        ocr_items,
+                        local,
+                        repeated_spans,
+                        &ocr_markdown_options,
+                        document_page_count,
+                    ),
                 };
                 let (markdown, source, adaptive_recommends_hosted) = if let Some(candidate) =
                     native_candidates
@@ -389,10 +387,9 @@ fn fuse_ocr_pages_impl(
                     );
                     warnings.push(choice.warning);
                     (choice.markdown, choice.source, choice.recommend_hosted)
-                } else if native.markdown.trim().is_empty() || native.needs_ocr {
-                    (ocr_markdown, PageContentSource::Ocr, false)
                 } else {
-                    let (markdown, source) = merge_native_and_ocr(&native.markdown, &ocr_markdown);
+                    let (markdown, source) =
+                        ocr_page_content(&native.markdown, native.needs_ocr, ocr_markdown);
                     (markdown, source, false)
                 };
                 let weak_ocr = local
@@ -465,6 +462,40 @@ fn fuse_ocr_pages_impl(
         render_time_ms: ocr_run.render_time_ms,
         ocr_time_ms: ocr_run.ocr_time_ms,
     })
+}
+
+/// A full-page OCR page's Markdown from its items (the page's spans less
+/// `repeated_spans`, laid out level and upright), with the page's
+/// recognized line breaks restored.
+fn full_page_ocr_markdown(
+    ocr_items: Vec<TextItem>,
+    page: &RoutedOcrPage,
+    repeated_spans: &HashSet<usize>,
+    ocr_markdown_options: &MarkdownOptions,
+    document_page_count: u32,
+) -> String {
+    let markdown = to_markdown_from_items_with_rects_and_page_count(
+        ocr_items,
+        ocr_markdown_options.clone(),
+        &[],
+        document_page_count,
+    );
+    preserve_ocr_line_breaks_without(&markdown, page, repeated_spans)
+}
+
+/// The content of a recognized page with no native candidate to weigh:
+/// its OCR when native extraction found nothing or rejected the page,
+/// otherwise its native text with the OCR's genuinely new blocks.
+fn ocr_page_content(
+    native_markdown: &str,
+    needs_ocr: bool,
+    ocr_markdown: String,
+) -> (String, PageContentSource) {
+    if native_markdown.trim().is_empty() || needs_ocr {
+        (ocr_markdown, PageContentSource::Ocr)
+    } else {
+        merge_native_and_ocr(native_markdown, &ocr_markdown)
+    }
 }
 
 struct AdaptiveContentChoice {
@@ -795,12 +826,29 @@ fn repeated_ocr_header_footer_spans(
     routes: &BTreeMap<u32, OcrFusionRoute>,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
 ) -> RepeatedOcrSpans {
+    repeated_spans_among(&repeat_pass_pages(
+        native_pages,
+        ocr_run,
+        routes,
+        native_candidates,
+    ))
+}
+
+/// The recognized pages [`repeated_ocr_header_footer_spans`] compares, in
+/// the run's order: full-page OCR on a page that cannot keep a native
+/// candidate instead.
+fn repeat_pass_pages<'a>(
+    native_pages: &[PageMarkdown],
+    ocr_run: &'a OcrRun,
+    routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+) -> Vec<&'a RoutedOcrPage> {
     let may_keep_native: BTreeSet<u32> = native_pages
         .iter()
         .filter(|page| page.needs_ocr && native_candidates.contains_key(&(page.page + 1)))
         .map(|page| page.page + 1)
         .collect();
-    let full_pages: Vec<&RoutedOcrPage> = ocr_run
+    ocr_run
         .pages
         .iter()
         .filter(|page| {
@@ -808,13 +856,19 @@ fn repeated_ocr_header_footer_spans(
             matches!(routes.get(&number), Some(OcrFusionRoute::FullPage))
                 && !may_keep_native.contains(&number)
         })
-        .collect();
+        .collect()
+}
+
+/// The repeated header/footer pass over `full_pages`, all of the pages it
+/// compares, in page order: the whole-document run's and
+/// [`strip_repeats_in_evidence`]'s alike.
+fn repeated_spans_among(full_pages: &[&RoutedOcrPage]) -> RepeatedOcrSpans {
     let Ok(page_count) = u32::try_from(full_pages.len()) else {
         return RepeatedOcrSpans::default();
     };
     let mut spans_by_item: HashMap<crate::HeaderFooterItemKey, Vec<(u32, usize)>> = HashMap::new();
     let mut items = Vec::new();
-    for page in full_pages {
+    for &page in full_pages {
         // A page read turned upright is compared upright, as its Markdown
         // is laid out; other pages in their rendered geometry, as before.
         let turned = page_upright_turns(page) != 0;
@@ -857,6 +911,373 @@ fn repeated_ocr_header_footer_spans(
         }
     }
     result
+}
+
+/// Version of [`OcrRepeatEvidence`]'s meaning; evidence of another version
+/// is refused ([`OcrFusionError::UnsupportedRepeatEvidence`]).
+const REPEAT_EVIDENCE_FORMAT: u32 = 1;
+
+/// What one recognized page keeps so the repeated header/footer pass can
+/// run over pages recognized in separate calls
+/// ([`strip_repeats_across_pages`](crate::vision::strip_repeats_across_pages)).
+///
+/// A whole-document run compares its recognized pages with each other; a
+/// run of one page has nothing to compare, so its running headers and
+/// footers stay. A caller that recognizes a document page by page keeps
+/// this with each page's result and, once it has them all, passes every
+/// page's evidence to `strip_repeats_across_pages`, which gives those pages
+/// the Markdown and counts a whole-document run gives them.
+///
+/// It holds the page's recognized spans (text, polygon and orientation;
+/// the bitmap is not kept), the rendered page's size and pixel-to-page
+/// transform, the document's page count, and, for a page whose native text
+/// is kept beside its OCR (`OcrMode::Force` on a page with clean text), that
+/// native Markdown and the rows native extraction left out of it as
+/// repeats. Serializable with serde: floats keep their exact values
+/// through any format (the transform's coefficients are written as
+/// decimal text). Opaque otherwise: build it only from a run's result.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OcrRepeatEvidence {
+    format: u32,
+    page_number: u32,
+    document_page_count: u32,
+    page_width: f32,
+    page_height: f32,
+    pixel_width: u32,
+    pixel_height: u32,
+    #[serde(with = "exact_f64s")]
+    transform: [f64; 6],
+    spans: Vec<RepeatEvidenceSpan>,
+    native: Option<RepeatEvidenceNative>,
+}
+
+/// One recognized span, as the pass and the page's Markdown read it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RepeatEvidenceSpan {
+    text: String,
+    /// Polygon points `[x, y]` in the rendered page's pixels, in the
+    /// engine's order.
+    polygon: [[f32; 2]; 4],
+    orientation_degrees: Option<f32>,
+}
+
+/// The native text a page keeps beside its OCR.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RepeatEvidenceNative {
+    markdown: String,
+    /// Rows native extraction left out as repeats (their text).
+    repeated_rows: Vec<String>,
+}
+
+impl OcrRepeatEvidence {
+    /// 1-indexed page number.
+    pub fn page_number(&self) -> u32 {
+        self.page_number
+    }
+
+    /// Pages in the whole document, as the page's run read it.
+    pub fn document_page_count(&self) -> u32 {
+        self.document_page_count
+    }
+
+    fn from_page(
+        page: &RoutedOcrPage,
+        document_page_count: u32,
+        native: Option<RepeatEvidenceNative>,
+    ) -> Self {
+        let rendered = &page.rendered;
+        Self {
+            format: REPEAT_EVIDENCE_FORMAT,
+            page_number: rendered.page(),
+            document_page_count,
+            page_width: rendered.page_width(),
+            page_height: rendered.page_height(),
+            pixel_width: rendered.width(),
+            pixel_height: rendered.height(),
+            transform: rendered.transform().forward(),
+            spans: page
+                .ocr
+                .spans
+                .iter()
+                .map(|span| RepeatEvidenceSpan {
+                    text: span.text.clone(),
+                    polygon: span.polygon.points.map(|point| [point.x, point.y]),
+                    orientation_degrees: span.orientation_degrees,
+                })
+                .collect(),
+            native,
+        }
+    }
+
+    /// The page as the run held it once its bitmap was released.
+    fn to_page(&self) -> Result<RoutedOcrPage, OcrFusionError> {
+        let invalid = || OcrFusionError::InvalidRepeatEvidence {
+            page: self.page_number,
+        };
+        let transform =
+            super::PageTransform::from_forward(self.pixel_width, self.pixel_height, self.transform)
+                .ok_or_else(invalid)?;
+        let rendered = super::RenderedPage::without_pixels(
+            self.page_number,
+            self.page_width,
+            self.page_height,
+            self.pixel_width,
+            self.pixel_height,
+            transform,
+        )
+        .map_err(|_| invalid())?;
+        Ok(RoutedOcrPage {
+            rendered,
+            ocr: super::OcrPage {
+                page_number: self.page_number,
+                spans: self
+                    .spans
+                    .iter()
+                    .map(|span| super::OcrSpan {
+                        text: span.text.clone(),
+                        polygon: super::ImageQuad::new(
+                            span.polygon.map(|[x, y]| super::ImagePoint::new(x, y)),
+                        ),
+                        // Not read by assembly.
+                        confidence: 0.0,
+                        orientation_degrees: span.orientation_degrees,
+                    })
+                    .collect(),
+                mean_confidence: None,
+                model: super::ModelIdentity::new("", ""),
+                processing_time_ms: 0,
+                warnings: Vec::new(),
+            },
+        })
+    }
+}
+
+/// Serde for `[f64; 6]` as decimal text, which every format carries
+/// exactly: Rust prints an `f64`'s shortest round-trip form and parses it
+/// back correctly rounded, while some JSON readers parse long numbers
+/// within a unit of the last place.
+mod exact_f64s {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        values: &[f64; 6],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(values.iter().map(|value| format!("{value:?}")))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[f64; 6], D::Error> {
+        let texts = <[String; 6]>::deserialize(deserializer)?;
+        let mut values = [0.0; 6];
+        for (value, text) in values.iter_mut().zip(&texts) {
+            *value = text.parse().map_err(D::Error::custom)?;
+        }
+        Ok(values)
+    }
+}
+
+/// The evidence of every page in the repeated header/footer pass of `ocr_run`
+/// (see [`repeat_pass_pages`]), in the run's order.
+pub(crate) fn repeat_evidence(
+    native_pages: &[PageMarkdown],
+    ocr_run: &OcrRun,
+    routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+    native_repeated: &BTreeMap<u32, Vec<String>>,
+    document_page_count: u32,
+) -> Vec<OcrRepeatEvidence> {
+    repeat_pass_pages(native_pages, ocr_run, routes, native_candidates)
+        .into_iter()
+        .map(|page| {
+            let number = page.rendered.page();
+            // As `ocr_page_content` decides: native text stays beside the
+            // OCR only on a clean page that has some.
+            let native = native_pages
+                .iter()
+                .find(|native| native.page.checked_add(1) == Some(number))
+                .filter(|native| !native.needs_ocr && !native.markdown.trim().is_empty())
+                .map(|native| RepeatEvidenceNative {
+                    markdown: native.markdown.clone(),
+                    repeated_rows: native_repeated.get(&number).cloned().unwrap_or_default(),
+                });
+            OcrRepeatEvidence::from_page(page, document_page_count, native)
+        })
+        .collect()
+}
+
+/// One page after the repeated header/footer pass across pages
+/// ([`strip_repeats_across_pages`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageWithoutRepeats {
+    /// 1-indexed page number.
+    pub page_number: u32,
+    /// The page's Markdown, in the form a one-page run's
+    /// [`OcrPdfResult::markdown`](crate::vision::OcrPdfResult::markdown)
+    /// has: it replaces the Markdown the page's own run gave.
+    pub markdown: String,
+    /// The recognized rows left out as repeats of a row kept on an earlier
+    /// page (their text), top to bottom.
+    pub removed_rows: Vec<String>,
+    /// Running header or footer rows the page's content left out, as
+    /// [`PageProvenance::repeated_lines`] counts them; it replaces the
+    /// page's count from its own run.
+    pub repeated_lines: u32,
+}
+
+/// The pages of [`strip_repeats_across_pages`], with their counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepeatsAcrossPages {
+    /// Every page of the evidence, in page order.
+    pub pages: Vec<PageWithoutRepeats>,
+    /// The pages that left rows out, with how many, in page order: the
+    /// evidence pages' entries of a whole-document run's
+    /// [`OcrPdfResult::repeated_lines_by_page`](crate::vision::OcrPdfResult::repeated_lines_by_page).
+    pub repeated_lines_by_page: Vec<crate::PageRepeatedLines>,
+}
+
+/// Runs the repeated header/footer pass over pages recognized in separate
+/// calls, as a whole-document run does over its recognized pages.
+///
+/// `evidence` is every page's [`OcrRepeatEvidence`] from the per-page runs
+/// (`OcrPdfOptions::retain_repeat_evidence`), all from one document and in
+/// any order; pages whose run kept no evidence take no part in the pass,
+/// just as in a whole-document run. `markdown` is the
+/// [`MarkdownOptions`] those runs used. Each page comes back with the
+/// Markdown and repeated-line count a whole-document run with the same
+/// options gives it: a row stays on the first page that shows it, and its
+/// exact repeats in the same place go, on at least three of the pages (the
+/// rule [`PageRepeatedLines`](crate::PageRepeatedLines) describes). With
+/// `strip_headers_footers` off nothing is left out.
+pub fn strip_repeats_across_pages(
+    evidence: &[OcrRepeatEvidence],
+    markdown: &MarkdownOptions,
+) -> Result<RepeatsAcrossPages, OcrFusionError> {
+    // As the pipeline hands Markdown options to fusion.
+    let mut fusion_markdown = markdown.clone();
+    fusion_markdown.include_page_numbers = false;
+    let pages: Vec<PageWithoutRepeats> = strip_repeats_in_evidence(evidence, &fusion_markdown)?
+        .into_iter()
+        .map(|mut page| {
+            page.markdown = assemble_document_markdown(
+                [(page.page_number, page.markdown.as_str())],
+                markdown.include_page_numbers,
+            );
+            page
+        })
+        .collect();
+    let repeated_lines_by_page = pages
+        .iter()
+        .filter(|page| page.repeated_lines > 0)
+        .map(|page| crate::PageRepeatedLines {
+            page: page.page_number,
+            lines: page.repeated_lines,
+        })
+        .collect();
+    Ok(RepeatsAcrossPages {
+        pages,
+        repeated_lines_by_page,
+    })
+}
+
+/// A document's Markdown from its pages' Markdown, in the given order: a
+/// blank line between pages, each optionally after a page marker, with
+/// block spacing normalized and a final newline.
+pub(crate) fn assemble_document_markdown<'a>(
+    pages: impl IntoIterator<Item = (u32, &'a str)>,
+    include_page_numbers: bool,
+) -> String {
+    let mut document = String::new();
+    for (index, (page_number, markdown)) in pages.into_iter().enumerate() {
+        if index > 0 {
+            document.push_str("\n\n");
+        }
+        if include_page_numbers {
+            document.push_str(&format!("<!-- Page {page_number} -->\n\n"));
+        }
+        document.push_str(markdown.trim());
+    }
+    let mut document = crate::markdown::normalize_block_spacing(&document);
+    if !document.is_empty() {
+        document.push('\n');
+    }
+    document
+}
+
+/// Runs the repeated header/footer pass over `evidence`, every page of the
+/// pass, and assembles each page as fusion does with that pass's result
+/// ([`PageWithoutRepeats::markdown`] as [`FusedPageMarkdown::markdown`]).
+/// `markdown` is the Markdown options fusion received.
+pub(crate) fn strip_repeats_in_evidence(
+    evidence: &[OcrRepeatEvidence],
+    markdown: &MarkdownOptions,
+) -> Result<Vec<PageWithoutRepeats>, OcrFusionError> {
+    let mut sorted: Vec<&OcrRepeatEvidence> = evidence.iter().collect();
+    sorted.sort_by_key(|page| page.page_number);
+    for page in &sorted {
+        if page.format != REPEAT_EVIDENCE_FORMAT {
+            return Err(OcrFusionError::UnsupportedRepeatEvidence {
+                page: page.page_number,
+                format: page.format,
+            });
+        }
+    }
+    for pair in sorted.windows(2) {
+        if pair[0].page_number == pair[1].page_number {
+            return Err(OcrFusionError::DuplicateOcrPage {
+                page: pair[1].page_number,
+            });
+        }
+        if pair[0].document_page_count != pair[1].document_page_count {
+            return Err(OcrFusionError::InvalidRepeatEvidence {
+                page: pair[1].page_number,
+            });
+        }
+    }
+    let pages = sorted
+        .iter()
+        .map(|page| page.to_page())
+        .collect::<Result<Vec<_>, _>>()?;
+    let repeated = if markdown.strip_headers_footers {
+        repeated_spans_among(&pages.iter().collect::<Vec<_>>())
+    } else {
+        RepeatedOcrSpans::default()
+    };
+    // As `fuse_ocr_pages_impl` lays out full-page OCR.
+    let mut ocr_markdown_options = markdown.clone();
+    ocr_markdown_options.strip_headers_footers = false;
+    let no_spans = HashSet::new();
+    Ok(sorted
+        .iter()
+        .zip(&pages)
+        .map(|(evidence, page)| {
+            let number = evidence.page_number;
+            let repeated_spans = repeated.spans.get(&number).unwrap_or(&no_spans);
+            let (items, _) = ocr_text_items(page, repeated_spans, true);
+            let ocr_markdown = full_page_ocr_markdown(
+                items,
+                page,
+                repeated_spans,
+                &ocr_markdown_options,
+                evidence.document_page_count,
+            );
+            let (native_markdown, native_rows) =
+                evidence.native.as_ref().map_or(("", &[][..]), |native| {
+                    (native.markdown.as_str(), native.repeated_rows.as_slice())
+                });
+            let (markdown, source) =
+                ocr_page_content(native_markdown, evidence.native.is_none(), ocr_markdown);
+            let rows = repeated.rows.get(&number).cloned().unwrap_or_default();
+            let repeated_lines = repeated_lines_left_out(source, &markdown, native_rows, &rows);
+            PageWithoutRepeats {
+                page_number: number,
+                markdown,
+                removed_rows: rows,
+                repeated_lines,
+            }
+        })
+        .collect())
 }
 
 /// Recognized lines from this share of the page's body height up to (not
@@ -1706,6 +2127,24 @@ pub enum OcrFusionError {
     InvalidHostedConfidence {
         /// Invalid value.
         value: f32,
+    },
+    /// Repeat evidence was kept by a pdf-inspector whose evidence means
+    /// something else; recognize the page again.
+    #[error(
+        "repeat evidence for page {page} has format {format}, which this version does not read"
+    )]
+    UnsupportedRepeatEvidence {
+        /// 1-indexed page number.
+        page: u32,
+        /// The evidence's format.
+        format: u32,
+    },
+    /// Repeat evidence has unusable page geometry, or names a different
+    /// document page count than the other pages' evidence.
+    #[error("repeat evidence for page {page} is inconsistent")]
+    InvalidRepeatEvidence {
+        /// 1-indexed page number.
+        page: u32,
     },
 }
 
@@ -3262,6 +3701,293 @@ mod tests {
         assert_eq!(
             repeated_lines_left_out(PageContentSource::Ocr, shown, &both, &header),
             1
+        );
+    }
+
+    /// [`scanned_page`] with a `footer` at the bottom edge too.
+    fn scanned_page_with_footer(page: u32, header: &str, footer: &str) -> RoutedOcrPage {
+        let mut scanned = scanned_page(page, Some(header), 9.0);
+        scanned
+            .ocr
+            .spans
+            .push(positioned_span(footer, 30.0, 380.0, 220.0, 389.0));
+        scanned
+    }
+
+    /// Fuses `pages` in one run, and again one page per run with each run's
+    /// repeat evidence kept, then runs the pass across that evidence. Each
+    /// page must come out with the Markdown and count of the one run. Returns
+    /// the one run's result.
+    fn assert_page_runs_match_one_run(
+        pages: impl Fn() -> Vec<RoutedOcrPage>,
+        native_pages: &[PageMarkdown],
+        candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+        native_repeated: &BTreeMap<u32, Vec<String>>,
+    ) -> FusedPages {
+        let options = strip_options();
+        let count = native_pages.len() as u32;
+        let whole_run = run(pages());
+        let whole = fuse_ocr_pages_impl(
+            native_pages,
+            &whole_run,
+            count,
+            &options,
+            candidates,
+            &full_page_routes(&whole_run),
+            native_repeated,
+        )
+        .unwrap();
+
+        let mut page_runs = Vec::new();
+        let mut evidence = Vec::new();
+        for (page, native_page) in pages().into_iter().zip(native_pages) {
+            let one = run(vec![page]);
+            let routes = full_page_routes(&one);
+            let native_page = std::slice::from_ref(native_page);
+            let mut fused = fuse_ocr_pages_impl(
+                native_page,
+                &one,
+                count,
+                &options,
+                candidates,
+                &routes,
+                native_repeated,
+            )
+            .unwrap();
+            evidence.extend(repeat_evidence(
+                native_page,
+                &one,
+                &routes,
+                candidates,
+                native_repeated,
+                count,
+            ));
+            page_runs.push(fused.pages.remove(0));
+        }
+        // Any order: the pass sorts the pages.
+        evidence.reverse();
+        for page in strip_repeats_in_evidence(&evidence, &options.markdown).unwrap() {
+            let kept = page_runs
+                .iter_mut()
+                .find(|kept| kept.page_number == page.page_number)
+                .unwrap();
+            kept.markdown = page.markdown;
+            kept.provenance.repeated_lines = page.repeated_lines;
+        }
+        let shown = |pages: &[FusedPageMarkdown]| -> Vec<(u32, String, u32)> {
+            pages
+                .iter()
+                .map(|page| {
+                    (
+                        page.page_number,
+                        page.markdown.clone(),
+                        page.provenance.repeated_lines,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(shown(&page_runs), shown(&whole.pages));
+
+        // The public call gives each page its one-page document Markdown.
+        let across = strip_repeats_across_pages(&evidence, &options.markdown).unwrap();
+        assert_eq!(across.pages.len(), evidence.len());
+        for page in &across.pages {
+            let whole_page = whole
+                .pages
+                .iter()
+                .find(|whole_page| whole_page.page_number == page.page_number)
+                .unwrap();
+            assert_eq!(
+                page.markdown,
+                assemble_document_markdown(
+                    [(whole_page.page_number, whole_page.markdown.as_str())],
+                    false
+                )
+            );
+            assert_eq!(page.repeated_lines, whole_page.provenance.repeated_lines);
+        }
+        assert_eq!(
+            across.repeated_lines_by_page,
+            whole
+                .pages
+                .iter()
+                .filter(|page| page.provenance.repeated_lines > 0)
+                .map(|page| crate::PageRepeatedLines {
+                    page: page.page_number,
+                    lines: page.provenance.repeated_lines,
+                })
+                .collect::<Vec<_>>()
+        );
+        whole
+    }
+
+    fn scanned_natives(count: u32) -> Vec<PageMarkdown> {
+        (0..count).map(|page| native(page, "", true)).collect()
+    }
+
+    #[test]
+    fn page_runs_drop_a_header_and_footer_repeated_on_four_pages() {
+        let whole = assert_page_runs_match_one_run(
+            || {
+                (1..=4)
+                    .map(|page| {
+                        scanned_page_with_footer(page, "Дело № 2-123/2026", "Confidential: Acme")
+                    })
+                    .collect()
+            },
+            &scanned_natives(4),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, "Дело № 2-123/2026"), [1]);
+        assert_eq!(pages_showing(&whole, "Confidential: Acme"), [1]);
+        assert_eq!(repeated_lines(&whole), [0, 2, 2, 2]);
+    }
+
+    #[test]
+    fn page_runs_keep_a_header_whose_case_number_changes() {
+        let whole = assert_page_runs_match_one_run(
+            || {
+                (1..=4)
+                    .map(|page| {
+                        let header = format!("Дело № 2-12{page}/2026");
+                        scanned_page(page, Some(&header), 9.0)
+                    })
+                    .collect()
+            },
+            &scanned_natives(4),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        for page in 1..=4u32 {
+            assert_eq!(
+                pages_showing(&whole, &format!("Дело № 2-12{page}/2026")),
+                [page]
+            );
+        }
+        assert_eq!(repeated_lines(&whole), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn page_runs_keep_a_header_repeated_on_two_pages() {
+        let whole = assert_page_runs_match_one_run(
+            || {
+                (1..=2)
+                    .map(|page| scanned_page_with_footer(page, "Дело № 2-123/2026", "Acme"))
+                    .collect()
+            },
+            &scanned_natives(2),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, "Дело № 2-123/2026"), [1, 2]);
+        assert_eq!(repeated_lines(&whole), [0, 0]);
+    }
+
+    #[test]
+    fn page_runs_match_one_run_with_native_text_turned_pages_and_candidates() {
+        // Page 1 may keep a native candidate (no part in the pass); page 2
+        // keeps clean native text beside its OCR, whose header native
+        // extraction already left out; page 4 was read turned upright.
+        let header = "Дело № 2-123/2026";
+        let pages = || {
+            (1..=5)
+                .map(|page| {
+                    let mut scanned = scanned_page_with_footer(page, header, "Confidential: Acme");
+                    if page == 4 {
+                        for span in &mut scanned.ocr.spans {
+                            span.polygon =
+                                ImageQuad::new(span.polygon.points.map(|point| {
+                                    ImagePoint::new(300.0 - point.x, 400.0 - point.y)
+                                }));
+                            span.orientation_degrees = Some(180.0);
+                        }
+                    }
+                    scanned
+                })
+                .collect()
+        };
+        let mut natives = scanned_natives(5);
+        natives[1] = native(1, "Native text of page two, set in its own words.\n", false);
+        let candidates = BTreeMap::from([(
+            1,
+            native_candidate(
+                "Страница 1, строка 0: условия договора поставки, согласованные сторонами.\n",
+            ),
+        )]);
+        let native_repeated = BTreeMap::from([(2, vec![header.to_string()])]);
+        let whole = assert_page_runs_match_one_run(pages, &natives, &candidates, &native_repeated);
+        // Page 2 holds the first occurrence among the pages compared.
+        assert_eq!(pages_showing(&whole, "Confidential: Acme")[1..], [2]);
+        assert_eq!(repeated_lines(&whole)[2..], [2, 2, 2]);
+    }
+
+    #[test]
+    fn evidence_keeps_the_page_as_the_run_held_it() {
+        let mut page = scanned_page_with_footer(3, "Дело № 2-123/2026", "Acme");
+        page.ocr.spans[1].orientation_degrees = Some(90.0);
+        let evidence = OcrRepeatEvidence::from_page(&page, 7, None);
+        assert_eq!(evidence.page_number(), 3);
+        assert_eq!(evidence.document_page_count(), 7);
+        let restored = evidence.to_page().unwrap();
+        let rendered = &restored.rendered;
+        assert_eq!(
+            (
+                rendered.page(),
+                rendered.page_width(),
+                rendered.page_height(),
+                rendered.width(),
+                rendered.height(),
+                rendered.transform()
+            ),
+            (3, 600.0, 800.0, 300, 400, page.rendered.transform())
+        );
+        assert!(rendered.pixels().is_empty());
+        let spans = |page: &RoutedOcrPage| -> Vec<(String, ImageQuad, Option<f32>)> {
+            page.ocr
+                .spans
+                .iter()
+                .map(|span| (span.text.clone(), span.polygon, span.orientation_degrees))
+                .collect()
+        };
+        assert_eq!(spans(&restored), spans(&page));
+    }
+
+    #[test]
+    fn evidence_writes_transform_coefficients_exactly() {
+        // Long decimals some JSON readers parse a unit off in the last place.
+        for value in [
+            0.479_999_999_999_999_98,
+            612.0 / 1275.0,
+            595.275_590_551_181_1 / 1240.0,
+            -841.889_763_779_527_6,
+            1e-300,
+            f64::MAX,
+        ] {
+            let text = format!("{value:?}");
+            assert_eq!(text.parse::<f64>().unwrap().to_bits(), value.to_bits());
+        }
+    }
+
+    #[test]
+    fn inconsistent_evidence_is_refused() {
+        let page = |number| scanned_page(number, Some("Дело № 2-123/2026"), 9.0);
+        let options = MarkdownOptions::default();
+        let one = OcrRepeatEvidence::from_page(&page(1), 3, None);
+        assert_eq!(
+            strip_repeats_across_pages(&[one.clone(), one.clone()], &options),
+            Err(OcrFusionError::DuplicateOcrPage { page: 1 })
+        );
+        let other_document = OcrRepeatEvidence::from_page(&page(2), 4, None);
+        assert_eq!(
+            strip_repeats_across_pages(&[one.clone(), other_document], &options),
+            Err(OcrFusionError::InvalidRepeatEvidence { page: 2 })
+        );
+        let mut older = OcrRepeatEvidence::from_page(&page(2), 3, None);
+        older.format = 0;
+        assert_eq!(
+            strip_repeats_across_pages(&[one, older], &options),
+            Err(OcrFusionError::UnsupportedRepeatEvidence { page: 2, format: 0 })
         );
     }
 }

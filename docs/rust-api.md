@@ -457,6 +457,36 @@ recommendations. Page numbers in `OcrPdfResult` and its per-page provenance
 are 1-indexed, matching the PDF page numbers accepted by
 `OcrPdfOptions::page_numbers`.
 
+Running headers and footers on OCR pages are found by comparing the pages one
+run recognizes, so a page recognized alone keeps them. A caller that recognizes
+a document one page per call (to resume after a stop or report progress) can
+still get a whole-document run's Markdown and counts: it keeps each page's
+`OcrRepeatEvidence` (serde-serializable) with the page's Markdown, then runs
+the pass across all of them once every page is done:
+
+```rust
+use pdf_inspector::vision::{
+    process_pdf_with_ocr_mem, strip_repeats_across_pages, OcrPdfOptions,
+};
+
+let options = OcrPdfOptions::auto().retain_repeat_evidence(true);
+let mut kept = Vec::new(); // (page, Markdown, evidence), stored between calls
+for page in 1..=page_count {
+    let result = process_pdf_with_ocr_mem(&bytes, options.clone().page_numbers([page]))?;
+    kept.push((page, result.markdown, result.repeat_evidence));
+}
+let evidence: Vec<_> = kept.iter().flat_map(|(_, _, e)| e.iter().cloned()).collect();
+let across = strip_repeats_across_pages(&evidence, &options.markdown)?;
+for page in across.pages {
+    // Replaces that page's Markdown and its `repeated_lines_by_page` entry.
+    kept[page.page_number as usize - 1].1 = page.markdown;
+}
+```
+
+Pages without evidence (native-only pages, pages that may keep native text
+instead of their OCR, image-region OCR) take no part, as in a whole-document
+run; their own run's Markdown and counts are already final.
+
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):
 
