@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 
 use image::RgbImage;
-use oar_ocr::core::config::onnx::OrtSessionConfig;
+use oar_ocr::core::config::onnx::{OrtExecutionProvider, OrtSessionConfig};
 use oar_ocr::domain::tasks::TextDetectionConfig;
 use oar_ocr::oarocr::{EdgeProcessor, TextCroppingProcessor};
 use oar_ocr::predictors::{TextDetectionPredictor, TextRecognitionPredictor};
@@ -621,11 +621,21 @@ fn polygon_height(polygon: &BoundingBox) -> f32 {
     }
 }
 
+/// Sessions hand their working memory back after every run. The engine is
+/// cached for the life of the process, and ONNX Runtime's defaults keep it:
+/// the CPU arena grows to the largest page a session has seen and never
+/// shrinks, and the memory pattern plans each new input shape and caches
+/// the plan. Page sizes vary, so the plans are rarely reused, and one large
+/// page left a process holding gigabytes it no longer used. The explicit CPU
+/// provider is `ort::ep::CPU::default()`, which turns the arena off; output
+/// is unchanged.
 fn ocr_session_config(intra_threads: usize) -> OrtSessionConfig {
     OrtSessionConfig::new()
         .with_intra_threads(intra_threads.max(1))
         .with_inter_threads(1)
         .with_parallel_execution(false)
+        .with_execution_providers(vec![OrtExecutionProvider::CPU])
+        .with_memory_pattern(false)
 }
 
 fn load_onnx_runtime(runtime: Option<&Path>) -> Result<(), OarOcrError> {
@@ -983,6 +993,12 @@ mod tests {
         assert_eq!(config.parallel_execution, Some(false));
         // Zero requests are clamped so a session always has a thread.
         assert_eq!(ocr_session_config(0).intra_threads, Some(1));
+        // Working memory goes back after each run: no CPU arena, no plans.
+        assert_eq!(
+            config.execution_providers,
+            Some(vec![OrtExecutionProvider::CPU])
+        );
+        assert_eq!(config.enable_mem_pattern, Some(false));
     }
 
     fn page(format: RenderPixelFormat, stride: usize, pixels: Vec<u8>) -> RenderedPage {
