@@ -439,14 +439,18 @@ fn clean_cells(cells: &[Vec<String>], layout_rows: &[bool]) -> (Vec<Vec<String>>
             && header_filled >= 3
             && looks_like_plain_section_label(first_cell);
         // A table on a page after a page break can open with the rest of a
-        // row split by the break (upstream #588): its first cell is empty
-        // like this row's, each of this row's cells continues the text above
-        // it, and the text above breaks off unfinished in one of them, so
-        // this row is that fragment's next line, not a first data row under
-        // a header. A two-row header ("Revenue | Profit" over "net | gross")
-        // does not break off and stays two rows.
+        // row split by the break (upstream #588): it starts mid-sentence (a
+        // cell in lowercase) with its first cell empty like this row's, each
+        // of this row's cells continues the text above it, and the text
+        // above breaks off unfinished in one of them, so this row is that
+        // fragment's next line, not a first data row under a header. A
+        // two-row header ("Net revenue | Operating profit" over "domestic |
+        // adjusted") opens with capitals and stays two rows.
         let continues_split_row = cleaned.len() == 1
             && cleaned[0].first().is_some_and(|cell| cell.is_empty())
+            && cleaned[0]
+                .iter()
+                .any(|cell| cell.chars().next().is_some_and(char::is_lowercase))
             && row
                 .iter()
                 .zip(&cleaned[0])
@@ -1033,6 +1037,11 @@ mod tests {
         let cells = vec![
             vec!["".into(), "Revenue".into(), "Profit".into()],
             vec!["".into(), "net".into(), "gross".into()],
+        ];
+        assert_eq!(clean_table_cells(&cells).0.len(), 2);
+        let cells = vec![
+            vec!["".into(), "Net revenue".into(), "Operating profit".into()],
+            vec!["".into(), "domestic".into(), "adjusted".into()],
         ];
         assert_eq!(clean_table_cells(&cells).0.len(), 2);
     }
