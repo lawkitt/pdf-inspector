@@ -12335,6 +12335,90 @@ fn test_a_page_that_needs_ocr_does_not_spoil_a_page_number() {
     );
 }
 
+/// Four letter pages, each headed by `label` and then the page's own number
+/// as a separate text run at `number_x` in the top margin, over twelve body
+/// lines. In Helvetica 10 pt, "Acme Holdings Invoice No." from x=72 ends at
+/// x=192.04.
+fn make_labelled_number_pdf(label: &str, number_x: f32, number: impl Fn(u32) -> u32) -> Vec<u8> {
+    use lopdf::{dictionary, Document};
+
+    let mut doc = Document::with_version("1.5");
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let pages_id = doc.new_object_id();
+    let mut kids = Vec::new();
+    for page in 1..=4u32 {
+        let mut content = format!(
+            "BT /F1 10 Tf 72 770 Td ({label}) Tj ET\n\
+             BT /F1 10 Tf {number_x} 770 Td ({}) Tj ET\n",
+            number(page)
+        );
+        for line in 0..12u32 {
+            content.push_str(&format!(
+                "BT /F1 10 Tf 72 {} Td (Paragraph {line} of sheet {page}: the parties agree.) Tj ET\n",
+                680 - 30 * line
+            ));
+        }
+        kids.push(add_page(
+            &mut doc,
+            pages_id,
+            &content,
+            LETTER_BOX,
+            None,
+            &[("F1", font_id)],
+        ));
+    }
+    finish_document(doc, pages_id, kids)
+}
+
+#[test]
+fn test_an_invoice_number_in_the_top_margin_is_not_a_folio() {
+    // Codex on #18: "Invoice No." and the invoice's number 1-4 as separate
+    // runs in the top margin. Tab-aligned (x=240), the number was taken for
+    // an isolated margin folio and lost on every page, page 1 included, in
+    // whole-document and per-page extraction alike. Set close (x=196), the
+    // extractor joins the two runs into one item, which must stay too. A
+    // number set close but kept a separate item, which the recurrence
+    // check took for a running folio, is covered by the layout unit test
+    // `numbers_labelled_as_identifiers_are_never_folios`.
+    for number_x in [196.0, 240.0] {
+        let pdf = make_labelled_number_pdf("Acme Holdings Invoice No.", number_x, |page| page);
+        let markdown = process_pdf_mem(&pdf).unwrap().markdown.unwrap_or_default();
+        let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+        for page in 1..=4u32 {
+            let shown = |text: &str| {
+                text.contains(&format!("Acme Holdings Invoice No. {page}\n"))
+                    || text.contains(&format!("Acme Holdings Invoice No. {page} "))
+                    || text
+                        .trim_end()
+                        .ends_with(&format!("Acme Holdings Invoice No. {page}"))
+            };
+            assert!(shown(&markdown), "x={number_x}, page {page}: {markdown}");
+            let own = &pages.pages[page as usize - 1].markdown;
+            assert!(shown(own), "x={number_x}, page {page} alone: {own}");
+        }
+    }
+}
+
+#[test]
+fn test_a_running_head_folio_in_the_top_margin_still_goes() {
+    // The same layout with a running head instead of a label: the
+    // tab-aligned number is the page's folio and goes, on every page and in
+    // per-page extraction. The head ends at x=205.94.
+    let pdf = make_labelled_number_pdf("Acme Holdings Annual Report", 254.0, |page| page);
+    let markdown = process_pdf_mem(&pdf).unwrap().markdown.unwrap_or_default();
+    let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+    assert!(markdown.contains("Acme Holdings Annual Report"));
+    for page in 1..=4u32 {
+        let folio = format!("Acme Holdings Annual Report {page}");
+        assert!(!markdown.contains(&folio), "{markdown}");
+        assert!(!pages.pages[page as usize - 1].markdown.contains(&folio));
+    }
+}
+
 #[cfg(feature = "ocr")]
 #[test]
 fn test_repeated_header_keeps_its_first_page_and_is_counted() {
