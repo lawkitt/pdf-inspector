@@ -1451,12 +1451,15 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
 }
 
 /// Applies the document-wide repeated header/footer classifier to grouped
-/// lines: cross-page repetition only, no per-page fallback.
+/// lines: cross-page repetition only, no per-page fallback. `page_frames`
+/// holds each page's visible `(bottom, top)` where known, for a sparse
+/// page's position check.
 pub(crate) fn strip_repeated_header_footer_lines(
     lines: Vec<crate::types::TextLine>,
     page_count: u32,
+    page_frames: &crate::extractor::PageVerticalBounds,
 ) -> Vec<crate::types::TextLine> {
-    furniture::strip_repeated_lines(lines, page_count)
+    furniture::strip_repeated_lines_in_frames(lines, page_count, page_frames)
 }
 
 /// Convert positioned text items to markdown with structure detection
@@ -2536,7 +2539,7 @@ fn convert_items_with_rects_lines_and_table_output(
 
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
-        furniture::strip_header_footer_lines(lines, document_page_count)
+        furniture::strip_header_footer_lines_in_frames(lines, document_page_count, page_bounds)
     } else {
         lines
     };
