@@ -218,14 +218,26 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
 /// ([`strip_repeated_lines`]); shorter documents carry no repetition signal
 /// and fall back to per-page positional and typographic evidence
 /// ([`strip_edge_furniture`]).
+#[cfg(test)]
 pub(crate) fn strip_header_footer_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
+    strip_header_footer_lines_in_frames(lines, page_count, &HashMap::new())
+}
+
+/// [`strip_header_footer_lines`] with each page's frame, its visible
+/// `(bottom, top)` in the lines' coordinates where known (see
+/// [`strip_repeated_lines_in_frames`]).
+pub(crate) fn strip_header_footer_lines_in_frames(
+    lines: Vec<TextLine>,
+    page_count: u32,
+    page_frames: &HashMap<u32, (f32, f32)>,
+) -> Vec<TextLine> {
     if lines.is_empty() {
         return lines;
     }
     if page_count < 3 {
         strip_edge_furniture(lines)
     } else {
-        strip_repeated_lines(lines, page_count)
+        strip_repeated_lines_in_frames(lines, page_count, page_frames)
     }
 }
 
@@ -466,7 +478,23 @@ fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String)
 /// opening or closing the row is the one tolerance, so headers like "Chapter
 /// 3 — Page 5" and "Chapter 3 — Page 6" are the same row. The
 /// first page that shows a repeated row keeps it.
+#[cfg(test)]
 pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
+    strip_repeated_lines_in_frames(lines, page_count, &HashMap::new())
+}
+
+/// [`strip_repeated_lines`], with each page's frame where known: its visible
+/// `(bottom, top)` in the lines' coordinates. Only a sparse page's position
+/// check reads it. A page with one or two rows has no margin of its own, so
+/// a row proven on the full pages goes there only at the place the full
+/// pages show it: as far from the top edge (a header) or the bottom edge (a
+/// footer), on pages of any size, when every page involved has a frame, and
+/// at the same height otherwise.
+pub(crate) fn strip_repeated_lines_in_frames(
+    lines: Vec<TextLine>,
+    page_count: u32,
+    page_frames: &HashMap<u32, (f32, f32)>,
+) -> Vec<TextLine> {
     if lines.is_empty() || page_count < 3 {
         return lines;
     }
@@ -553,6 +581,21 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         }
     };
 
+    // The span of the pages that have a margin, for a sparse page's position
+    // check: a sparse page must not move its own tolerance.
+    let full_page_span = {
+        let spans: Vec<f32> = page_y_range
+            .iter()
+            .filter(|(page, _)| page_rows.get(page).is_some_and(|rows| rows.len() > 2))
+            .map(|(_, (lo, hi))| hi - lo)
+            .collect();
+        if spans.is_empty() {
+            avg_span
+        } else {
+            (spans.iter().sum::<f32>() / spans.len() as f32).max(1.0)
+        }
+    };
+
     // Build Y-bands: group line indices by (page, quantized_y).
     // Lines at the same Y position (within ~0.1pt) on the same page form a band.
     let mut y_bands: HashMap<(u32, i32), Vec<usize>> = HashMap::new();
@@ -622,18 +665,20 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     let frequencies = |rows: &[(String, u32, f32)]| {
         let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
         let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut placements: HashMap<String, Vec<(u32, f32)>> = HashMap::new();
         for (text, page, y) in rows {
             let (key, chars) = keys.key(text, *page);
             if chars < 10 || is_decorative_separator(&key) {
                 continue;
             }
             freq.entry(key.clone()).or_default().insert(*page);
-            y_positions.entry(key).or_default().push(*y);
+            y_positions.entry(key.clone()).or_default().push(*y);
+            placements.entry(key).or_default().push((*page, *y));
         }
-        (freq, y_positions)
+        (freq, y_positions, placements)
     };
-    let (freq, y_positions) = frequencies(&edge_lines);
-    let (band_freq, band_y_positions) = frequencies(&edge_bands);
+    let (freq, y_positions, placements) = frequencies(&edge_lines);
+    let (band_freq, band_y_positions, _) = frequencies(&edge_bands);
 
     // At least 3 pages and at least 30% of them, rounded up: on 11 pages,
     // 3 pages are 27% and too few.
@@ -654,14 +699,34 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         let stddev = variance.sqrt();
         stddev / avg_span < POSITION_TOLERANCE
     };
-    // Whether `y` is where the full pages show the repeated row `key`: within
-    // the same share of the page span of its mean position. A sparse page
-    // has no edge rows to judge by, so this is its only position check.
-    let at_learned_position = |key: &str, y: f32| -> bool {
-        y_positions.get(key).is_some_and(|positions| {
-            let mean = positions.iter().sum::<f32>() / positions.len() as f32;
-            (y - mean).abs() / avg_span < POSITION_TOLERANCE
-        })
+    // Whether `y` on `page` is where the full pages show the repeated row
+    // `key`: within the same share of the full pages' span of its mean
+    // place. A sparse page has no edge rows to judge by, so this is its only
+    // position check. With every frame known, the place is the distance
+    // from the edge the row keeps to (the top for a header, the bottom for
+    // a footer), so pages of other sizes compare; without, the height.
+    let at_learned_position = |key: &str, page: u32, y: f32| -> bool {
+        let Some(seen) = placements.get(key).filter(|seen| !seen.is_empty()) else {
+            return false;
+        };
+        let mean = |values: &mut dyn Iterator<Item = f32>| {
+            let (sum, count) = values.fold((0.0, 0usize), |(sum, count), v| (sum + v, count + 1));
+            sum / count as f32
+        };
+        let frames: Option<Vec<(f32, (f32, f32))>> = seen
+            .iter()
+            .map(|&(seen_page, seen_y)| page_frames.get(&seen_page).map(|&f| (seen_y, f)))
+            .collect();
+        let offset = match (frames, page_frames.get(&page)) {
+            (Some(frames), Some(&(bottom, top))) if frames.iter().all(|(_, (b, t))| t > b) => {
+                let header = mean(&mut frames.iter().map(|&(y, (b, t))| (y - b) / (t - b))) > 0.5;
+                let from_edge = |y: f32, (b, t): (f32, f32)| if header { t - y } else { y - b };
+                let learned = mean(&mut frames.iter().map(|&(y, frame)| from_edge(y, frame)));
+                from_edge(y, (bottom, top)) - learned
+            }
+            _ => y - mean(&mut seen.iter().map(|&(_, seen_y)| seen_y)),
+        };
+        offset.abs() / full_page_span < POSITION_TOLERANCE
     };
 
     // Identify candidates from individual frequency map
@@ -719,7 +784,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
             continue;
         }
         let (key, _) = keys.key(&text, line.page);
-        if sparse_page && !at_learned_position(&key, line.y) {
+        if sparse_page && !at_learned_position(&key, line.page, line.y) {
             continue;
         }
         if candidates.contains(&key) {
@@ -1824,6 +1889,45 @@ mod tests {
         }
         let result = strip_repeated_lines(lines, 4);
         assert_eq!(header_pages(&result, header), [1, 2]);
+    }
+
+    #[test]
+    fn a_sparse_page_does_not_move_its_own_tolerance() {
+        // Codex on #22: the full pages span 435 pt (header at 750, body from
+        // 600 down to 315), so a sparse page's row must sit within 21.75 pt
+        // of 750. A sparse page spanning 676 pt must not widen that to keep
+        // its body line at 726 out of reach...
+        let header = "Please sign and return this form";
+        let mut lines = headed_pages(3, |_| header.into());
+        lines.push(make_line(header, 10.0, 4, 726.0, None));
+        lines.push(make_line("Thank you for your order", 10.0, 4, 50.0, None));
+        let result = strip_repeated_lines(lines, 4);
+        assert_eq!(header_pages(&result, header), [1, 4]);
+        // ...nor a one-row page narrow it to keep a header 20 pt off.
+        let mut lines = headed_pages(3, |_| header.into());
+        lines.push(make_line(header, 10.0, 4, 730.0, None));
+        let result = strip_repeated_lines(lines, 4);
+        assert_eq!(header_pages(&result, header), [1]);
+    }
+
+    #[test]
+    fn a_sparse_page_of_another_size_is_judged_from_its_edge() {
+        // Codex on #22: pages 1-3 are Letter (792 pt) with the header 42 pt
+        // below the top; page 4 is Legal (1008 pt) and sparse.
+        let header = "Please sign and return this form";
+        let frames: HashMap<u32, (f32, f32)> = (1..=4)
+            .map(|page| (page, (0.0, if page == 4 { 1008.0 } else { 792.0 })))
+            .collect();
+        let with_page_4 = |y: f32| {
+            let mut lines = headed_pages(3, |_| header.into());
+            lines.push(make_line(header, 10.0, 4, y, None));
+            lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+            strip_repeated_lines_in_frames(lines, 4, &frames)
+        };
+        // At y=750 on Legal the sentence is 258 pt below the top: body text.
+        assert_eq!(header_pages(&with_page_4(750.0), header), [1, 4]);
+        // 42 pt below Legal's top it is the header.
+        assert_eq!(header_pages(&with_page_4(966.0), header), [1]);
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header(page)`.

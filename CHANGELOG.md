@@ -91,10 +91,11 @@ version and date. Earlier releases are described in their
   "Acme Holdings") stays when the repeated piece goes.
 - Repeated headers and footers: on a page with only one or two rows, a
   header or footer already proven on the full pages is removed only where
-  the full pages show it (within 5% of the page span, the tolerance their
-  own positions must keep). The same sentence elsewhere on that page is body
-  text and stays, uncounted. Before, it was removed and counted wherever it
-  stood.
+  the full pages show it: as far from the top edge (a header) or the bottom
+  edge (a footer), so pages of another size compare, within 5% of the full
+  pages' span, the tolerance their own positions must keep. The same
+  sentence elsewhere on that page is body text and stays, uncounted. Before,
+  it was removed and counted wherever it stood.
 - Repeated headers and footers need at least 30% of the pages, rounded up,
   as the rule states: on 11 pages, 4 pages, not 3.
 - Repeated headers and footers: a page whose native text never reaches the

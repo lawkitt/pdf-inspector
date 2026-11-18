@@ -1298,7 +1298,9 @@ impl RepeatedHeaderFooter {
 /// such evidence and keep everything; the per-page typographic fallback that
 /// whole-document Markdown conversion applies to them would leave out even a
 /// first occurrence, with nothing to count. Pages in `excluded` take no
-/// part: they neither keep a row nor lose one.
+/// part: they neither keep a row nor lose one. `page_bounds` (each page's
+/// visible box) also serve as the pages' frames for a sparse page's
+/// position check.
 pub(crate) fn repeated_header_footer_items(
     items: &[TextItem],
     page_thresholds: &HashMap<u32, f32>,
@@ -1306,6 +1308,31 @@ pub(crate) fn repeated_header_footer_items(
     page_count: u32,
     page_bounds: &extractor::PageVerticalBounds,
     excluded: &HashSet<u32>,
+) -> RepeatedHeaderFooter {
+    repeated_header_footer_items_in_frames(
+        items,
+        page_thresholds,
+        chart_regions,
+        page_count,
+        page_bounds,
+        excluded,
+        page_bounds,
+    )
+}
+
+/// [`repeated_header_footer_items`] with the pages' frames given apart from
+/// the bounds line grouping reads: each page's visible `(bottom, top)` in
+/// the items' coordinates, for a sparse page's position check
+/// ([`markdown::strip_repeated_header_footer_lines`]). OCR groups its lines
+/// without bounds but knows each rendered page's frame.
+pub(crate) fn repeated_header_footer_items_in_frames(
+    items: &[TextItem],
+    page_thresholds: &HashMap<u32, f32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    page_count: u32,
+    page_bounds: &extractor::PageVerticalBounds,
+    excluded: &HashSet<u32>,
+    page_frames: &extractor::PageVerticalBounds,
 ) -> RepeatedHeaderFooter {
     if page_count < 3 {
         return RepeatedHeaderFooter::default();
@@ -1342,7 +1369,7 @@ pub(crate) fn repeated_header_footer_items(
             )
         })
         .collect();
-    let kept = markdown::strip_repeated_header_footer_lines(lines, page_count);
+    let kept = markdown::strip_repeated_header_footer_lines(lines, page_count, page_frames);
     let kept_items: HashSet<_> = kept
         .iter()
         .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))

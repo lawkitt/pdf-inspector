@@ -12430,7 +12430,7 @@ fn test_a_header_sentence_in_a_sparse_pages_body_stays_and_is_not_counted() {
     // pages 2 and 3 count a repeat. With the sentence at the header
     // position instead, page 4 loses it and counts it.
     let header = "Please sign and return this form";
-    let pdf = |page_4_y: u32| {
+    let pdf = |page_4_y: u32, page_4_box: [i64; 4]| {
         let mut doc = Document::with_version("1.5");
         let font_id = doc.add_object(dictionary! {
             "Type" => "Font",
@@ -12459,7 +12459,7 @@ fn test_a_header_sentence_in_a_sparse_pages_body_stays_and_is_not_counted() {
                 &mut doc,
                 pages_id,
                 &content,
-                LETTER_BOX,
+                if page == 4 { page_4_box } else { LETTER_BOX },
                 None,
                 &[("F1", font_id)],
             ));
@@ -12476,19 +12476,30 @@ fn test_a_header_sentence_in_a_sparse_pages_body_stays_and_is_not_counted() {
             .collect()
     };
 
-    let body = process_pdf_with_ocr_mem(&pdf(400), OcrPdfOptions::new()).expect("native pass");
+    let run = |y, page_box| {
+        process_pdf_with_ocr_mem(&pdf(y, page_box), OcrPdfOptions::new()).expect("native pass")
+    };
+    let body = run(400, LETTER_BOX);
     assert_eq!(showing(&body), [1, 4]);
     assert_eq!(body.repeated_lines_by_page, vec![lines(2, 1), lines(3, 1)]);
 
-    let at_header = process_pdf_with_ocr_mem(&pdf(750), OcrPdfOptions::new()).expect("native");
+    let at_header = run(750, LETTER_BOX);
     assert_eq!(showing(&at_header), [1]);
     assert!(at_header.pages[3]
         .markdown
         .contains("Thank you for your order"));
-    assert_eq!(
-        at_header.repeated_lines_by_page,
-        vec![lines(2, 1), lines(3, 1), lines(4, 1)]
-    );
+    let counted = vec![lines(2, 1), lines(3, 1), lines(4, 1)];
+    assert_eq!(at_header.repeated_lines_by_page, counted);
+
+    // Codex on #22: page 4 is Legal (1008 pt). At y=750 the sentence is
+    // 258 pt below its top, body text; 42 pt below its top it is the header.
+    const LEGAL_BOX: [i64; 4] = [0, 0, 612, 1008];
+    let body = run(750, LEGAL_BOX);
+    assert_eq!(showing(&body), [1, 4]);
+    assert_eq!(body.repeated_lines_by_page, vec![lines(2, 1), lines(3, 1)]);
+    let at_header = run(966, LEGAL_BOX);
+    assert_eq!(showing(&at_header), [1]);
+    assert_eq!(at_header.repeated_lines_by_page, counted);
 }
 
 #[cfg(feature = "ocr")]

@@ -879,11 +879,13 @@ fn repeated_spans_among(full_pages: &[&RoutedOcrPage]) -> RepeatedOcrSpans {
     };
     let mut spans_by_item: HashMap<crate::HeaderFooterItemKey, Vec<(u32, usize)>> = HashMap::new();
     let mut items = Vec::new();
+    let mut page_frames = HashMap::new();
     for &page in full_pages {
         // A page read turned upright is compared upright, as its Markdown
         // is laid out; other pages in their rendered geometry, as before.
         let turned = page_upright_turns(page) != 0;
         let (page_items, _) = indexed_ocr_text_items(page, &HashSet::new(), turned);
+        page_frames.insert(page.rendered.page(), ocr_page_frame(page, turned));
         let plain: Vec<TextItem> = page_items.iter().map(|(_, item)| item.clone()).collect();
         let base_size =
             crate::markdown::analysis::calculate_font_stats_from_items(&plain).most_common_size;
@@ -902,7 +904,7 @@ fn repeated_spans_among(full_pages: &[&RoutedOcrPage]) -> RepeatedOcrSpans {
             items.push(item);
         }
     }
-    let repeated = crate::repeated_header_footer_items(
+    let repeated = crate::repeated_header_footer_items_in_frames(
         &items,
         &HashMap::new(),
         &HashMap::new(),
@@ -911,6 +913,7 @@ fn repeated_spans_among(full_pages: &[&RoutedOcrPage]) -> RepeatedOcrSpans {
         &HashMap::new(),
         // The pages that take no part are not in `items`.
         &HashSet::new(),
+        &page_frames,
     );
     let mut result = RepeatedOcrSpans {
         spans: BTreeMap::new(),
@@ -922,6 +925,30 @@ fn repeated_spans_among(full_pages: &[&RoutedOcrPage]) -> RepeatedOcrSpans {
         }
     }
     result
+}
+
+/// The page's visible `(bottom, top)` in the coordinates
+/// [`indexed_ocr_text_items`] gives its spans with `layout`: the rendered
+/// page mapped to PDF space, or the upright frame a page read turned is laid
+/// out in.
+fn ocr_page_frame(page: &RoutedOcrPage, layout: bool) -> (f32, f32) {
+    let frame = if layout {
+        ocr_span_boxes(page)
+    } else {
+        page_space_span_boxes(page)
+    };
+    if frame.turns == 0 {
+        let rect = page.rendered.pixel_rect_to_pdf_rect(
+            0.0,
+            0.0,
+            f64::from(page.rendered.width()),
+            f64::from(page.rendered.height()),
+        );
+        (rect.y, rect.y + rect.height)
+    } else {
+        let scale = page.rendered.page_width() / page.rendered.width() as f32;
+        (0.0, frame.height as f32 * scale)
+    }
 }
 
 /// Version of [`OcrRepeatEvidence`]'s meaning; evidence of another version
@@ -3882,6 +3909,66 @@ mod tests {
             .map(|&(text, top)| positioned_span(text, 30.0, top, 200.0, top + 9.0))
             .collect();
         scanned
+    }
+
+    /// [`sparse_scanned_page`] on a taller page: 600 x 1000 pt, rendered
+    /// 300 x 500 px.
+    fn tall_sparse_scanned_page(page: u32, rows: &[(&str, f32)]) -> RoutedOcrPage {
+        let mut scanned = sparse_scanned_page(page, rows);
+        let transform =
+            PageTransform::from_corners(300, 500, (0.0, 1000.0), (600.0, 1000.0), (0.0, 0.0))
+                .unwrap();
+        scanned.rendered = RenderedPage::new(
+            page,
+            600.0,
+            1000.0,
+            300,
+            500,
+            300,
+            RenderPixelFormat::Gray8,
+            vec![255; 150_000],
+            transform,
+        )
+        .unwrap();
+        scanned
+    }
+
+    #[test]
+    fn page_runs_judge_a_sparse_page_of_another_size_from_its_edge() {
+        // Codex on #22: pages 1-3 are 800 pt tall with the header 24 pt
+        // below the top (y 758 at its foot); sparse page 4 is 1000 pt tall.
+        // Its sentence at the same height, 242 pt below its top, is body
+        // text and stays; 24 pt below its top it is the header and goes.
+        let header = "Please sign and return this form";
+        let pages = |top_px: f32| {
+            move || {
+                let mut pages: Vec<RoutedOcrPage> = (1..=3)
+                    .map(|page| scanned_page(page, Some(header), 9.0))
+                    .collect();
+                pages.push(tall_sparse_scanned_page(
+                    4,
+                    &[(header, top_px), ("Thank you for your order", 300.0)],
+                ));
+                pages
+            }
+        };
+        let natives = scanned_natives(4);
+        let whole = assert_page_runs_match_one_run(
+            pages(112.0),
+            &natives,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, header), [1, 4]);
+        assert_eq!(repeated_lines(&whole), [0, 1, 1, 0]);
+        let whole = assert_page_runs_match_one_run(
+            pages(12.0),
+            &natives,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, header), [1]);
+        assert_eq!(repeated_lines(&whole), [0, 1, 1, 1]);
     }
 
     #[test]
