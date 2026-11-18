@@ -11,7 +11,8 @@ The reproducible runtime path uses these builds:
 
 - [Firecrawl PDFium `native-v7988`](https://github.com/firecrawl/pdfium-rs/releases/tag/native-v7988),
   containing PDFium `153.0.7988.0`
-- [ONNX Runtime `1.27.0`](https://github.com/microsoft/onnxruntime/releases/tag/v1.27.0)
+- [ONNX Runtime `1.32.0`](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime/1.32.0),
+  from Microsoft's NuGet package
 - PP-OCRv6 Small artifact revision `oar-ocr-v0.7.0`
 
 Use these versions for the reproducible path. Other compatible shared-library
@@ -19,18 +20,24 @@ builds may work, but are not part of the release smoke test.
 
 ## Install the shared libraries
 
-Download and extract the matching archives:
+Download and extract the matching PDFium archive and take the ONNX Runtime
+library from the NuGet package (a zip file). Microsoft's GitHub releases
+(`github.com/microsoft/onnxruntime`) have returned 404 since 2026-11-17.
 
-| Platform | PDFium asset | ONNX Runtime asset |
+| Platform | PDFium asset | ONNX Runtime library in the package |
 |---|---|---|
-| Linux x64 | `firecrawl-pdfium-linux-x64.tgz` | `onnxruntime-linux-x64-1.27.0.tgz` |
-| Linux ARM64 | `firecrawl-pdfium-linux-arm64.tgz` | `onnxruntime-linux-aarch64-1.27.0.tgz` |
-| macOS Apple Silicon | `firecrawl-pdfium-mac-arm64.tgz` | `onnxruntime-osx-arm64-1.27.0.tgz` |
-| Windows x64 | `firecrawl-pdfium-win-x64.tgz` | `onnxruntime-win-x64-1.27.0.zip` |
+| Linux x64 | `firecrawl-pdfium-linux-x64.tgz` | `runtimes/linux-x64/native/libonnxruntime.so` |
+| Linux ARM64 | `firecrawl-pdfium-linux-arm64.tgz` | `runtimes/linux-arm64/native/libonnxruntime.so` |
+| macOS Apple Silicon | `firecrawl-pdfium-mac-arm64.tgz` | `runtimes/osx-arm64/native/libonnxruntime.dylib` |
+| Windows x64 | `firecrawl-pdfium-win-x64.tgz` | `runtimes/win-x64/native/onnxruntime.dll` |
+
+On Linux, the 1.32.0 libraries need glibc 2.28 or later and libstdc++ with
+`GLIBCXX_3.4.22` or later (1.27.0 did not); on an older system the library
+fails to load when OCR first starts.
 
 The PDFium release publishes `SHA256SUMS`, build provenance, license files,
-and an SPDX document for every platform archive. GitHub publishes a SHA-256
-digest with each ONNX Runtime asset.
+and an SPDX document for every platform archive. CI pins the NuGet package's
+and the Linux x64 library's SHA-256 (`.github/workflows/ci.yml`).
 
 Point pdf-inspector at the extracted shared libraries when they are not on the
 platform library search path:
@@ -52,7 +59,7 @@ pdf2md scan.pdf --ocr auto --json
 
 The native extraction packages also support platforms without these exact
 runtime assets. In particular, the Python package has an Intel macOS wheel,
-but ONNX Runtime 1.27.0 does not publish an Intel macOS archive; local OCR on
+but ONNX Runtime 1.32.0 has no Intel macOS build; local OCR on
 that target requires a compatible custom ONNX Runtime build.
 
 The full OCR path is exercised end to end on Linux x64 in CI. macOS and
