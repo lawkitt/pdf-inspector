@@ -144,34 +144,24 @@ jobs:
       - name: Install ONNX Runtime
         shell: bash
         run: |
-          # GitHub's release first; NuGet's Microsoft.ML.OnnxRuntime 1.27.0
-          # only when that download fails (github.com/microsoft/onnxruntime
-          # returned 404 from 2026-11-17). Each source has its own archive pin;
-          # a hash mismatch fails the job and never falls through.
-          # The NuGet runtimes/linux-x64/native/libonnxruntime.so has SHA-256
-          # 4061866361d9a8d2872f5f419c5515ce35a830a0c5c77ce1723320ac0dbabfc7
-          # (23,658,512 bytes); recorded for reference, not compared with
-          # GitHub's, which could not be downloaded when this was added.
-          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.27.0.tgz"
+          # ONNX Runtime 1.32.0, mdoc's desktop runtime, from NuGet's
+          # Microsoft.ML.OnnxRuntime, the only source of 1.32.0 that can be
+          # pinned: github.com/microsoft/onnxruntime has returned 404 since
+          # 2026-11-17, so the v1.32.0 release asset
+          # (onnxruntime-linux-x64-1.32.0.tgz) could not be downloaded or
+          # hashed. Once it can, it goes first with its own archive pin, NuGet
+          # only when that download fails, and a hash mismatch never falls
+          # through. Both the package and the library are pinned.
+          package="$RUNNER_TEMP/microsoft.ml.onnxruntime.1.32.0.nupkg"
           directory="$RUNNER_TEMP/onnxruntime"
           mkdir -p "$directory"
-          if curl --fail --location --silent --show-error --retry 2 \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz \
-            --output "$archive"; then
-            echo "ONNX Runtime source: GitHub release"
-            echo "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f  $archive" | sha256sum --check
-            tar -xzf "$archive" -C "$directory"
-          else
-            echo "ONNX Runtime source: NuGet (GitHub download failed)"
-            package="$RUNNER_TEMP/microsoft.ml.onnxruntime.1.27.0.nupkg"
-            curl --fail --location --silent --show-error --retry 2 \
-              https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.27.0/microsoft.ml.onnxruntime.1.27.0.nupkg \
-              --output "$package"
-            echo "c725e8cefdfe4de08befb9f79b3f218c162439cdcdb97cbbb5192888d58ea669  $package" | sha256sum --check
-            unzip -q -j "$package" runtimes/linux-x64/native/libonnxruntime.so -d "$directory"
-          fi
-          ort_path="$(find "$directory" -type f -name 'libonnxruntime.so*' -print -quit)"
-          test -n "$ort_path"
+          curl --fail --location --silent --show-error --retry 2 \
+            https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.32.0/microsoft.ml.onnxruntime.1.32.0.nupkg \
+            --output "$package"
+          echo "a9150bc2992cbbb6722070da9910e1ffa989a8bfc67bdd5bb8e745ca755641db  $package" | sha256sum --check
+          unzip -q -j "$package" runtimes/linux-x64/native/libonnxruntime.so -d "$directory"
+          ort_path="$directory/libonnxruntime.so"
+          echo "4213d6d8c42ac4754865849cb139d31fc39127db6a326babf90bbc81a6eb52fc  $ort_path" | sha256sum --check
           echo "ORT_DYLIB_PATH=$ort_path" >> "$GITHUB_ENV"
 
       - name: Configure isolated model cache
