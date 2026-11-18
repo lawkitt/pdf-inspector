@@ -831,7 +831,8 @@ fn find_table_regions(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
 /// starts where one of the last row's cells starts and ends before the next
 /// cell does, and the region's own rows wrap the same way somewhere (a line
 /// continuing the cells of the row above it), so a table of one-line rows
-/// does not swallow a short note set right under it.
+/// does not swallow a short note set right under it, and each segment
+/// reads on from the cell text above it (`continues_cell_text`).
 fn extend_over_wrapped_last_row(candidates: &[(usize, &TextItem)], y_min: f32, y_max: f32) -> f32 {
     const SAME_LINE: f32 = 2.0;
     const SAME_START: f32 = 3.0;
@@ -851,18 +852,22 @@ fn extend_over_wrapped_last_row(candidates: &[(usize, &TextItem)], y_min: f32, y
             _ => lines.push((item.y, vec![item])),
         }
     }
-    let lines: Vec<(f32, Vec<(f32, f32)>)> = lines
+    // A segment: (start, end, text).
+    type Segment = (f32, f32, String);
+    let lines: Vec<(f32, Vec<Segment>)> = lines
         .into_iter()
         .map(|(y, mut runs)| {
             runs.sort_by(|a, b| a.x.total_cmp(&b.x));
-            let mut segments: Vec<(f32, f32)> = Vec::new();
+            let mut segments: Vec<Segment> = Vec::new();
             for run in runs {
                 let end = run.x + run.width.max(0.0);
                 match segments.last_mut() {
                     Some(last) if run.x - last.1 <= run.font_size.max(1.0) => {
                         last.1 = last.1.max(end);
+                        last.2.push(' ');
+                        last.2.push_str(run.text.trim());
                     }
-                    _ => segments.push((run.x, end)),
+                    _ => segments.push((run.x, end, run.text.trim().to_string())),
                 }
             }
             (y, segments)
@@ -885,14 +890,25 @@ fn extend_over_wrapped_last_row(candidates: &[(usize, &TextItem)], y_min: f32, y
         gap >= pitch * 0.7 && gap <= pitch * 1.25
     };
     // Every segment of `line` continues a cell of `row`.
-    let continues = |row: &[(f32, f32)], line: &[(f32, f32)]| {
+    let continues = |row: &[Segment], line: &[Segment]| {
         row.len() >= 2
             && line.len() < row.len()
-            && line.iter().all(|&(start, end)| {
+            && line.iter().all(|&(start, end, _)| {
                 row.iter()
                     .position(|cell| (cell.0 - start).abs() <= SAME_START)
                     .is_some_and(|cell| row.get(cell + 1).is_none_or(|next| end < next.0))
             })
+    };
+    // The text of the nearest line above `line` (back to `row`) in the
+    // column that starts at `start`.
+    let text_above = |line: usize, row: usize, start: f32| {
+        (row..line).rev().find_map(|above| {
+            lines[above]
+                .1
+                .iter()
+                .find(|segment| (segment.0 - start).abs() <= SAME_START)
+                .map(|segment| segment.2.as_str())
+        })
     };
     let wraps_inside = (1..inside).any(|line| {
         let row = (0..line).rev().find(|&row| lines[row].1.len() >= 2);
@@ -907,9 +923,18 @@ fn extend_over_wrapped_last_row(candidates: &[(usize, &TextItem)], y_min: f32, y
     if !wraps_inside {
         return y_min;
     }
+    // Below the region a line must also read on from the text above it in
+    // its column, so a note set under the table ("Source: ...") stays out
+    // when that text closed with a full stop.
     let mut lowest = inside - 1;
     while let Some((y, segments)) = lines.get(lowest + 1) {
-        if !one_line_below(lines[lowest].0, *y) || !continues(&lines[last_row].1, segments) {
+        if !one_line_below(lines[lowest].0, *y)
+            || !continues(&lines[last_row].1, segments)
+            || !segments.iter().all(|segment| {
+                text_above(lowest + 1, last_row, segment.0)
+                    .is_some_and(|above| super::grid::continues_cell_text(above, &segment.2))
+            })
+        {
             break;
         }
         lowest += 1;
