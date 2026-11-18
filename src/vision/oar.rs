@@ -107,6 +107,37 @@ const ESCALATION_MINIMUM_REGIONS: usize = 80;
 /// regions to qualify at all.
 const ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 15.0;
 
+/// A page is on its side when at least this many detected lines run
+/// vertically...
+const SIDEWAYS_MINIMUM_LINES: usize = 3;
+
+/// ...and they outnumber the horizontal lines by more than this factor. A
+/// line counts in either direction only when it is at least
+/// [`LINE_ELONGATION`] times as long as it is thick: a word or a digit on its
+/// own is often taller than wide.
+const SIDEWAYS_DOMINANCE: usize = 2;
+
+/// Length-to-thickness ratio from which a detected region counts as a line.
+const LINE_ELONGATION: f32 = 3.0;
+
+/// Pages read below this mean confidence are checked for being upside down.
+/// Upright pages of mdoc's OCR corpus, photographs and old scans included,
+/// read at 0.93 or more; upside-down text reads far lower (#622 reports
+/// 0.59–0.69).
+const UPSIDE_DOWN_CHECK_CONFIDENCE: f32 = 0.9;
+
+/// How many of the page's longest regions the upside-down check reads again
+/// turned half round.
+const UPSIDE_DOWN_SAMPLE: usize = 8;
+
+/// The half-turned sample must read this much more confidently on average
+/// than the same regions as they are for the page to be upside down.
+const UPSIDE_DOWN_MARGIN: f32 = 0.15;
+
+/// A page turned upright that still reads below this mean confidence keeps a
+/// warning: the turn did not make it reliable.
+const TURNED_PAGE_WEAK_CONFIDENCE: f32 = 0.8;
+
 /// One worker's model sessions: a standard-limit detector plus a recognizer,
 /// and that worker's own lazily built escalated-limit detector.
 /// Staged (detect, crop, recognize as separate calls) rather than OAROCR's
@@ -499,62 +530,71 @@ impl OarOcrEngine {
         worker: &OcrWorker,
     ) -> Result<OcrPage, OarOcrError> {
         let started = Instant::now();
-        let image = Arc::new(rendered_page_to_rgb(page)?);
-        let boxes = self.detect_boxes(page, &image, worker)?;
-        // Reading order, matching what the combined pipeline produced.
-        let boxes = oar_ocr::processors::sort_quad_boxes(&boxes);
+        let mut image = Arc::new(rendered_page_to_rgb(page)?);
+        let mut boxes = self.detect_boxes(page, &image, worker)?;
 
-        // Same rotation-aware cropping the combined pipeline uses.
-        let crops =
-            TextCroppingProcessor::new(true).process((Arc::clone(&image), boxes.clone()))?;
+        // A page scanned on its side or upside down (#622). The pinned model
+        // set has no orientation classifier, so the turn is found from what
+        // detection and recognition already produce: lines that run
+        // vertically put the page on its side, and a page that reads poorly
+        // is tried half turned on a sample of its lines. The page is turned
+        // upright and detected again, so the layout sees level lines.
+        let mut turns = 0u8;
+        if lines_run_vertically(&boxes) {
+            turns = 1;
+            image = Arc::new(image::imageops::rotate90(&*image));
+            boxes = self.detect_boxes(page, &image, worker)?;
+        }
+        let mut regions = recognize_regions(&image, boxes, worker)?;
+        // A page set on its side may have been turned the wrong way round,
+        // so it is always checked; an unturned page only when it reads
+        // poorly.
+        let checked = turns != 0 || mean_region_confidence(&regions) < UPSIDE_DOWN_CHECK_CONFIDENCE;
+        if checked && reads_upside_down(&image, &regions, worker)? {
+            turns += 2;
+            image = Arc::new(image::imageops::rotate180(&*image));
+            boxes = self.detect_boxes(page, &image, worker)?;
+            regions = recognize_regions(&image, boxes, worker)?;
+        }
+        let (turned_width, turned_height) = image.dimensions();
         drop(image);
 
-        let recognizer = &worker.recognizer;
-        let mut spans = Vec::with_capacity(boxes.len());
+        let orientation_degrees = (turns != 0).then(|| f32::from((4 - turns) % 4) * 90.0);
+        let mut spans = Vec::with_capacity(regions.len());
         let mut invalid_geometry = 0usize;
         let mut missing_recognition = 0usize;
-        for (bounding_box, crop) in boxes.iter().zip(crops) {
-            let Some(crop) = crop else {
-                invalid_geometry += 1;
-                continue;
+        for region in regions {
+            let (text, confidence) = match region.outcome {
+                RegionOutcome::InvalidGeometry => {
+                    invalid_geometry += 1;
+                    continue;
+                }
+                RegionOutcome::Unrecognized => {
+                    missing_recognition += 1;
+                    continue;
+                }
+                RegionOutcome::Recognized { text, confidence } => (text, confidence),
             };
-            // One crop per call: document line crops often have very
-            // different widths, and batching pads every crop to the widest
-            // line. Measured on CPU, batched recognition (even width-sorted)
-            // is 2–3× slower than per-crop calls.
-            let crop = Arc::try_unwrap(crop).unwrap_or_else(|shared| (*shared).clone());
-            let recognized = recognizer.predict(vec![crop])?;
-            let (Some(text), Some(confidence)) = (
-                recognized.texts.into_iter().next(),
-                recognized.scores.into_iter().next(),
-            ) else {
-                missing_recognition += 1;
-                continue;
-            };
-            if text.trim().is_empty() || !confidence.is_finite() {
-                missing_recognition += 1;
-                continue;
-            }
-            let confidence = confidence.clamp(0.0, 1.0);
             if confidence < options.minimum_confidence {
                 continue;
             }
 
-            let Some(polygon) = bounding_box_to_quad(bounding_box, page.width(), page.height())
+            let Some(polygon) =
+                bounding_box_to_quad(&region.bounding_box, turned_width, turned_height)
             else {
                 invalid_geometry += 1;
                 continue;
             };
             spans.push(OcrSpan {
                 text,
-                polygon,
+                polygon: unturn_quad(polygon, turns, page.width(), page.height()),
                 confidence,
-                // The combined pipeline's orientation_angle came from the
-                // text-line-orientation classifier, a model this engine has
-                // never loaded — it was structurally None before the staged
-                // split too (the staged/combined A/B was byte-identical).
-                // Region rotation is still carried by the polygon itself.
-                orientation_degrees: None,
+                // No text-line orientation classifier is loaded (the
+                // combined pipeline's per-line angle was always None too).
+                // A whole page read turned upright reports that page's turn
+                // on every span; region rotation within the page is carried
+                // by the polygon itself.
+                orientation_degrees,
             });
         }
 
@@ -575,6 +615,14 @@ impl OarOcrEngine {
         } else {
             Some(spans.iter().map(|span| span.confidence).sum::<f32>() / spans.len() as f32)
         };
+        if let Some(degrees) = orientation_degrees {
+            log::debug!("page {}: text turned {degrees}° clockwise", page.page());
+        }
+        warnings.extend(orientation_warning(
+            orientation_degrees,
+            checked,
+            mean_confidence,
+        ));
         let processing_time_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         Ok(OcrPage {
@@ -586,6 +634,220 @@ impl OarOcrEngine {
             warnings,
         })
     }
+}
+
+/// The warning for a page whose orientation was checked (it lay on its
+/// side, or read below [`UPSIDE_DOWN_CHECK_CONFIDENCE`]) and that still
+/// reads below [`TURNED_PAGE_WEAK_CONFIDENCE`]: the turn found, if any, did
+/// not make it reliable, so the text may be garbled.
+fn orientation_warning(
+    orientation_degrees: Option<f32>,
+    checked: bool,
+    mean_confidence: Option<f32>,
+) -> Option<String> {
+    let weak = mean_confidence.is_none_or(|confidence| confidence < TURNED_PAGE_WEAK_CONFIDENCE);
+    if !checked || !weak {
+        return None;
+    }
+    Some(match orientation_degrees {
+        Some(degrees) => format!(
+            "page text is turned {degrees}° clockwise; it was read turned upright, \
+             but recognition stays weak"
+        ),
+        None => "page text reads weakly and no turn of the page reads clearly better; \
+                 it may be turned, slanted or hard to read"
+            .to_string(),
+    })
+}
+
+/// What recognition made of one detected region.
+enum RegionOutcome {
+    /// The region could not be cropped from the page.
+    InvalidGeometry,
+    /// The recognizer returned no usable text for it.
+    Unrecognized,
+    /// Recognized text and its confidence in 0–1.
+    Recognized { text: String, confidence: f32 },
+}
+
+/// One detected region and what recognition made of it.
+struct RecognizedRegion {
+    bounding_box: BoundingBox,
+    outcome: RegionOutcome,
+}
+
+/// Crops and recognizes every detected region of `image`, in reading order.
+fn recognize_regions(
+    image: &Arc<RgbImage>,
+    boxes: Vec<BoundingBox>,
+    worker: &OcrWorker,
+) -> Result<Vec<RecognizedRegion>, OarOcrError> {
+    // Reading order, matching what the combined pipeline produced.
+    let boxes = oar_ocr::processors::sort_quad_boxes(&boxes);
+    // Same rotation-aware cropping the combined pipeline uses.
+    let crops = TextCroppingProcessor::new(true).process((Arc::clone(image), boxes.clone()))?;
+    let mut regions = Vec::with_capacity(boxes.len());
+    for (bounding_box, crop) in boxes.into_iter().zip(crops) {
+        let outcome = match crop {
+            None => RegionOutcome::InvalidGeometry,
+            // One crop per call: document line crops often have very
+            // different widths, and batching pads every crop to the widest
+            // line. Measured on CPU, batched recognition (even width-sorted)
+            // is 2–3× slower than per-crop calls.
+            Some(crop) => recognize_crop(
+                &worker.recognizer,
+                Arc::try_unwrap(crop).unwrap_or_else(|shared| (*shared).clone()),
+            )?,
+        };
+        regions.push(RecognizedRegion {
+            bounding_box,
+            outcome,
+        });
+    }
+    Ok(regions)
+}
+
+fn recognize_crop(
+    recognizer: &TextRecognitionPredictor,
+    crop: RgbImage,
+) -> Result<RegionOutcome, OarOcrError> {
+    let recognized = recognizer.predict(vec![crop])?;
+    let (Some(text), Some(confidence)) = (
+        recognized.texts.into_iter().next(),
+        recognized.scores.into_iter().next(),
+    ) else {
+        return Ok(RegionOutcome::Unrecognized);
+    };
+    if text.trim().is_empty() || !confidence.is_finite() {
+        return Ok(RegionOutcome::Unrecognized);
+    }
+    Ok(RegionOutcome::Recognized {
+        text,
+        confidence: confidence.clamp(0.0, 1.0),
+    })
+}
+
+/// Confidence of a region for orientation checks: zero when nothing usable
+/// was recognized, which is what upside-down text often gives.
+fn region_confidence(region: &RecognizedRegion) -> f32 {
+    match region.outcome {
+        RegionOutcome::Recognized { confidence, .. } => confidence,
+        _ => 0.0,
+    }
+}
+
+/// Mean confidence over the recognized regions; zero when there are none
+/// but there were regions to read, one when the page has no regions at all.
+fn mean_region_confidence(regions: &[RecognizedRegion]) -> f32 {
+    let recognized: Vec<f32> = regions
+        .iter()
+        .filter_map(|region| match region.outcome {
+            RegionOutcome::Recognized { confidence, .. } => Some(confidence),
+            _ => None,
+        })
+        .collect();
+    if regions.is_empty() {
+        1.0
+    } else if recognized.is_empty() {
+        0.0
+    } else {
+        recognized.iter().sum::<f32>() / recognized.len() as f32
+    }
+}
+
+/// Length and thickness of a detected region: its longer and shorter edge,
+/// and whether the longer one runs vertically.
+fn region_extent(region: &BoundingBox) -> Option<(f32, f32, bool)> {
+    let [p0, p1, p2, ..] = region.points.as_slice() else {
+        return None;
+    };
+    let first = (p1.x - p0.x, p1.y - p0.y);
+    let second = (p2.x - p1.x, p2.y - p1.y);
+    let (first_length, second_length) = (first.0.hypot(first.1), second.0.hypot(second.1));
+    let (long, length, thickness) = if first_length >= second_length {
+        (first, first_length, second_length)
+    } else {
+        (second, second_length, first_length)
+    };
+    (length.is_finite() && thickness.is_finite()).then_some((
+        length,
+        thickness,
+        long.1.abs() > long.0.abs(),
+    ))
+}
+
+/// True when most of the page's text lines run vertically: the page lies on
+/// its side. A vertical margin note on an upright page does not tip it.
+fn lines_run_vertically(boxes: &[BoundingBox]) -> bool {
+    let (mut vertical, mut horizontal) = (0usize, 0usize);
+    for (length, thickness, runs_vertically) in boxes.iter().filter_map(region_extent) {
+        if thickness <= 0.0 || length < thickness * LINE_ELONGATION {
+            continue;
+        }
+        if runs_vertically {
+            vertical += 1;
+        } else {
+            horizontal += 1;
+        }
+    }
+    vertical >= SIDEWAYS_MINIMUM_LINES && vertical > horizontal * SIDEWAYS_DOMINANCE
+}
+
+/// True when the page's longest regions read clearly better turned half
+/// round: the page is upside down.
+fn reads_upside_down(
+    image: &Arc<RgbImage>,
+    regions: &[RecognizedRegion],
+    worker: &OcrWorker,
+) -> Result<bool, OarOcrError> {
+    let mut sample: Vec<(f32, &RecognizedRegion)> = regions
+        .iter()
+        .filter_map(|region| {
+            let (length, ..) = region_extent(&region.bounding_box)?;
+            Some((length, region))
+        })
+        .collect();
+    sample.sort_by(|a, b| b.0.total_cmp(&a.0));
+    sample.truncate(UPSIDE_DOWN_SAMPLE);
+    if sample.is_empty() {
+        return Ok(false);
+    }
+    let boxes = sample
+        .iter()
+        .map(|(_, region)| region.bounding_box.clone())
+        .collect();
+    let crops = TextCroppingProcessor::new(true).process((Arc::clone(image), boxes))?;
+    let (mut as_is, mut turned) = (0.0f32, 0.0f32);
+    for ((_, region), crop) in sample.iter().zip(crops) {
+        as_is += region_confidence(region);
+        if let Some(crop) = crop {
+            let crop = image::imageops::rotate180(&*crop);
+            if let RegionOutcome::Recognized { confidence, .. } =
+                recognize_crop(&worker.recognizer, crop)?
+            {
+                turned += confidence;
+            }
+        }
+    }
+    let count = sample.len() as f32;
+    let (as_is, turned) = (as_is / count, turned / count);
+    log::debug!("upside-down check: {as_is:.3} as is, {turned:.3} turned half round");
+    Ok(turned >= as_is + UPSIDE_DOWN_MARGIN)
+}
+
+/// Maps a quad found on the page turned `turns` quarter turns clockwise back
+/// onto the page as rendered, `width` × `height` pixels.
+fn unturn_quad(quad: ImageQuad, turns: u8, width: u32, height: u32) -> ImageQuad {
+    let (width, height) = (width as f32, height as f32);
+    ImageQuad::new(quad.points.map(|point| {
+        let (u, v) = (point.x, point.y);
+        match turns % 4 {
+            1 => ImagePoint::new(v, height - u),
+            2 => ImagePoint::new(width - u, height - v),
+            3 => ImagePoint::new(width - v, u),
+            _ => point,
+        }
+    }))
 }
 
 /// Runs one detector over one page image and returns its region polygons.
@@ -1631,5 +1893,135 @@ mod tests {
                 std::panic::resume_unwind(payload);
             }
         }
+    }
+
+    fn rectangle(left: f32, top: f32, right: f32, bottom: f32) -> BoundingBox {
+        BoundingBox::new(vec![
+            Point::new(left, top),
+            Point::new(right, top),
+            Point::new(right, bottom),
+            Point::new(left, bottom),
+        ])
+    }
+
+    #[test]
+    fn a_page_of_vertical_lines_lies_on_its_side() {
+        let sideways: Vec<_> = (0..4)
+            .map(|i| {
+                rectangle(
+                    100.0 + 40.0 * i as f32,
+                    50.0,
+                    120.0 + 40.0 * i as f32,
+                    600.0,
+                )
+            })
+            .collect();
+        assert!(lines_run_vertically(&sideways));
+
+        // Three is the least that counts.
+        assert!(!lines_run_vertically(&sideways[..2]));
+        assert!(lines_run_vertically(&sideways[..3]));
+    }
+
+    #[test]
+    fn margin_notes_and_short_words_do_not_put_a_page_on_its_side() {
+        let mut upright: Vec<_> = (0..10)
+            .map(|i| rectangle(50.0, 50.0 + 30.0 * i as f32, 550.0, 70.0 + 30.0 * i as f32))
+            .collect();
+        // A vertical stamp in the margin.
+        upright.push(rectangle(10.0, 100.0, 30.0, 700.0));
+        upright.push(rectangle(570.0, 100.0, 590.0, 700.0));
+        assert!(!lines_run_vertically(&upright));
+
+        // Digits and single words, taller than wide but not lines.
+        let digits: Vec<_> = (0..10)
+            .map(|i| rectangle(50.0 + 30.0 * i as f32, 50.0, 64.0 + 30.0 * i as f32, 75.0))
+            .collect();
+        assert!(!lines_run_vertically(&digits));
+    }
+
+    #[test]
+    fn region_extent_reads_the_longer_edge_as_the_length() {
+        let (length, thickness, vertical) =
+            region_extent(&rectangle(0.0, 0.0, 20.0, 200.0)).unwrap();
+        assert_eq!((length, thickness, vertical), (200.0, 20.0, true));
+        let (length, thickness, vertical) =
+            region_extent(&rectangle(0.0, 0.0, 200.0, 20.0)).unwrap();
+        assert_eq!((length, thickness, vertical), (200.0, 20.0, false));
+        assert!(region_extent(&BoundingBox::new(vec![Point::new(0.0, 0.0)])).is_none());
+    }
+
+    #[test]
+    fn quads_found_on_a_turned_page_map_back_onto_the_rendered_page() {
+        // The rendered page is 300 × 100; its point (10, 20) is where each
+        // turned image puts it.
+        let (width, height) = (300, 100);
+        let at = |x: f32, y: f32| {
+            ImageQuad::new([
+                ImagePoint::new(x, y),
+                ImagePoint::new(x, y),
+                ImagePoint::new(x, y),
+                ImagePoint::new(x, y),
+            ])
+        };
+        let original = ImagePoint::new(10.0, 20.0);
+        // One quarter turn clockwise: (x, y) -> (height - y, x).
+        assert_eq!(
+            unturn_quad(at(80.0, 10.0), 1, width, height).points[0],
+            original
+        );
+        // A half turn: (x, y) -> (width - x, height - y).
+        assert_eq!(
+            unturn_quad(at(290.0, 80.0), 2, width, height).points[0],
+            original
+        );
+        // Three quarter turns: (x, y) -> (y, width - x).
+        assert_eq!(
+            unturn_quad(at(20.0, 290.0), 3, width, height).points[0],
+            original
+        );
+        assert_eq!(
+            unturn_quad(at(10.0, 20.0), 0, width, height).points[0],
+            original
+        );
+    }
+
+    #[test]
+    fn a_checked_page_that_stays_weak_is_warned_about() {
+        // Turned upright and read well: no warning.
+        assert_eq!(orientation_warning(Some(90.0), true, Some(0.95)), None);
+        // Turned, still weak.
+        assert!(orientation_warning(Some(180.0), true, Some(0.6))
+            .unwrap()
+            .contains("turned 180° clockwise"));
+        // Checked, no turn read clearly better, still weak (#622: an
+        // upside-down page whose half-turned sample improves too little).
+        assert!(orientation_warning(None, true, Some(0.69))
+            .unwrap()
+            .contains("may be turned"));
+        assert!(orientation_warning(None, true, None).is_some());
+        // A page read at 0.9 or better is never checked.
+        assert_eq!(orientation_warning(None, false, Some(0.7)), None);
+        assert_eq!(orientation_warning(None, true, Some(0.85)), None);
+    }
+
+    #[test]
+    fn region_confidence_counts_unread_regions_as_zero() {
+        let region = |outcome| RecognizedRegion {
+            bounding_box: rectangle(0.0, 0.0, 100.0, 10.0),
+            outcome,
+        };
+        let regions = vec![
+            region(RegionOutcome::Recognized {
+                text: "a".to_string(),
+                confidence: 0.8,
+            }),
+            region(RegionOutcome::Unrecognized),
+            region(RegionOutcome::InvalidGeometry),
+        ];
+        assert_eq!(mean_region_confidence(&regions), 0.8);
+        assert_eq!(region_confidence(&regions[1]), 0.0);
+        assert_eq!(mean_region_confidence(&regions[1..]), 0.0);
+        assert_eq!(mean_region_confidence(&[]), 1.0);
     }
 }

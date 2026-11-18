@@ -212,3 +212,123 @@ fn assert_usable_result(results: &[pdf_inspector::vision::OcrPage]) {
     assert!(!results[0].spans.is_empty());
     assert!(results[0].spans.iter().all(|span| span.confidence >= 0.3));
 }
+
+/// The model set the runtime tests resolve from `PDF_INSPECTOR_OCR_TEST_MODELS`:
+/// PP-OCRv6 Small unless `PDF_INSPECTOR_OCR_TEST_MANIFEST` names the Cyrillic
+/// set mdoc ships.
+#[cfg(feature = "ocr")]
+fn test_manifest() -> &'static pdf_inspector::vision::ModelManifest {
+    match std::env::var("PDF_INSPECTOR_OCR_TEST_MANIFEST").as_deref() {
+        Ok(id) if id == pdf_inspector::vision::PP_OCR_CYRILLIC.id => {
+            &pdf_inspector::vision::PP_OCR_CYRILLIC
+        }
+        _ => &PP_OCR_V6_SMALL,
+    }
+}
+
+#[cfg(all(feature = "ocr", feature = "render-pdfium"))]
+fn force_ocr(path: &str, model_directory: &std::ffi::OsStr) -> pdf_inspector::vision::OcrPdfResult {
+    let bytes = std::fs::read(path).unwrap();
+    let ocr = OcrOptions::new()
+        .mode(OcrMode::Force)
+        .model_directory(model_directory)
+        .model_downloads(ModelDownloadPolicy::Offline);
+    let options = OcrPdfOptions {
+        model_manifest: test_manifest(),
+        retain_recognition: true,
+        ..OcrPdfOptions::new().ocr(ocr)
+    };
+    process_pdf_with_ocr_mem(&bytes, options).unwrap()
+}
+
+/// #622: a page scanned sideways or upside down reads as the upright page
+/// does, and every span reports how the text was turned.
+#[cfg(all(feature = "ocr", feature = "render-pdfium"))]
+#[test]
+fn turned_scans_read_like_the_upright_page() {
+    let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
+        eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
+        return;
+    };
+    let Some(_renderer) = load_renderer() else {
+        return;
+    };
+
+    let upright = force_ocr(
+        "tests/fixtures/ocr_qualification_english.pdf",
+        &model_directory,
+    );
+    assert!(upright
+        .markdown
+        .contains("Payment must arrive within thirty working days."));
+    assert!(upright.recognition[0]
+        .spans
+        .iter()
+        .all(|span| span.orientation_degrees.is_none()));
+    for degrees in [90.0, 180.0, 270.0] {
+        let turned = force_ocr(
+            &format!("tests/fixtures/ocr_rotated_{degrees}.pdf"),
+            &model_directory,
+        );
+        eprintln!("{degrees}: {}", turned.markdown);
+        assert_eq!(turned.markdown, upright.markdown, "turned {degrees}");
+        let spans = &turned.recognition[0].spans;
+        assert_eq!(spans.len(), upright.recognition[0].spans.len());
+        assert!(spans
+            .iter()
+            .all(|span| span.orientation_degrees == Some(degrees)));
+        assert!(turned.pages[0].provenance.warnings.is_empty());
+        assert!(turned.pages_recommending_hosted.is_empty());
+    }
+}
+
+/// #624: a clean scan keeps the native page's headings, paragraphs and list
+/// items instead of running the page together.
+#[cfg(all(feature = "ocr", feature = "render-pdfium"))]
+#[test]
+fn a_clean_scan_keeps_the_native_pages_structure() {
+    let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
+        eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
+        return;
+    };
+    let Some(_renderer) = load_renderer() else {
+        return;
+    };
+
+    let native = process_pdf_with_ocr_mem(
+        &std::fs::read("tests/fixtures/ocr_clean_scan_paragraphs_native.pdf").unwrap(),
+        OcrPdfOptions::new(),
+    )
+    .unwrap();
+    let scanned = force_ocr(
+        "tests/fixtures/ocr_clean_scan_paragraphs.pdf",
+        &model_directory,
+    );
+    eprintln!("native:\n{}\nOCR:\n{}", native.markdown, scanned.markdown);
+
+    // Block by block: a heading (at any level), a list item or a paragraph,
+    // with the same words.
+    let blocks = |markdown: &str| -> Vec<String> {
+        markdown
+            .split("\n\n")
+            .flat_map(|block| {
+                if block.lines().all(|line| line.starts_with(char::is_numeric)) {
+                    block.lines().map(str::to_string).collect::<Vec<_>>()
+                } else {
+                    vec![block.to_string()]
+                }
+            })
+            .map(|block| {
+                let heading = block.starts_with('#');
+                let words = block
+                    .trim_start_matches('#')
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{}{words}", if heading { "# " } else { "" })
+            })
+            .filter(|block| !block.is_empty())
+            .collect()
+    };
+    assert_eq!(blocks(&scanned.markdown), blocks(&native.markdown));
+}
