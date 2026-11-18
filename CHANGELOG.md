@@ -95,6 +95,10 @@ version and date. Earlier releases are described in their
   original bytes (encrypted files included). `RenderOptions::comment_annotations`
   (off by default) draws them again; `annotations(false)` still leaves out
   every annotation. Pages without comment annotations render as before.
+  When the comments cannot all be found (an object lopdf cannot load, more
+  than 100,000 `/Annots` entries, a page count PDFium disagrees with) or the
+  copy cannot be made, the page is rendered without annotations instead, so
+  comment text never reaches OCR; form fields are still drawn.
 - A word hyphenated at a line wrap inside one paragraph is joined without
   the document having to use it elsewhere, when a lowercase letter meets a
   lowercase letter of the same script ("contrac-" + "tion", "дого-" +

@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 
+use lopdf::xref::XrefEntry;
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId};
 
 /// Annotation subtypes hidden from OCR renders: notes, FreeText, popups and
@@ -33,17 +34,22 @@ pub(crate) const COMMENT_SUBTYPES: [&[u8]; 7] = [
 /// Annotation flag bit 2 (PDF 32000-1, table 165): do not display or print.
 const HIDDEN_FLAG: i64 = 2;
 
-/// `/Annots` entries examined per document before giving up on the rest.
+/// `/Annots` entries examined per document. A document with more cannot be
+/// verified, and is rendered without annotations.
 const MAX_ANNOTS_EXAMINED: usize = 100_000;
 
 /// Same bound native extraction puts on one decompressed object stream.
 const MAX_DECOMPRESSED_BYTES: usize = crate::MAX_STREAM_DECOMPRESSED_BYTES;
 
-/// Why no render copy could be made. The caller renders the original file.
+/// Why no verified render copy could be made. The caller renders the
+/// original without any annotations, so no comment can reach OCR.
 #[derive(Debug)]
 pub(crate) enum HideError {
     /// lopdf could not read the file (or decrypt it with the password).
     Load(lopdf::Error),
+    /// Some page or `/Annots` entry could not be read, for example an object
+    /// stream over the decompression bound, so a comment may be missed.
+    Unverified(String),
     /// lopdf could not write the update, e.g. an encrypted file whose
     /// `/Encrypt` dictionary is not an indirect object.
     Save(std::io::Error),
@@ -53,13 +59,26 @@ impl std::fmt::Display for HideError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Load(error) => write!(formatter, "could not read the PDF: {error}"),
+            Self::Unverified(reason) => formatter.write_str(reason),
             Self::Save(error) => write!(formatter, "could not write the render copy: {error}"),
         }
     }
 }
 
+/// The result of [`hide_comment_annotations`].
+#[derive(Debug)]
+pub(crate) struct HiddenCopy {
+    /// The copy to render, or `None` when no page has a comment annotation
+    /// and the original can be rendered as it is.
+    pub(crate) bytes: Option<Vec<u8>>,
+    /// Pages lopdf found. The renderer checks PDFium sees as many, since a
+    /// page lopdf missed was not searched for comments.
+    pub(crate) page_count: usize,
+}
+
 /// A copy of `pdf` whose comment-type annotations ([`COMMENT_SUBTYPES`]) are
-/// hidden, or `None` when no page has one.
+/// hidden. Fails when that cannot be made or verified: every page's
+/// `/Annots` entries must resolve.
 ///
 /// Every page is covered, not only the ones about to be rendered, so the
 /// result does not depend on lopdf and PDFium agreeing on page order. Bytes
@@ -68,18 +87,19 @@ impl std::fmt::Display for HideError {
 pub(crate) fn hide_comment_annotations(
     pdf: &[u8],
     password: Option<&str>,
-) -> Result<Option<Vec<u8>>, HideError> {
+) -> Result<HiddenCopy, HideError> {
     let header = pdf.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
     let pdf = &pdf[header..];
     let doc = load(pdf, password).map_err(HideError::Load)?;
+    let page_count = doc.get_pages().len();
 
-    let changes = hidden_objects(&doc);
-    if changes.is_empty() {
-        return Ok(None);
-    }
-    append_update(pdf, doc, changes)
-        .map(Some)
-        .map_err(HideError::Save)
+    let changes = hidden_objects(&doc).map_err(HideError::Unverified)?;
+    let bytes = if changes.is_empty() {
+        None
+    } else {
+        Some(append_update(pdf, doc, changes).map_err(HideError::Save)?)
+    };
+    Ok(HiddenCopy { bytes, page_count })
 }
 
 /// `pdf` (from its header) followed by an incremental update that redefines
@@ -134,18 +154,26 @@ fn load(pdf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
 /// The objects to redefine: each comment annotation that is an indirect
 /// object, with the Hidden flag set, and the `/Annots` array (or the page,
 /// when the array is direct) for annotations written directly in it.
-fn hidden_objects(doc: &Document) -> Vec<(ObjectId, Object)> {
+///
+/// Fails when a page, its `/Annots` array or one of its entries is missing
+/// from what lopdf loaded (an object stream over the decompression bound, a
+/// damaged object), or there are more entries than [`MAX_ANNOTS_EXAMINED`]:
+/// PDFium may still draw what was not seen. An entry that is present but not
+/// a dictionary is no annotation to PDFium either.
+fn hidden_objects(doc: &Document) -> Result<Vec<(ObjectId, Object)>, String> {
     let mut changes = Vec::new();
     let mut seen = HashSet::new();
     let mut examined = 0usize;
     for page_id in doc.get_pages().into_values() {
-        let Ok(page) = doc.get_dictionary(page_id) else {
-            continue;
-        };
+        let page = doc
+            .get_dictionary(page_id)
+            .map_err(|_| format!("page object {page_id:?} could not be read"))?;
         let (array_id, annots) = match page.get(b"Annots") {
-            Ok(Object::Reference(id)) => match doc.get_object(*id).and_then(Object::as_array) {
-                Ok(annots) => (Some(*id), annots),
-                Err(_) => continue,
+            Ok(Object::Reference(id)) => match doc.get_object(*id) {
+                Ok(Object::Array(annots)) => (Some(*id), annots),
+                Ok(_) => continue,
+                Err(_) if never_written(doc, *id) => continue,
+                Err(_) => return Err(format!("/Annots array {id:?} could not be read")),
             },
             Ok(Object::Array(annots)) => (None, annots),
             _ => continue,
@@ -157,10 +185,7 @@ fn hidden_objects(doc: &Document) -> Vec<(ObjectId, Object)> {
         let mut direct: Option<Vec<Object>> = None;
         for (index, entry) in annots.iter().enumerate() {
             if examined >= MAX_ANNOTS_EXAMINED {
-                log::debug!(
-                    "stopped hiding comment annotations after {MAX_ANNOTS_EXAMINED} entries"
-                );
-                return changes;
+                return Err(format!("more than {MAX_ANNOTS_EXAMINED} /Annots entries"));
             }
             examined += 1;
             match entry {
@@ -168,10 +193,13 @@ fn hidden_objects(doc: &Document) -> Vec<(ObjectId, Object)> {
                     if !seen.insert(*id) {
                         continue;
                     }
-                    if let Ok(dict) = doc.get_dictionary(*id) {
-                        if is_comment(doc, dict) {
+                    match doc.get_object(*id) {
+                        Ok(Object::Dictionary(dict)) if is_comment(doc, dict) => {
                             changes.push((*id, Object::Dictionary(hidden(doc, dict))));
                         }
+                        Ok(_) => {}
+                        Err(_) if never_written(doc, *id) => {}
+                        Err(_) => return Err(format!("annotation {id:?} could not be read")),
                     }
                 }
                 Object::Dictionary(dict) if is_comment(doc, dict) => {
@@ -193,7 +221,18 @@ fn hidden_objects(doc: &Document) -> Vec<(ObjectId, Object)> {
             }
         }
     }
-    changes
+    Ok(changes)
+}
+
+/// Whether `id` has no entry in the file's cross-reference table, or a free
+/// one: a reference to it is null to every reader. An object the table
+/// lists that lopdf did not load (an object stream over the decompression
+/// bound, a damaged object) may still be drawn by PDFium.
+fn never_written(doc: &Document, id: ObjectId) -> bool {
+    matches!(
+        doc.reference_table.get(id.0),
+        None | Some(XrefEntry::Free | XrefEntry::UnusableFree)
+    )
 }
 
 fn is_comment(doc: &Document, dict: &Dictionary) -> bool {
@@ -340,6 +379,7 @@ mod tests {
                 let original = document(all_kinds(), direct, xref_stream);
                 let copy = hide_comment_annotations(&original, None)
                     .unwrap()
+                    .bytes
                     .expect("comments to hide");
                 assert!(
                     copy.starts_with(&original),
@@ -357,7 +397,10 @@ mod tests {
     #[test]
     fn keeps_existing_flags_beside_hidden() {
         let original = document(vec![annot("FreeText", Some(4 | 32))], false, false);
-        let copy = hide_comment_annotations(&original, None).unwrap().unwrap();
+        let copy = hide_comment_annotations(&original, None)
+            .unwrap()
+            .bytes
+            .unwrap();
         assert_eq!(flags_of(&copy), [("FreeText".to_string(), 4 | 32 | 2)]);
     }
 
@@ -368,9 +411,15 @@ mod tests {
             false,
             false,
         );
-        assert!(hide_comment_annotations(&original, None).unwrap().is_none());
+        assert!(hide_comment_annotations(&original, None)
+            .unwrap()
+            .bytes
+            .is_none());
         let original = document(Vec::new(), true, false);
-        assert!(hide_comment_annotations(&original, None).unwrap().is_none());
+        assert!(hide_comment_annotations(&original, None)
+            .unwrap()
+            .bytes
+            .is_none());
     }
 
     #[test]
@@ -378,9 +427,77 @@ mod tests {
         let original = document(vec![annot("Text", None)], false, false);
         let mut prefixed = b"--boundary\r\n\r\n".to_vec();
         prefixed.extend_from_slice(&original);
-        let copy = hide_comment_annotations(&prefixed, None).unwrap().unwrap();
+        let copy = hide_comment_annotations(&prefixed, None)
+            .unwrap()
+            .bytes
+            .unwrap();
         assert!(copy.starts_with(&original));
         assert_eq!(flags_of(&copy), [("Text".to_string(), 2)]);
+    }
+
+    #[test]
+    fn reports_the_pages_lopdf_found() {
+        let original = document(vec![annot("Stamp", None)], false, false);
+        let hidden = hide_comment_annotations(&original, None).unwrap();
+        assert_eq!(hidden.page_count, 1);
+    }
+
+    #[test]
+    fn too_many_annots_entries_cannot_be_verified() {
+        let mut annots = vec![Object::Null; MAX_ANNOTS_EXAMINED];
+        annots.push(annot("FreeText", None));
+        let original = document(annots, true, false);
+        assert!(matches!(
+            hide_comment_annotations(&original, None),
+            Err(HideError::Unverified(_))
+        ));
+    }
+
+    /// A one-page file whose `/Annots` refers to objects 4 and 5. Object 4
+    /// is listed in the cross-reference table at an offset holding no
+    /// object; object 5 is not listed at all.
+    fn file_with_unreadable_annotation(list_object_4: bool) -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [4 0 R 5 0 R] >>",
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+        }
+        let garbage = pdf.len();
+        pdf.extend_from_slice(b"% not an object\n");
+        let xref = pdf.len();
+        let count = if list_object_4 { 5 } else { 4 };
+        pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for offset in &offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        if list_object_4 {
+            pdf.extend_from_slice(format!("{garbage:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn an_annotation_lopdf_could_not_load_cannot_be_verified() {
+        let listed = file_with_unreadable_annotation(true);
+        assert!(matches!(
+            hide_comment_annotations(&listed, None),
+            Err(HideError::Unverified(_))
+        ));
+        // References to objects the file never wrote are null to every
+        // reader, so they leave nothing to hide.
+        let unlisted = file_with_unreadable_annotation(false);
+        let hidden = hide_comment_annotations(&unlisted, None).unwrap();
+        assert!(hidden.bytes.is_none());
     }
 
     #[test]
@@ -391,9 +508,12 @@ mod tests {
         ));
     }
 
-    /// Every fixture renders the same through an update that redefines its
-    /// first page unchanged: the update itself (its trailer, cross-reference
-    /// format, `/Prev` and encryption) leaves the document as it was.
+    /// Every fixture's comments can be verified (lopdf reads every page and
+    /// `/Annots` entry, and finds the pages PDFium does), so none falls back
+    /// to rendering without annotations; and every fixture renders the same
+    /// through an update that redefines its first page unchanged: the update
+    /// itself (its trailer, cross-reference format, `/Prev` and encryption)
+    /// leaves the document as it was.
     #[test]
     fn a_no_op_update_renders_every_fixture_unchanged() {
         use crate::vision::{PdfiumRenderer, RenderOptions};
@@ -412,6 +532,7 @@ mod tests {
 
         let mut checked = 0;
         let mut skipped = Vec::new();
+        let mut page_count_differs = Vec::new();
         for path in paths {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let bytes = std::fs::read(&path).unwrap();
@@ -423,6 +544,11 @@ mod tests {
                 skipped.push(format!("{name}: PDFium cannot render it"));
                 continue;
             };
+            let hidden = hide_comment_annotations(&bytes, password)
+                .unwrap_or_else(|error| panic!("{name}: comments not verified: {error}"));
+            if hidden.page_count != original_page_count(&renderer, &bytes, password) {
+                page_count_differs.push(name.clone());
+            }
             let Ok(doc) = load(pdf, password) else {
                 skipped.push(format!("{name}: lopdf cannot load it"));
                 continue;
@@ -453,16 +579,30 @@ mod tests {
             checked += 1;
         }
         eprintln!("checked {checked} fixtures; skipped {skipped:#?}");
+        // PDFium counts a ninth page in this file that lopdf does not find
+        // (and PDFium cannot load), so its render leaves out annotations.
+        assert_eq!(page_count_differs, ["2013-app2.pdf"]);
         assert!(
             checked >= 40,
             "checked only {checked}; skipped {skipped:#?}"
         );
     }
 
+    fn original_page_count(
+        renderer: &crate::vision::PdfiumRenderer,
+        bytes: &[u8],
+        password: Option<&str>,
+    ) -> usize {
+        renderer.page_count_for_tests(bytes, password)
+    }
+
     #[test]
     fn update_trailer_keeps_only_document_entries() {
         let original = document(all_kinds(), false, true);
-        let copy = hide_comment_annotations(&original, None).unwrap().unwrap();
+        let copy = hide_comment_annotations(&original, None)
+            .unwrap()
+            .bytes
+            .unwrap();
         let tail = String::from_utf8_lossy(&copy[original.len()..]).into_owned();
         assert!(tail.contains("/Root"), "{tail}");
         assert!(tail.contains("/Prev"), "{tail}");

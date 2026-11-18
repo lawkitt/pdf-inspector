@@ -14,10 +14,14 @@ carry distinctive words:
                                            other renderers do)
     Highlight  over "SCANNED PAGE", comment "Highlight comment heron"
     Stamp      "APPROVED"                  drawn by its appearance stream
+    Ink        a blue zigzag               drawn by its appearance stream
+    Widget     text field "buyer", value "Buyer signature otter", in the
+               AcroForm, drawn by its appearance stream
 
 The comment-type annotations (notes, FreeText, popups, text markup) are left
 out of the OCR render, so "zebra", "walrus" and "heron" must not reach the
-recognized Markdown, while the stamp's "APPROVED" and the body text must.
+recognized Markdown, while the stamp's "APPROVED", the field's value and
+the body text must; the ink stays drawn.
 
 Only the standard library is needed (the PDF writer is shared with
 ``make_font_metadata_fixtures.py``):
@@ -227,7 +231,40 @@ def build_pdf() -> bytes:
         f" /T (Reviewer) /M (D:20261118093000Z) /AP << /N {stamp_ap} 0 R >>"
     )
 
-    annots = " ".join(f"{ref} 0 R" for ref in (free_text_annot, note, popup, highlight, stamp))
+    ink_box = (340, 280, 560, 340)
+    zigzag = [(10, 10), (60, 50), (110, 10), (160, 50), (210, 10)]
+    ink_ap = writer.stream(
+        "/Type /XObject /Subtype /Form /BBox [0 0 220 60]",
+        (
+            "0 0 1 RG 4 w 1 J 1 j "
+            + " ".join(f"{x} {y} {'m' if i == 0 else 'l'}" for i, (x, y) in enumerate(zigzag))
+            + " S"
+        ).encode("latin-1"),
+    )
+    ink_list = " ".join(f"{ink_box[0] + x} {ink_box[1] + y}" for x, y in zigzag)
+    ink = add(
+        f"/Subtype /Ink /Rect {rect(ink_box)} /P {page} 0 R /C [0 0 1] /BS << /W 4 >>"
+        f" /InkList [[{ink_list}]] /T (Reviewer) /AP << /N {ink_ap} 0 R >>"
+    )
+
+    field_box = (72, 180, 372, 216)
+    field_ap = writer.stream(
+        "/Type /XObject /Subtype /Form /BBox [0 0 300 36]"
+        f" /Resources << /Font << /Helv {helvetica} 0 R >> >>",
+        (
+            "/Tx BMC q 1 1 298 34 re W n BT /Helv 18 Tf 0 g 4 11 Td"
+            f" ({pdf_escape('Buyer signature otter')}) Tj ET Q EMC"
+        ).encode("latin-1"),
+    )
+    field = add(
+        f"/Subtype /Widget /Rect {rect(field_box)} /P {page} 0 R /F 4 /FT /Tx /T (buyer)"
+        " /V (Buyer signature otter) /DA (/Helv 18 Tf 0 g)"
+        f" /MK << /BC [0 0 0] >> /AP << /N {field_ap} 0 R >>"
+    )
+
+    annots = " ".join(
+        f"{ref} 0 R" for ref in (free_text_annot, note, popup, highlight, stamp, ink, field)
+    )
     writer.set(
         page,
         (
@@ -237,7 +274,13 @@ def build_pdf() -> bytes:
         ).encode("latin-1"),
     )
     writer.set(pages, f"<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>".encode("latin-1"))
-    writer.set(catalog, f"<< /Type /Catalog /Pages {pages} 0 R >>".encode("latin-1"))
+    writer.set(
+        catalog,
+        (
+            f"<< /Type /Catalog /Pages {pages} 0 R /AcroForm << /Fields [{field} 0 R]"
+            f" /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv {helvetica} 0 R >> >> >> >>"
+        ).encode("latin-1"),
+    )
     return writer.build(catalog, info)
 
 

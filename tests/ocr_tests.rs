@@ -214,7 +214,7 @@ fn ocr_leaves_comment_annotations_out_of_a_scanned_page() {
 
     assert_eq!(result.pages_routed_to_ocr, vec![1]);
     let markdown = result.markdown.to_lowercase();
-    for kept in ["approved", "delivery"] {
+    for kept in ["approved", "delivery", "otter"] {
         assert!(
             markdown.contains(kept),
             "{kept:?} missing from {markdown:?}"

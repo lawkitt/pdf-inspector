@@ -187,7 +187,7 @@ impl PdfiumRenderer {
             return Err(RenderError::InvalidPageNumber);
         }
 
-        let document = self.load_render_document(pdf_bytes, password, options)?;
+        let (document, annotations) = self.load_render_document(pdf_bytes, password, options)?;
         let page_count = document.page_count();
 
         if let Some(&page) = pages.iter().find(|&&page| page as usize > page_count) {
@@ -198,7 +198,7 @@ impl PdfiumRenderer {
             document.enable_form_rendering()?;
         }
 
-        let config = options.pdfium_config();
+        let config = options.pdfium_config().annotations(annotations);
         let mut rendered_pages = Vec::with_capacity(pages.len());
         for &page_number in pages {
             let page = document.page(page_number as usize - 1)?;
@@ -216,32 +216,58 @@ impl PdfiumRenderer {
         Ok(rendered_pages)
     }
 
-    /// The document to render: unless `options` asks for comment-type
-    /// annotations, a copy with them hidden (see `comment_annotations`).
-    /// When no copy can be made, or PDFium cannot open it, the original is
-    /// rendered and the reason logged.
+    /// Pages PDFium finds in `pdf_bytes`.
+    #[cfg(test)]
+    pub(crate) fn page_count_for_tests(&self, pdf_bytes: &[u8], password: Option<&str>) -> usize {
+        self.pdfium
+            .load_document(pdf_bytes.to_vec(), password)
+            .unwrap()
+            .page_count()
+    }
+
+    /// The document to render, and whether to draw its annotations.
+    ///
+    /// Unless `options` asks for comment-type annotations, this is a copy
+    /// with them hidden (see `comment_annotations`), or the original when it
+    /// has none. When that cannot be verified (lopdf cannot read every
+    /// annotation or page, the copy cannot be written, or PDFium cannot open
+    /// it or sees other pages), the original is rendered with no annotations
+    /// at all, so a comment's text never reaches OCR, and the reason logged.
     fn load_render_document(
         &self,
         pdf_bytes: &[u8],
         password: Option<&str>,
         options: &RenderOptions,
-    ) -> Result<firecrawl_pdfium::PdfDocument, RenderError> {
-        if options.annotations && !options.comment_annotations {
-            match hide_comment_annotations(pdf_bytes, password) {
-                Ok(Some(copy)) => match self.pdfium.load_document(copy, password) {
-                    Ok(document) => return Ok(document),
-                    Err(error) => log::warn!(
-                        "rendering with comment annotations drawn: PDFium could not open \
-                         the copy that hides them: {error}"
-                    ),
-                },
-                Ok(None) => {}
-                Err(error) => log::warn!(
-                    "rendering with comment annotations drawn: could not hide them: {error}"
-                ),
-            }
+    ) -> Result<(firecrawl_pdfium::PdfDocument, bool), RenderError> {
+        if !options.annotations || options.comment_annotations {
+            let document = self.pdfium.load_document(pdf_bytes.to_vec(), password)?;
+            return Ok((document, options.annotations));
         }
-        Ok(self.pdfium.load_document(pdf_bytes.to_vec(), password)?)
+        let reason = match hide_comment_annotations(pdf_bytes, password) {
+            Ok(hidden) => {
+                let document = match hidden.bytes {
+                    Some(copy) => self.pdfium.load_document(copy, password),
+                    None => self.pdfium.load_document(pdf_bytes.to_vec(), password),
+                };
+                match document {
+                    Ok(document) if document.page_count() == hidden.page_count => {
+                        return Ok((document, true));
+                    }
+                    Ok(document) => format!(
+                        "PDFium sees {} pages where lopdf read {}",
+                        document.page_count(),
+                        hidden.page_count
+                    ),
+                    Err(error) => format!("PDFium could not open the copy: {error}"),
+                }
+            }
+            Err(error) => error.to_string(),
+        };
+        log::warn!(
+            "rendering without annotations: comment annotations could not be hidden ({reason})"
+        );
+        let document = self.pdfium.load_document(pdf_bytes.to_vec(), password)?;
+        Ok((document, false))
     }
 }
 

@@ -49,7 +49,9 @@ pub struct RenderOptions {
     /// `Underline`, `StrikeOut`, `Squiggly`). Off by default, so OCR does not
     /// read a comment's text into the page: their text is reported as
     /// annotations beside the Markdown instead. Stamps, ink, file
-    /// attachments, links, shapes and form widgets are drawn either way.
+    /// attachments, links, shapes and form widgets are drawn either way. If
+    /// the comments cannot all be found, the renderer draws no annotations
+    /// rather than risk drawing them (form fields are still drawn).
     pub comment_annotations: bool,
     /// Include visible static AcroForm field appearances.
     pub form_fields: bool,

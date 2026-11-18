@@ -206,9 +206,14 @@ well, and `.annotations(false)` leaves out every annotation. To hide them,
 the renderer opens a copy of the file followed by one incremental update
 that sets the Hidden flag on each comment annotation; the update is
 encrypted like the file. A file without comment annotations is rendered as
-given. If the copy cannot be made (lopdf cannot read the file, or an
-encrypted file's `/Encrypt` dictionary is not an indirect object), the
-original is rendered with its comments and a warning is logged.
+given. When the comments cannot all be found or hidden, the original is
+rendered with no annotations at all (form fields are still drawn) and a
+warning is logged, so a comment's text never reaches OCR: lopdf cannot read
+the file, a page or `/Annots` entry it lists (an object stream past the
+8 MiB decompression bound, a damaged object), more than 100,000 `/Annots`
+entries, PDFium counting other pages than lopdf, an encrypted file whose
+`/Encrypt` dictionary is not an indirect object, or PDFium failing to open
+the copy.
 
 Browser WASM remains on the default text-only path and does not expose native
 PDFium rendering.

@@ -207,6 +207,8 @@ mod scanned_comments {
     pub const HIGHLIGHT: (f64, f64, f64, f64) = (72.0, 680.0, 276.0, 698.0);
     pub const STAMP: (f64, f64, f64, f64) = (72.0, 280.0, 292.0, 340.0);
     pub const BODY: (f64, f64, f64, f64) = (60.0, 620.0, 560.0, 710.0);
+    pub const INK: (f64, f64, f64, f64) = (340.0, 280.0, 560.0, 340.0);
+    pub const FIELD: (f64, f64, f64, f64) = (72.0, 180.0, 372.0, 216.0);
 }
 
 /// Pixels inside the PDF-space `region` of `page` that satisfy `test`.
@@ -247,6 +249,43 @@ fn red(r: u8, g: u8, b: u8) -> bool {
     r > 150 && g < 80 && b < 80
 }
 
+fn blue(r: u8, g: u8, b: u8) -> bool {
+    r < 80 && g < 80 && b > 150
+}
+
+/// The fixture's comments are left out and everything else is drawn.
+fn assert_comments_hidden(page: &pdf_inspector::vision::RenderedPage, name: &str) {
+    use scanned_comments::*;
+    assert_eq!(count_in(page, FREE_TEXT, dark), 0, "{name}: FreeText drawn");
+    assert_eq!(count_in(page, NOTE, dark), 0, "{name}: note drawn");
+    assert_eq!(
+        count_in(page, HIGHLIGHT, yellow),
+        0,
+        "{name}: highlight drawn"
+    );
+    assert!(count_in(page, STAMP, red) > 500, "{name}: stamp missing");
+    assert!(count_in(page, INK, blue) > 300, "{name}: ink missing");
+    assert!(count_in(page, FIELD, dark) > 200, "{name}: field missing");
+    assert!(
+        count_in(page, BODY, dark) > 1000,
+        "{name}: page image missing"
+    );
+}
+
+/// No annotation is drawn but the form field and the page.
+fn assert_no_annotations(page: &pdf_inspector::vision::RenderedPage, name: &str) {
+    use scanned_comments::*;
+    assert_eq!(count_in(page, FREE_TEXT, dark), 0, "{name}: FreeText drawn");
+    assert_eq!(count_in(page, NOTE, dark), 0, "{name}: note drawn");
+    assert_eq!(count_in(page, STAMP, red), 0, "{name}: stamp drawn");
+    assert_eq!(count_in(page, INK, blue), 0, "{name}: ink drawn");
+    assert!(count_in(page, FIELD, dark) > 200, "{name}: field missing");
+    assert!(
+        count_in(page, BODY, dark) > 1000,
+        "{name}: page image missing"
+    );
+}
+
 fn render_first_page(
     renderer: &PdfiumRenderer,
     bytes: &[u8],
@@ -271,11 +310,7 @@ fn comment_annotations_are_left_out_of_the_render_by_default() {
     let bytes = std::fs::read("tests/fixtures/scanned_comments.pdf").unwrap();
 
     let hidden = render_first_page(&renderer, &bytes, None, &RenderOptions::new());
-    assert_eq!(count_in(&hidden, FREE_TEXT, dark), 0, "FreeText drawn");
-    assert_eq!(count_in(&hidden, NOTE, dark), 0, "note drawn");
-    assert_eq!(count_in(&hidden, HIGHLIGHT, yellow), 0, "highlight drawn");
-    assert!(count_in(&hidden, STAMP, red) > 500, "stamp missing");
-    assert!(count_in(&hidden, BODY, dark) > 1000, "page image missing");
+    assert_comments_hidden(&hidden, "default");
 
     let drawn = render_first_page(
         &renderer,
@@ -290,6 +325,8 @@ fn comment_annotations_are_left_out_of_the_render_by_default() {
         "highlight missing"
     );
     assert!(count_in(&drawn, STAMP, red) > 500, "stamp missing");
+    assert!(count_in(&drawn, INK, blue) > 300, "ink missing");
+    assert!(count_in(&drawn, FIELD, dark) > 200, "field missing");
 
     let none = render_first_page(
         &renderer,
@@ -299,9 +336,7 @@ fn comment_annotations_are_left_out_of_the_render_by_default() {
             .annotations(false)
             .comment_annotations(true),
     );
-    assert_eq!(count_in(&none, FREE_TEXT, dark), 0, "FreeText drawn");
-    assert_eq!(count_in(&none, STAMP, red), 0, "stamp drawn");
-    assert!(count_in(&none, BODY, dark) > 1000, "page image missing");
+    assert_no_annotations(&none, "annotations(false)");
 }
 
 /// The fixture rewritten by lopdf: with object streams and a
@@ -402,22 +437,7 @@ fn comment_annotations_are_left_out_of_rewritten_and_encrypted_files() {
 
     for (name, bytes, password) in variants {
         let hidden = render_first_page(&renderer, &bytes, password, &RenderOptions::new());
-        assert_eq!(
-            count_in(&hidden, FREE_TEXT, dark),
-            0,
-            "{name}: FreeText drawn"
-        );
-        assert_eq!(count_in(&hidden, NOTE, dark), 0, "{name}: note drawn");
-        assert_eq!(
-            count_in(&hidden, HIGHLIGHT, yellow),
-            0,
-            "{name}: highlight drawn"
-        );
-        assert!(count_in(&hidden, STAMP, red) > 500, "{name}: stamp missing");
-        assert!(
-            count_in(&hidden, BODY, dark) > 1000,
-            "{name}: page image missing"
-        );
+        assert_comments_hidden(&hidden, name);
 
         let drawn = render_first_page(
             &renderer,
@@ -430,4 +450,60 @@ fn comment_annotations_are_left_out_of_rewritten_and_encrypted_files() {
             "{name}: FreeText missing"
         );
     }
+}
+
+/// When the comments cannot all be found, the page is rendered with no
+/// annotations rather than with them: here the page has more `/Annots`
+/// entries than are examined, and in the second file the FreeText sits in an
+/// object stream that inflates past the bound lopdf reads, so lopdf cannot
+/// load the document at all while PDFium can.
+#[test]
+fn unverifiable_comments_render_without_annotations() {
+    use lopdf::{Document, Object, SaveOptions, StringFormat};
+
+    let Some(renderer) = load_renderer() else {
+        return;
+    };
+    let original = std::fs::read("tests/fixtures/scanned_comments.pdf").unwrap();
+
+    let mut doc = Document::load_mem(&original).unwrap();
+    let page_id = *doc.get_pages().get(&1).unwrap();
+    let page = doc.get_dictionary_mut(page_id).unwrap();
+    let mut annots = vec![Object::Null; 100_000];
+    annots.extend(
+        page.get(b"Annots")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    page.set("Annots", annots);
+    let mut crowded = Vec::new();
+    doc.save_to(&mut crowded).unwrap();
+    let page = render_first_page(&renderer, &crowded, None, &RenderOptions::new());
+    assert_no_annotations(&page, "100,000 /Annots entries");
+
+    let mut doc = Document::load_mem(&original).unwrap();
+    // 9 MiB of zeros compress to almost nothing in the object stream.
+    doc.add_object(Object::String(vec![0; 9 << 20], StringFormat::Hexadecimal));
+    let options = SaveOptions::builder()
+        .use_object_streams(true)
+        .use_xref_streams(true)
+        .max_objects_per_stream(1000)
+        .compression_level(6)
+        .build();
+    let mut packed = Vec::new();
+    doc.save_with_options(&mut packed, options).unwrap();
+    assert!(packed.len() < 2 << 20, "{} bytes", packed.len());
+    let page = render_first_page(&renderer, &packed, None, &RenderOptions::new());
+    assert_no_annotations(&page, "oversized object stream");
+    // PDFium itself reads the packed file in full.
+    let drawn = render_first_page(
+        &renderer,
+        &packed,
+        None,
+        &RenderOptions::new().comment_annotations(true),
+    );
+    assert!(count_in(&drawn, scanned_comments::FREE_TEXT, dark) > 200);
 }
