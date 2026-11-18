@@ -257,7 +257,10 @@ fn decimal_digit_value(c: char) -> Option<u32> {
 /// The row's page-number slot: its whitespace-collapsed text with the
 /// standalone number of up to four digits that opens (`leading`) or closes
 /// it replaced by [`FOLIO`], and that number. A number joined to other
-/// characters ("EDU-401", "502A", "2-123/2026") is part of the text.
+/// characters ("EDU-401", "502A", "2-123/2026") is part of the text, and so
+/// is a closing number labelled as an identifier ("Invoice No. 3", "Дело №
+/// 12", "Приложение 4"): a document number is no page number, even when it
+/// happens to keep step with the pages.
 fn folio_slot(collapsed: &str, leading: bool) -> Option<(String, u32)> {
     let (rest, token) = if leading {
         let (token, rest) = collapsed.split_once(' ')?;
@@ -273,6 +276,9 @@ fn folio_slot(collapsed: &str, leading: bool) -> Option<(String, u32)> {
     for c in token.chars() {
         value = value * 10 + decimal_digit_value(c)?;
     }
+    if !leading && ends_with_identifier_label(rest) {
+        return None;
+    }
     let template = if leading {
         format!("{FOLIO} {rest}")
     } else {
@@ -281,13 +287,95 @@ fn folio_slot(collapsed: &str, leading: bool) -> Option<(String, u32)> {
     Some((template, value))
 }
 
+/// Words that label the number after them as a document's own number, not
+/// a page's: "No.", "№", "#", and the kinds of document and part that carry
+/// one, in English and Russian. Compared lowercase, with closing "." and ":"
+/// removed.
+const IDENTIFIER_LABELS: [&str; 52] = [
+    "no",
+    "nº",
+    "n°",
+    "nr",
+    "num",
+    "number",
+    "#",
+    "№",
+    "id",
+    "ref",
+    "reference",
+    "invoice",
+    "case",
+    "file",
+    "order",
+    "account",
+    "contract",
+    "agreement",
+    "claim",
+    "docket",
+    "act",
+    "lot",
+    "item",
+    "exhibit",
+    "annex",
+    "appendix",
+    "schedule",
+    "attachment",
+    "chapter",
+    "section",
+    "article",
+    "clause",
+    "version",
+    "rev",
+    "счёт",
+    "счет",
+    "дело",
+    "договор",
+    "заказ",
+    "акт",
+    "номер",
+    "протокол",
+    "приказ",
+    "решение",
+    "постановление",
+    "приложение",
+    "глава",
+    "раздел",
+    "статья",
+    "пункт",
+    "лот",
+    "редакция",
+];
+
+/// Whether the text before a closing number ends with an
+/// [identifier label](IDENTIFIER_LABELS) ("Invoice No.", "Дело №", "Case").
+fn ends_with_identifier_label(rest: &str) -> bool {
+    let Some(last) = rest.split(' ').next_back() else {
+        return false;
+    };
+    let word = last.trim_end_matches(['.', ':']).to_lowercase();
+    word.ends_with('№') || word.ends_with('#') || IDENTIFIER_LABELS.contains(&word.as_str())
+}
+
+/// How far a printed page number may trail the page's index in the file:
+/// up to this many pages of unnumbered front matter (a cover, a contents
+/// page) before printed page 1. A printed number ahead of the page index
+/// (numbering carried over from a longer document) is not taken as a page
+/// number, because identifiers that rise one per page (invoice 4171, 4172,
+/// ...) lead it too; such a header stays on every page.
+const MAX_UNNUMBERED_FRONT_PAGES: i64 = 10;
+
 /// Comparison keys for repetition. Two rows repeat only when their text is
 /// the same, letters, numbers, punctuation and case included: "Case 2-123"
 /// and "Case 2-124" are different rows. Whitespace is no part of the key,
-/// since OCR splits and joins words inconsistently ("Confi dential"). The one tolerance is a page number: a
-/// standalone number opening or closing the row that rises with the page
-/// (`value - page` the same on every page that shows the row), so "Annual
-/// Report 5" on page 5 and "Annual Report 6" on page 6 share a key.
+/// since OCR splits and joins words inconsistently ("Confi dential"). The
+/// one tolerance is a plausible page number: a standalone number of up to
+/// four digits opening or closing the row, not labelled as an identifier
+/// (see [`folio_slot`]), that equals the page index or trails it by the same
+/// few pages of front matter on every page that shows the row (see
+/// [`MAX_UNNUMBERED_FRONT_PAGES`]). So "Annual Report 5" on page 5 and
+/// "Annual Report 6" on page 6 share a key, and so do "Report 3" and "Report
+/// 4" on pages 5 and 6 after a cover and a contents page; "Invoice 4171" to
+/// "Invoice 4174" on pages 1 to 4 do not.
 struct ComparisonKeys {
     folio_templates: HashSet<String>,
 }
@@ -310,11 +398,20 @@ impl ComparisonKeys {
         }
         let folio_templates = slots
             .into_iter()
-            .filter(|(_, occurrences)| {
+            .filter(|(template, occurrences)| {
                 let offset = |&(page, value): &(u32, u32)| i64::from(value) - i64::from(page);
                 let first = offset(&occurrences[0]);
                 let pages: HashSet<u32> = occurrences.iter().map(|&(page, _)| page).collect();
-                pages.len() >= 2 && occurrences.iter().all(|o| offset(o) == first)
+                let in_step = pages.len() >= 2 && occurrences.iter().all(|o| offset(o) == first);
+                let plausible = (-MAX_UNNUMBERED_FRONT_PAGES..=0).contains(&first)
+                    && occurrences.iter().all(|&(_, value)| value >= 1);
+                if in_step && !plausible {
+                    log::debug!(
+                        "number in step with the pages but no page number (offset {first}): {}",
+                        template.replace(FOLIO, "#")
+                    );
+                }
+                in_step && plausible
             })
             .map(|(template, _)| template)
             .collect();
@@ -400,7 +497,7 @@ fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String)
 /// Strip lines that repeat on many distinct pages (running headers/footers).
 ///
 /// A line is considered a repeated header/footer if:
-/// 1. Its comparison key appears on `>= max(3, page_count * 30%)` distinct pages
+/// 1. Its comparison key appears on `>= max(3, ceil(page_count * 30%))` distinct pages
 /// 2. It is at least 10 characters long
 /// 3. It doesn't look like a structural element (heading, list item)
 /// 4. It consistently appears in the top or bottom N distinct Y positions
@@ -415,9 +512,9 @@ fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String)
 /// fragments may not independently meet the frequency threshold.
 ///
 /// Rows compare as exact text, numbers included (see [`ComparisonKeys`]):
-/// "Case No. 2-123" does not repeat "Case No. 2-124". A page number opening or
-/// closing the row that rises with the page is the one tolerance, so headers
-/// like "Chapter 3 — Page 5" and "Chapter 3 — Page 6" are the same row. The
+/// "Case No. 2-123" does not repeat "Case No. 2-124". A plausible page number
+/// opening or closing the row is the one tolerance, so headers like "Chapter
+/// 3 — Page 5" and "Chapter 3 — Page 6" are the same row. The
 /// first page that shows a repeated row keeps it.
 pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
     if lines.is_empty() || page_count < 3 {
@@ -588,8 +685,9 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     let (freq, y_positions) = frequencies(&edge_lines);
     let (band_freq, band_y_positions) = frequencies(&edge_bands);
 
-    // Compute threshold
-    let threshold = 3u32.max(page_count * 30 / 100);
+    // At least 3 pages and at least 30% of them, rounded up: on 11 pages,
+    // 3 pages are 27% and too few.
+    let threshold = 3u32.max(page_count.saturating_mul(30).div_ceil(100));
 
     // Check Y-position consistency: headers/footers appear at the same position
     // on every page, table content varies. Require normalized stddev < 5% of
@@ -1802,12 +1900,54 @@ mod tests {
             5,
         );
         assert_eq!(header_pages(&result, "Annual Report of the Board"), [1]);
-        // Printed numbering may start after a cover: the offset holds.
+        let result = strip_repeated_lines(headed_pages(5, |p| format!("Annual Report {p}")), 5);
+        assert_eq!(header_pages(&result, "Annual Report"), [1]);
+        // Printed numbering may start after a cover and a contents page:
+        // page 3 is printed 1, and the offset holds.
         let result = strip_repeated_lines(
-            headed_pages(5, |p| format!("{} Отчёт о работе за год", p + 2)),
-            5,
+            headed_pages(6, |p| match p {
+                1 => "Договор поставки, титульный лист".into(),
+                2 => "Содержание договора поставки".into(),
+                _ => format!("{} Отчёт о работе за год", p - 2),
+            }),
+            6,
         );
-        assert_eq!(header_pages(&result, "Отчёт о работе за год"), [1]);
+        assert_eq!(header_pages(&result, "Отчёт о работе за год"), [3]);
+    }
+
+    #[test]
+    fn identifiers_that_rise_with_the_page_are_no_page_numbers() {
+        // Codex on mdoc#944: a document number one ahead per page keeps step
+        // with the pages but is far ahead of them.
+        let result = strip_repeated_lines(
+            headed_pages(4, |p| format!("Acme Holdings Invoice {}", 4170 + p)),
+            4,
+        );
+        assert_eq!(header_pages(&result, "Acme Holdings Invoice").len(), 4);
+        let result = strip_repeated_lines(
+            headed_pages(4, |p| format!("{} Acme Holdings statement", 4170 + p)),
+            4,
+        );
+        assert_eq!(header_pages(&result, "Acme Holdings statement").len(), 4);
+        // Numbering carried over from a longer document leads the page
+        // index too, and is not taken for a page number either.
+        let result =
+            strip_repeated_lines(headed_pages(5, |p| format!("Annual Report {}", p + 2)), 5);
+        assert_eq!(header_pages(&result, "Annual Report").len(), 5);
+        // A labelled number is an identifier even when it equals the page
+        // index: one invoice, case or annex per page.
+        for label in [
+            "Acme Holdings Invoice No.",
+            "Acme Holdings invoice",
+            "Арбитражный суд, дело №",
+            "Арбитражный суд, Дело",
+            "Счёт на оплату №",
+            "Договор поставки, приложение",
+            "Supply contract, Case #",
+        ] {
+            let result = strip_repeated_lines(headed_pages(4, |p| format!("{label} {p}")), 4);
+            assert_eq!(header_pages(&result, label).len(), 4, "{label} N must stay");
+        }
     }
 
     #[test]
@@ -1821,6 +1961,28 @@ mod tests {
             4,
         );
         assert_eq!(header_pages(&result, "Annual Report of the Board").len(), 4);
+    }
+
+    #[test]
+    fn a_repeat_needs_at_least_30_percent_of_the_pages() {
+        // Codex on mdoc#944: 3 of 11 pages are 27%, below the rule's 30%;
+        // 4 of 11 are 36%.
+        let header = |on: u32| {
+            move |p: u32| {
+                if p <= on {
+                    "Confidential: Acme Holdings".to_string()
+                } else {
+                    format!("Section heading of page {p} differs")
+                }
+            }
+        };
+        let result = strip_repeated_lines(headed_pages(11, header(3)), 11);
+        assert_eq!(header_pages(&result, "Acme Holdings"), [1, 2, 3]);
+        let result = strip_repeated_lines(headed_pages(11, header(4)), 11);
+        assert_eq!(header_pages(&result, "Acme Holdings"), [1]);
+        // 3 of 10 pages are 30%, enough.
+        let result = strip_repeated_lines(headed_pages(10, header(3)), 10);
+        assert_eq!(header_pages(&result, "Acme Holdings"), [1]);
     }
 
     #[test]

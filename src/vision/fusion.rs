@@ -844,6 +844,8 @@ fn repeated_ocr_header_footer_spans(
         page_count,
         // As OCR Markdown conversion does: the calibrated folio bands.
         &HashMap::new(),
+        // The pages that take no part are not in `items`.
+        &HashSet::new(),
     );
     let mut result = RepeatedOcrSpans {
         spans: BTreeMap::new(),

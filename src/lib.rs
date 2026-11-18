@@ -76,7 +76,7 @@ pub use process_mode::ProcessMode;
 pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use text_quality::{
     analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
@@ -895,14 +895,58 @@ fn extract_pages_markdown_mem_impl(
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
+    let lopdf_pages = doc.get_pages();
+    // Each page's OCR signals, computed once: the repetition pass below may
+    // need them for every page, and the page loop needs them for its own.
+    let mut page_signals: HashMap<u32, detector::PageOcrSignals> = HashMap::new();
+    let mut signals_for = |page: u32| -> detector::PageOcrSignals {
+        *page_signals.entry(page).or_insert_with(|| {
+            lopdf_pages
+                .get(&page)
+                .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
+                .unwrap_or_default()
+        })
+    };
     let repeated_header_footer = if strip_repeated_headers_footers {
-        repeated_header_footer_items(
-            &all_items,
-            &page_thresholds,
-            &chart_regions,
-            page_count,
-            &page_bounds,
-        )
+        let find = |unreliable: &HashSet<u32>| {
+            repeated_header_footer_items(
+                &all_items,
+                &page_thresholds,
+                &chart_regions,
+                page_count,
+                &page_bounds,
+                unreliable,
+            )
+        };
+        let found = find(&HashSet::new());
+        if found.items.is_empty() {
+            found
+        } else {
+            // A page whose native text never reaches the Markdown (it needs
+            // OCR, and its text is left out when OCR does not run or
+            // replaced when it does) takes no part: it would keep a row
+            // whose repeats go elsewhere, so no copy would be left, and
+            // count rows its own empty content never showed. Only signals
+            // known before any row is removed decide, and for every page,
+            // so a call for some pages chooses as a call for all would.
+            let text_pages: BTreeSet<u32> = all_items.iter().map(|item| item.page).collect();
+            let unreliable: HashSet<u32> = text_pages
+                .into_iter()
+                .filter(|&page| {
+                    let signals = signals_for(page);
+                    gid_pages.contains(&page)
+                        || text_quality.pages_needing_ocr.contains(&page)
+                        || signals.template_image_needs_ocr
+                        || signals.has_vector_text
+                        || signals.has_invisible_text_layer
+                })
+                .collect();
+            if unreliable.is_empty() {
+                found
+            } else {
+                find(&unreliable)
+            }
+        }
     } else {
         RepeatedHeaderFooter::default()
     };
@@ -927,7 +971,6 @@ fn extract_pages_markdown_mem_impl(
     let mut annotations = extractor::annotations::Collector::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
-    let lopdf_pages = doc.get_pages();
     let field_names_left_out = extractor::form_field_names_by_page(
         &doc,
         &lopdf_pages.iter().map(|(&num, &id)| (id, num)).collect(),
@@ -1007,10 +1050,7 @@ fn extract_pages_markdown_mem_impl(
         // text layer it extracts describes the raster rather than being
         // the page's content. All three signals share one
         // analyze_page_content pass — see page_ocr_signals's doc comment.
-        let signals = lopdf_pages
-            .get(&page_1idx)
-            .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
-            .unwrap_or_default();
+        let signals = signals_for(page_1idx);
         let has_template_image = signals.template_image_needs_ocr;
         let has_vector_text = signals.has_vector_text;
         let has_invisible_text_layer = signals.has_invisible_text_layer;
@@ -1268,13 +1308,15 @@ impl RepeatedHeaderFooter {
 /// place go, on three or more of `page_count` pages. Short documents have no
 /// such evidence and keep everything; the per-page typographic fallback that
 /// whole-document Markdown conversion applies to them would leave out even a
-/// first occurrence, with nothing to count.
+/// first occurrence, with nothing to count. Pages in `excluded` take no
+/// part: they neither keep a row nor lose one.
 pub(crate) fn repeated_header_footer_items(
     items: &[TextItem],
     page_thresholds: &HashMap<u32, f32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     page_count: u32,
     page_bounds: &extractor::PageVerticalBounds,
+    excluded: &HashSet<u32>,
 ) -> RepeatedHeaderFooter {
     if page_count < 3 {
         return RepeatedHeaderFooter::default();
@@ -1285,7 +1327,7 @@ pub(crate) fn repeated_header_footer_items(
             matches!(
                 item.item_type,
                 types::ItemType::Text | types::ItemType::FormField
-            )
+            ) && !excluded.contains(&item.page)
         })
         .cloned()
         .collect();
@@ -1408,8 +1450,14 @@ mod ocr_header_footer_tests {
             thresholds.insert(page, 0.1);
         }
 
-        let repeated =
-            repeated_header_footer_items(&items, &thresholds, &HashMap::new(), 3, &HashMap::new());
+        let repeated = repeated_header_footer_items(
+            &items,
+            &thresholds,
+            &HashMap::new(),
+            3,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         assert_eq!(
             repeated.rows_by_page,
             BTreeMap::from([
@@ -1651,6 +1699,7 @@ mod repeated_table_header_tests {
             &HashMap::new(),
             3,
             &HashMap::new(),
+            &HashSet::new(),
         )
         .items;
         let removed_text: Vec<(u32, &str)> = items
@@ -1705,6 +1754,7 @@ mod repeated_table_header_tests {
             &HashMap::new(),
             3,
             &HashMap::new(),
+            &HashSet::new(),
         )
         .items;
         let removed_text: Vec<(u32, &str)> = items

@@ -12184,7 +12184,13 @@ fn invisible_text_stays_out_and_is_counted_in_stretches() {
 /// a case-exhibit footer whose number changes per page, a folio, and twelve
 /// body lines unique to the page.
 fn make_court_file_pdf(header: impl Fn(u32) -> String) -> Vec<u8> {
-    use lopdf::{dictionary, Document};
+    make_court_file_pdf_with_scans(header, &[])
+}
+
+/// [`make_court_file_pdf`], except that each page in `scanned` is a
+/// full-page image with only the header drawn over it as native text.
+fn make_court_file_pdf_with_scans(header: impl Fn(u32) -> String, scanned: &[u32]) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
 
     let mut doc = Document::with_version("1.5");
     let font_id = doc.add_object(dictionary! {
@@ -12192,10 +12198,46 @@ fn make_court_file_pdf(header: impl Fn(u32) -> String) -> Vec<u8> {
         "Subtype" => "Type1",
         "BaseFont" => "Helvetica",
     });
+    // A scan's size: large enough in pixels to be the page's template image.
+    let mut image = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 1000,
+            "Height" => 1000,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8,
+        },
+        vec![250; 1_000_000],
+    );
+    let _ = image.compress();
+    let image_id = doc.add_object(image);
     let pages_id = doc.new_object_id();
     let exhibits = [0, 4171, 4382, 4593, 4604];
     let mut kids = Vec::new();
     for page in 1..=4u32 {
+        if scanned.contains(&page) {
+            let content = format!(
+                "q 612 0 0 792 0 0 cm /Im0 Do Q\n\
+                 BT /F1 10 Tf 72 750 Td ({}) Tj ET\n",
+                header(page)
+            );
+            let kid = add_page(
+                &mut doc,
+                pages_id,
+                &content,
+                LETTER_BOX,
+                None,
+                &[("F1", font_id)],
+            );
+            if let Ok(Object::Dictionary(page)) = doc.get_object_mut(kid) {
+                if let Ok(Object::Dictionary(resources)) = page.get_mut(b"Resources") {
+                    resources.set("XObject", dictionary! { "Im0" => image_id });
+                }
+            }
+            kids.push(kid);
+            continue;
+        }
         let mut content = format!(
             "BT /F1 10 Tf 72 750 Td ({}) Tj ET\n\
              BT /F1 10 Tf 72 40 Td (Exhibit register entry {}) Tj ET\n\
@@ -12219,6 +12261,43 @@ fn make_court_file_pdf(header: impl Fn(u32) -> String) -> Vec<u8> {
         ));
     }
     finish_document(doc, pages_id, kids)
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn test_repeated_header_stays_on_the_first_page_whose_text_is_kept() {
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    // Codex on mdoc#944: page 1 is a scan with the header as native text.
+    // It needs OCR, so with OCR off its text is left out; the header must
+    // stay on page 2, the first page whose text the Markdown keeps, and
+    // only the repeats on pages 3 and 4 count.
+    let pdf =
+        make_court_file_pdf_with_scans(|_| "Case No. 2-123/2026 District Court".to_string(), &[1]);
+    let result = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native pass");
+    assert_eq!(result.pages_recommended_for_ocr, [1]);
+    assert!(result.pages[0].markdown.trim().is_empty());
+    let with_header: Vec<u32> = result
+        .pages
+        .iter()
+        .filter(|page| page.markdown.contains("Case No. 2-123/2026"))
+        .map(|page| page.page_number)
+        .collect();
+    assert_eq!(with_header, [2]);
+    let lines = |page, lines| pdf_inspector::PageRepeatedLines { page, lines };
+    assert_eq!(
+        result.repeated_lines_by_page,
+        vec![lines(3, 1), lines(4, 1)]
+    );
+    // A call for one page chooses the same page to keep the header.
+    let selected =
+        process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new().page_numbers([2])).expect("page 2");
+    assert!(selected.markdown.contains("Case No. 2-123/2026"));
+    assert!(selected.repeated_lines_by_page.is_empty());
+    let selected =
+        process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new().page_numbers([3])).expect("page 3");
+    assert!(!selected.markdown.contains("Case No. 2-123/2026"));
+    assert_eq!(selected.repeated_lines_by_page, vec![lines(3, 1)]);
 }
 
 #[cfg(feature = "ocr")]
