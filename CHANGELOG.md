@@ -196,7 +196,8 @@ version and date. Earlier releases are described in their
   garbled or no text. Lines that run vertically put the page on its side,
   and a page that reads below 0.9 mean confidence is tried half turned on a
   sample of its longest lines; the page is then turned upright and
-  detected again. Every span of a turned page reports the turn in
+  detected again, and a half turn replaces the first reading only when the
+  whole page reads better. Every span of a turned page reports the turn in
   `orientation_degrees` (clockwise). A checked page that still reads below
   0.8, turned or not, keeps a warning. No orientation model is loaded.
   ([#622](https://github.com/firecrawl/pdf-inspector/issues/622), reported

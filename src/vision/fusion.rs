@@ -815,7 +815,10 @@ fn repeated_ocr_header_footer_spans(
     let mut spans_by_item: HashMap<crate::HeaderFooterItemKey, Vec<(u32, usize)>> = HashMap::new();
     let mut items = Vec::new();
     for page in full_pages {
-        let (page_items, _) = indexed_ocr_text_items(page, &HashSet::new(), false);
+        // A page read turned upright is compared upright, as its Markdown
+        // is laid out; other pages in their rendered geometry, as before.
+        let turned = page_upright_turns(page) != 0;
+        let (page_items, _) = indexed_ocr_text_items(page, &HashSet::new(), turned);
         let plain: Vec<TextItem> = page_items.iter().map(|(_, item)| item.clone()).collect();
         let base_size =
             crate::markdown::analysis::calculate_font_stats_from_items(&plain).most_common_size;
@@ -3012,6 +3015,37 @@ mod tests {
             .iter()
             .map(|page| page.provenance.repeated_lines)
             .collect()
+    }
+
+    #[test]
+    fn a_header_on_a_page_read_turned_upright_still_repeats() {
+        // Page 3 was scanned upside down and read turned upright: its spans
+        // sit at the opposite edge of the rendered page and report the turn.
+        let pages = (1..=4)
+            .map(|page| {
+                let mut scanned = scanned_page(page, Some("Дело № 2-123/2026"), 9.0);
+                if page == 3 {
+                    for span in &mut scanned.ocr.spans {
+                        span.polygon = ImageQuad::new(
+                            span.polygon
+                                .points
+                                .map(|point| ImagePoint::new(300.0 - point.x, 400.0 - point.y)),
+                        );
+                        span.orientation_degrees = Some(180.0);
+                    }
+                }
+                scanned
+            })
+            .collect();
+        let fused = fuse_scans(pages, &strip_options());
+        assert_eq!(pages_showing(&fused, "Дело № 2-123/2026"), [1]);
+        assert_eq!(repeated_lines(&fused), [0, 1, 1, 1]);
+        for line in 0..16u32 {
+            assert_eq!(
+                pages_showing(&fused, &format!("Страница 3, строка {line}:")),
+                [3]
+            );
+        }
     }
 
     #[test]
