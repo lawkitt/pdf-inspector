@@ -771,20 +771,31 @@ struct RepeatedOcrSpans {
     rows: BTreeMap<u32, Vec<String>>,
 }
 
-/// Rows the page's final content left out as repeats: those removed from
-/// the source it kept. Fused content holds both sources, so a row removed
-/// from one counts only when the other did not bring it back (whitespace
-/// and Markdown escapes aside), and a row removed from both counts once.
+/// How many rows the page's final content left out as repeats; see
+/// [`rows_left_out`].
 fn repeated_lines_left_out(
     source: PageContentSource,
     markdown: &str,
     native_rows: &[String],
     ocr_rows: &[String],
 ) -> u32 {
-    let count = |rows: usize| u32::try_from(rows).unwrap_or(u32::MAX);
+    u32::try_from(rows_left_out(source, markdown, native_rows, ocr_rows).len()).unwrap_or(u32::MAX)
+}
+
+/// Rows the page's final content left out as repeats (their text): those
+/// removed from the source it kept. Fused content holds both sources, so a
+/// row removed from one counts only when the other did not bring it back
+/// (whitespace and Markdown escapes aside), and a row removed from both
+/// counts once.
+fn rows_left_out(
+    source: PageContentSource,
+    markdown: &str,
+    native_rows: &[String],
+    ocr_rows: &[String],
+) -> Vec<String> {
     match source {
-        PageContentSource::Native => count(native_rows.len()),
-        PageContentSource::Ocr => count(ocr_rows.len()),
+        PageContentSource::Native => native_rows.to_vec(),
+        PageContentSource::Ocr => ocr_rows.to_vec(),
         PageContentSource::Fused => {
             let squeeze = |text: &str| -> String {
                 text.chars()
@@ -793,18 +804,18 @@ fn repeated_lines_left_out(
             };
             let shown = squeeze(markdown);
             let native: Vec<String> = native_rows.iter().map(|row| squeeze(row)).collect();
-            let mut rows = native.clone();
+            let mut rows: Vec<(&String, String)> =
+                native_rows.iter().zip(native.iter().cloned()).collect();
             rows.extend(
                 ocr_rows
                     .iter()
-                    .map(|row| squeeze(row))
-                    .filter(|row| !native.contains(row)),
+                    .map(|row| (row, squeeze(row)))
+                    .filter(|(_, squeezed)| !native.contains(squeezed)),
             );
-            count(
-                rows.iter()
-                    .filter(|row| !row.is_empty() && !shown.contains(row.as_str()))
-                    .count(),
-            )
+            rows.into_iter()
+                .filter(|(_, squeezed)| !squeezed.is_empty() && !shown.contains(squeezed.as_str()))
+                .map(|(row, _)| row.clone())
+                .collect()
         }
     }
 }
@@ -1063,7 +1074,9 @@ mod exact_f64s {
         values: &[f64; 6],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(values.iter().map(|value| format!("{value:?}")))
+        // A fixed-size array, as `deserialize` reads it back: a tuple to
+        // serde, which binary formats write without a length.
+        serde::Serialize::serialize(&values.map(|value| format!("{value:?}")), serializer)
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
@@ -1117,8 +1130,10 @@ pub struct PageWithoutRepeats {
     /// [`OcrPdfResult::markdown`](crate::vision::OcrPdfResult::markdown)
     /// has: it replaces the Markdown the page's own run gave.
     pub markdown: String,
-    /// The recognized rows left out as repeats of a row kept on an earlier
-    /// page (their text), top to bottom.
+    /// The rows the page's content left out as repeats of a row kept on an
+    /// earlier page (their text): the OCR's, top to bottom, then, on a page
+    /// that keeps native text beside its OCR, those neither source shows.
+    /// As many as `repeated_lines`.
     pub removed_rows: Vec<String>,
     /// Running header or footer rows the page's content left out, as
     /// [`PageProvenance::repeated_lines`] counts them; it replaces the
@@ -1222,6 +1237,11 @@ pub(crate) fn strip_repeats_in_evidence(
                 format: page.format,
             });
         }
+        if !(1..=page.document_page_count).contains(&page.page_number) {
+            return Err(OcrFusionError::InvalidRepeatEvidence {
+                page: page.page_number,
+            });
+        }
     }
     for pair in sorted.windows(2) {
         if pair[0].page_number == pair[1].page_number {
@@ -1268,13 +1288,13 @@ pub(crate) fn strip_repeats_in_evidence(
                 });
             let (markdown, source) =
                 ocr_page_content(native_markdown, evidence.native.is_none(), ocr_markdown);
-            let rows = repeated.rows.get(&number).cloned().unwrap_or_default();
-            let repeated_lines = repeated_lines_left_out(source, &markdown, native_rows, &rows);
+            let ocr_rows = repeated.rows.get(&number).map_or(&[][..], Vec::as_slice);
+            let removed_rows = rows_left_out(source, &markdown, native_rows, ocr_rows);
             PageWithoutRepeats {
                 page_number: number,
                 markdown,
-                removed_rows: rows,
-                repeated_lines,
+                repeated_lines: u32::try_from(removed_rows.len()).unwrap_or(u32::MAX),
+                removed_rows,
             }
         })
         .collect())
@@ -2139,8 +2159,9 @@ pub enum OcrFusionError {
         /// The evidence's format.
         format: u32,
     },
-    /// Repeat evidence has unusable page geometry, or names a different
-    /// document page count than the other pages' evidence.
+    /// Repeat evidence has unusable page geometry, a page number outside
+    /// its document, or a different document page count than the other
+    /// pages' evidence.
     #[error("repeat evidence for page {page} is inconsistent")]
     InvalidRepeatEvidence {
         /// 1-indexed page number.
@@ -3805,6 +3826,10 @@ mod tests {
                 )
             );
             assert_eq!(page.repeated_lines, whole_page.provenance.repeated_lines);
+            assert_eq!(page.removed_rows.len() as u32, page.repeated_lines);
+            for row in &page.removed_rows {
+                assert!(!page.markdown.contains(row.as_str()), "{row} is shown");
+            }
         }
         assert_eq!(
             across.repeated_lines_by_page,
@@ -3886,9 +3911,10 @@ mod tests {
 
     #[test]
     fn page_runs_match_one_run_with_native_text_turned_pages_and_candidates() {
-        // Page 1 may keep a native candidate (no part in the pass); page 2
-        // keeps clean native text beside its OCR, whose header native
-        // extraction already left out; page 4 was read turned upright.
+        // Page 1 may keep a native candidate (no part in the pass); pages 2
+        // and 3 keep clean native text beside their OCR (page 2's header
+        // native extraction already left out); page 4 was read turned
+        // upright.
         let header = "Дело № 2-123/2026";
         let pages = || {
             (1..=5)
@@ -3909,6 +3935,13 @@ mod tests {
         };
         let mut natives = scanned_natives(5);
         natives[1] = native(1, "Native text of page two, set in its own words.\n", false);
+        // Page 3's native text keeps the header its OCR loses: it is shown,
+        // so neither counted nor reported.
+        natives[2] = native(
+            2,
+            "Дело № 2-123/2026\n\nNative text of page three, in its own words.\n",
+            false,
+        );
         let candidates = BTreeMap::from([(
             1,
             native_candidate(
@@ -3919,7 +3952,7 @@ mod tests {
         let whole = assert_page_runs_match_one_run(pages, &natives, &candidates, &native_repeated);
         // Page 2 holds the first occurrence among the pages compared.
         assert_eq!(pages_showing(&whole, "Confidential: Acme")[1..], [2]);
-        assert_eq!(repeated_lines(&whole)[2..], [2, 2, 2]);
+        assert_eq!(repeated_lines(&whole)[2..], [1, 2, 2]);
     }
 
     #[test]
@@ -3982,6 +4015,11 @@ mod tests {
         assert_eq!(
             strip_repeats_across_pages(&[one.clone(), other_document], &options),
             Err(OcrFusionError::InvalidRepeatEvidence { page: 2 })
+        );
+        let beyond = OcrRepeatEvidence::from_page(&page(4), 3, None);
+        assert_eq!(
+            strip_repeats_across_pages(&[one.clone(), beyond], &options),
+            Err(OcrFusionError::InvalidRepeatEvidence { page: 4 })
         );
         let mut older = OcrRepeatEvidence::from_page(&page(2), 3, None);
         older.format = 0;
