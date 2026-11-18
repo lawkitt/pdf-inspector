@@ -612,9 +612,8 @@ fn struct_role_heading_level(role: &StructRole) -> Option<usize> {
 ///
 /// When consecutive pages each have exactly one table with the same number of columns
 /// AND both pages are table-only (no non-table text), treat them as a single table.
-/// Their rows are appended to the first page's table (a repeated header row is
-/// dropped, and a row split by the page break is joined back), then the later
-/// pages' tables are removed.
+/// Their rows are appended to the first page's table (only a repeated header row
+/// is dropped), then the later pages' tables are removed.
 pub(super) fn merge_continuation_tables(
     page_tables: &mut std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
     table_only_pages: &HashSet<u32>,
@@ -690,9 +689,9 @@ pub(super) fn merge_continuation_tables(
             // when it repeats the first table's header row: otherwise it is
             // the first row of the page, which is data (upstream #588: a row
             // split by the page break continued at the top of the next page,
-            // and the merge dropped it as that page's header). A first row
-            // whose first cell is empty is the rest of the row the previous
-            // page ended with and joins it cell by cell.
+            // and the merge dropped it as that page's header). It stays a row
+            // of its own: an empty first cell can as well be a label spanning
+            // rows, so joining it to the row above could fuse two records.
             let mut rows: Vec<String> = page_tables[&first_page][0]
                 .markdown
                 .lines()
@@ -704,13 +703,6 @@ pub(super) fn merge_continuation_tables(
                     for (line_idx, line) in tables[0].markdown.lines().enumerate() {
                         match line_idx {
                             0 if line == header => {}
-                            0 => match rows.last().and_then(|last| join_split_row(last, line)) {
-                                Some(joined) => {
-                                    rows.pop();
-                                    rows.push(joined);
-                                }
-                                None => rows.push(line.to_string()),
-                            },
                             1 => {}
                             _ => rows.push(line.to_string()),
                         }
@@ -736,30 +728,6 @@ pub(super) fn merge_continuation_tables(
             i += 1;
         }
     }
-}
-
-/// `last`, a table row, with the rest of it from `rest`, the first row of
-/// the same table on the next page whose first cell is empty: the two
-/// joined cell by cell. `None` when `rest` is not such a row.
-fn join_split_row(last: &str, rest: &str) -> Option<String> {
-    let cells = |row: &str| -> Option<Vec<String>> {
-        Some(
-            row.strip_prefix('|')?
-                .strip_suffix('|')?
-                .split('|')
-                .map(|cell| cell.trim().to_string())
-                .collect(),
-        )
-    };
-    let (mut above, below) = (cells(last)?, cells(rest)?);
-    if above.len() != below.len()
-        || !below.first().is_some_and(String::is_empty)
-        || below.iter().all(String::is_empty)
-    {
-        return None;
-    }
-    crate::tables::join_wrapped_cells(&mut above, below);
-    Some(format!("|{}|", above.join("|")))
 }
 
 /// Count the number of columns in a markdown table by counting `|` in the separator row.

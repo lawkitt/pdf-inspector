@@ -517,20 +517,28 @@ fn a_row_split_by_a_page_break_stays_whole_on_each_page() {
 
 /// Upstream #588 where it was reported: whole-document conversion merges a
 /// table continued on a table-only page, and dropped that page's first row
-/// as a repeated header, losing the rest of the split row. The row is now
-/// joined back together.
+/// as a repeated header, losing the rest of the split row. That row now
+/// stays, as a row of its own (an empty first cell can as well be a label
+/// spanning rows, so it is not joined to the row above).
 #[test]
-fn merging_a_continued_table_keeps_and_joins_the_split_row() {
+fn merging_a_continued_table_keeps_the_split_rows_rest() {
     let result = pdf_inspector::process_pdf_mem(&make_pdf(&split_row_pages(true, false)))
         .expect("handmade PDF converts");
     let markdown = result.markdown.unwrap_or_default();
     for part in SPLIT_ROW_TEXT {
         assert_eq!(markdown.matches(part).count(), 1, "{part:?}\n{markdown}");
     }
-    assert!(
-        markdown.contains(
-            "|4.19|The supplier remedies every reported defect at its own cost and replaces any goods that cannot be repaired, and refunds the price of any goods it cannot replace.|Within 30 days after the report|"
-        ),
+    let rows = table_rows(&markdown);
+    let split = rows
+        .iter()
+        .position(|row| row.starts_with("|4.19|"))
+        .unwrap_or_else(|| panic!("row 4.19 missing:\n{markdown}"));
+    assert_eq!(
+        &rows[split..split + 2],
+        [
+            "|4.19|The supplier remedies every reported defect at its own cost and replaces any goods that|Within 30 days|",
+            "||cannot be repaired, and refunds the price of any goods it cannot replace.|after the report|",
+        ],
         "{markdown}"
     );
     assert!(markdown.contains("|4.21|The buyer pays invoice number 21 in full.|14 days|"));
