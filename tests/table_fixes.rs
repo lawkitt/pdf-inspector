@@ -266,6 +266,26 @@ fn a_wrapped_last_row_stays_in_its_cell() {
     }
 }
 
+/// A source note one line under the wrapped last row, aligned with its
+/// cell, is no wrap of that cell: the cell's text closed with a full stop.
+#[test]
+fn a_note_under_a_wrapped_last_row_stays_out_of_the_table() {
+    let mut page = wrapped_last_row_page(false);
+    page += &text("F1", 11.0, 233.4, 265.2, "Source: audited inventory");
+    let markdown = page_markdown(&make_pdf(&[page])).remove(0);
+    let rows = table_rows(&markdown);
+    assert_eq!(
+        rows.last().copied(),
+        Some("|[19] Three|[20] The text after the table comes next.|[21] Across both columns|"),
+        "{markdown}"
+    );
+    let note = markdown
+        .lines()
+        .find(|line| line.contains("Source: audited inventory"))
+        .unwrap_or_else(|| panic!("note missing:\n{markdown}"));
+    assert!(!note.starts_with('|'), "{markdown}");
+}
+
 /// The service table of upstream #315 at the reported geometry (9.5 pt
 /// type, baselines 720 / 703.5 / 692.25 / 675.75): the first body row wraps
 /// in four of its five cells at an 11.25 pt line pitch, rows are 16.5 pt
