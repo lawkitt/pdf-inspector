@@ -31,6 +31,10 @@ library from the NuGet package (a zip file). Microsoft's GitHub releases
 | macOS Apple Silicon | `firecrawl-pdfium-mac-arm64.tgz` | `runtimes/osx-arm64/native/libonnxruntime.dylib` |
 | Windows x64 | `firecrawl-pdfium-win-x64.tgz` | `runtimes/win-x64/native/onnxruntime.dll` |
 
+On Linux, the 1.32.0 libraries need glibc 2.28 or later and libstdc++ with
+`GLIBCXX_3.4.22` or later (1.27.0 did not); on an older system the library
+fails to load when OCR first starts.
+
 The PDFium release publishes `SHA256SUMS`, build provenance, license files,
 and an SPDX document for every platform archive. CI pins the NuGet package's
 and the Linux x64 library's SHA-256 (`.github/workflows/ci.yml`).
