@@ -642,5 +642,13 @@ fn a_continued_tables_header_row_stays_on_every_page() {
             "ruled: {ruled}\n{}",
             result.markdown
         );
+        // The import note counts the running header on pages 2 and 3, and
+        // never the table header rows that stay.
+        let counted: Vec<(u32, u32)> = result
+            .repeated_lines_by_page
+            .iter()
+            .map(|repeated| (repeated.page, repeated.lines))
+            .collect();
+        assert_eq!(counted, [(2, 1), (3, 1)], "ruled: {ruled}");
     }
 }
