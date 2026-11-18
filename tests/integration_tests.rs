@@ -12421,6 +12421,78 @@ fn test_a_running_head_folio_in_the_top_margin_still_goes() {
 
 #[cfg(feature = "ocr")]
 #[test]
+fn test_a_header_sentence_in_a_sparse_pages_body_stays_and_is_not_counted() {
+    use lopdf::{dictionary, Document};
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    // Codex on mdoc#957: "Please sign and return this form" heads pages
+    // 1-3 and is a body line on sparse page 4. Page 4 keeps it, and only
+    // pages 2 and 3 count a repeat. With the sentence at the header
+    // position instead, page 4 loses it and counts it.
+    let header = "Please sign and return this form";
+    let pdf = |page_4_y: u32| {
+        let mut doc = Document::with_version("1.5");
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let pages_id = doc.new_object_id();
+        let mut kids = Vec::new();
+        for page in 1..=4u32 {
+            let content = if page == 4 {
+                format!(
+                    "BT /F1 10 Tf 72 {page_4_y} Td ({header}) Tj ET\n\
+                     BT /F1 10 Tf 72 380 Td (Thank you for your order) Tj ET\n"
+                )
+            } else {
+                let mut content = format!("BT /F1 10 Tf 72 750 Td ({header}) Tj ET\n");
+                for line in 0..12u32 {
+                    content.push_str(&format!(
+                        "BT /F1 10 Tf 72 {} Td (Paragraph {line} of sheet {page}: the parties agree.) Tj ET\n",
+                        680 - 30 * line
+                    ));
+                }
+                content
+            };
+            kids.push(add_page(
+                &mut doc,
+                pages_id,
+                &content,
+                LETTER_BOX,
+                None,
+                &[("F1", font_id)],
+            ));
+        }
+        finish_document(doc, pages_id, kids)
+    };
+    let lines = |page, lines| pdf_inspector::PageRepeatedLines { page, lines };
+    let showing = |result: &pdf_inspector::vision::OcrPdfResult| -> Vec<u32> {
+        result
+            .pages
+            .iter()
+            .filter(|page| page.markdown.contains(header))
+            .map(|page| page.page_number)
+            .collect()
+    };
+
+    let body = process_pdf_with_ocr_mem(&pdf(400), OcrPdfOptions::new()).expect("native pass");
+    assert_eq!(showing(&body), [1, 4]);
+    assert_eq!(body.repeated_lines_by_page, vec![lines(2, 1), lines(3, 1)]);
+
+    let at_header = process_pdf_with_ocr_mem(&pdf(750), OcrPdfOptions::new()).expect("native");
+    assert_eq!(showing(&at_header), [1]);
+    assert!(at_header.pages[3]
+        .markdown
+        .contains("Thank you for your order"));
+    assert_eq!(
+        at_header.repeated_lines_by_page,
+        vec![lines(2, 1), lines(3, 1), lines(4, 1)]
+    );
+}
+
+#[cfg(feature = "ocr")]
+#[test]
 fn test_repeated_header_keeps_its_first_page_and_is_counted() {
     use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
 

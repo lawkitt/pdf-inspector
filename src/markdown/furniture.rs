@@ -642,6 +642,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     // Check Y-position consistency: headers/footers appear at the same position
     // on every page, table content varies. Require normalized stddev < 5% of
     // average page span.
+    const POSITION_TOLERANCE: f32 = 0.05;
     let has_consistent_y = |text: &str, positions: &HashMap<String, Vec<f32>>| -> bool {
         let pos = match positions.get(text) {
             Some(p) if p.len() >= 2 => p,
@@ -651,7 +652,16 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         let mean = pos.iter().sum::<f32>() / n;
         let variance = pos.iter().map(|y| (y - mean).powi(2)).sum::<f32>() / n;
         let stddev = variance.sqrt();
-        stddev / avg_span < 0.05
+        stddev / avg_span < POSITION_TOLERANCE
+    };
+    // Whether `y` is where the full pages show the repeated row `key`: within
+    // the same share of the page span of its mean position. A sparse page
+    // has no edge rows to judge by, so this is its only position check.
+    let at_learned_position = |key: &str, y: f32| -> bool {
+        y_positions.get(key).is_some_and(|positions| {
+            let mean = positions.iter().sum::<f32>() / positions.len() as f32;
+            (y - mean).abs() / avg_span < POSITION_TOLERANCE
+        })
     };
 
     // Identify candidates from individual frequency map
@@ -694,7 +704,8 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     let mut first_page_individual: HashMap<String, u32> = HashMap::new();
     for (idx, line) in lines.iter().enumerate() {
         // A one- or two-row page adds no candidates, but a header already
-        // confirmed on full pages is still furniture there.
+        // confirmed on full pages is still furniture there, where the full
+        // pages show it; the same sentence elsewhere on it is body text.
         let sparse_page = page_rows.get(&line.page).is_some_and(|r| r.len() <= 2);
         if !sparse_page && !is_y_at_edge(line.y, line.page, &page_rows, EDGE_LINE_COUNT) {
             continue;
@@ -708,6 +719,9 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
             continue;
         }
         let (key, _) = keys.key(&text, line.page);
+        if sparse_page && !at_learned_position(&key, line.y) {
+            continue;
+        }
         if candidates.contains(&key) {
             let first = first_page_individual.entry(key).or_insert(line.page);
             if line.page > *first {
@@ -1775,6 +1789,41 @@ mod tests {
                 .any(|l| l.page == 6 && l.text().contains("page 6 row 0")),
             "the near-empty page body must stay"
         );
+    }
+
+    #[test]
+    fn a_repeated_sentence_in_a_sparse_pages_body_stays() {
+        // Codex on mdoc#957: the header of pages 1-3 is a body line on a
+        // sparse page 4, away from the header position. It is the page's
+        // own text and stays.
+        let header = "Please sign and return this form";
+        let mut lines = headed_pages(3, |_| header.into());
+        lines.push(make_line(header, 10.0, 4, 400.0, None));
+        lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+        let result = strip_repeated_lines(lines, 4);
+        assert_eq!(header_pages(&result, header), [1, 4]);
+        // Where the full pages show it, it is the header and goes.
+        let mut lines = headed_pages(3, |_| header.into());
+        lines.push(make_line(header, 10.0, 4, 750.0, None));
+        lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+        let result = strip_repeated_lines(lines, 4);
+        assert_eq!(header_pages(&result, header), [1]);
+        assert!(result
+            .iter()
+            .any(|l| l.text() == "Thank you for your order"));
+        // A sparse first page with the sentence in its body keeps it, and
+        // the first full page keeps the header.
+        let mut lines = vec![
+            make_line(header, 10.0, 1, 400.0, None),
+            make_line("Cover note for the order", 10.0, 1, 380.0, None),
+        ];
+        for line in headed_pages(4, |_| header.into()) {
+            if line.page > 1 {
+                lines.push(line);
+            }
+        }
+        let result = strip_repeated_lines(lines, 4);
+        assert_eq!(header_pages(&result, header), [1, 2]);
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header(page)`.

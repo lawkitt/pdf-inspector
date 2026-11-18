@@ -3873,6 +3873,59 @@ mod tests {
         assert_eq!(repeated_lines(&whole), [0, 2, 2, 2]);
     }
 
+    /// A scanned page holding only `rows`, each (text, top) in rendered
+    /// pixels: too few rows to have a margin of its own.
+    fn sparse_scanned_page(page: u32, rows: &[(&str, f32)]) -> RoutedOcrPage {
+        let mut scanned = scanned_page(page, None, 9.0);
+        scanned.ocr.spans = rows
+            .iter()
+            .map(|&(text, top)| positioned_span(text, 30.0, top, 200.0, top + 9.0))
+            .collect();
+        scanned
+    }
+
+    #[test]
+    fn page_runs_keep_a_repeated_sentence_in_a_sparse_pages_body() {
+        // Codex on mdoc#957: pages 1-3 are headed by the sentence; sparse
+        // page 4 has it as a body line, away from the header position. It
+        // stays, in one run and across page runs, and nothing on page 4
+        // counts.
+        let header = "Please sign and return this form";
+        let pages = |header_top_on_page_4: f32| {
+            move || {
+                let mut pages: Vec<RoutedOcrPage> = (1..=3)
+                    .map(|page| scanned_page(page, Some(header), 9.0))
+                    .collect();
+                pages.push(sparse_scanned_page(
+                    4,
+                    &[
+                        (header, header_top_on_page_4),
+                        ("Thank you for your order", 220.0),
+                    ],
+                ));
+                pages
+            }
+        };
+        let whole = assert_page_runs_match_one_run(
+            pages(200.0),
+            &scanned_natives(4),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, header), [1, 4]);
+        assert_eq!(repeated_lines(&whole), [0, 1, 1, 0]);
+        // At the header position, it is the header and goes there too.
+        let whole = assert_page_runs_match_one_run(
+            pages(12.0),
+            &scanned_natives(4),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, header), [1]);
+        assert_eq!(pages_showing(&whole, "Thank you for your order"), [4]);
+        assert_eq!(repeated_lines(&whole), [0, 1, 1, 1]);
+    }
+
     #[test]
     fn page_runs_keep_a_header_whose_case_number_changes() {
         let whole = assert_page_runs_match_one_run(
