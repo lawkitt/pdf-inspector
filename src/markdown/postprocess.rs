@@ -655,6 +655,10 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     static PLAIN_WORD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(&format!("{WORD}{{3,}}")).unwrap());
     static HYPHENATED_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})-({WORD}{{2,}})")).unwrap());
+    // "co - op" written with spaces still says the document knows "co-op":
+    // evidence only; the spaced text itself stays as written (mdoc#952).
+    static SPACED_COMPOUND_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(&format!("({WORD}{{2,}}) - ({WORD}{{2,}})")).unwrap());
 
     // The document is its own dictionary: whole words and hyphenated
     // compounds as they appear away from line breaks. Two exclusions keep the
@@ -684,7 +688,10 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     for m in PLAIN_WORD_RE.find_iter(&scrubbed) {
         words.insert(m.as_str().to_lowercase());
     }
-    for caps in HYPHENATED_RE.captures_iter(&scrubbed) {
+    for caps in HYPHENATED_RE
+        .captures_iter(&scrubbed)
+        .chain(SPACED_COMPOUND_RE.captures_iter(&scrubbed))
+    {
         hyphenated.insert(format!(
             "{}-{}",
             caps[1].to_lowercase(),
@@ -1378,7 +1385,20 @@ mod tests {
         );
         assert_eq!(fix_hyphenation("Limoeiro - Norte"), "Limoeiro - Norte");
         assert_eq!(fix_hyphenation("São - Paulo"), "São - Paulo");
-        assert_eq!(fix_hyphenation("сторона - покупатель"), "сторона - покупатель");
+        assert_eq!(
+            fix_hyphenation("сторона - покупатель"),
+            "сторона - покупатель"
+        );
+    }
+
+    #[test]
+    fn test_fix_hyphenation_spaced_compound_is_still_evidence() {
+        // mdoc#952 review: "co - op" stays spaced, and still keeps the
+        // hyphen of a "co- op" broken at a line end.
+        assert_eq!(
+            fix_hyphenation("The co - op met. After the co- op vote."),
+            "The co - op met. After the co-op vote."
+        );
     }
 
     #[test]
