@@ -53,7 +53,6 @@ pub use detect_struct::detect_tables_from_struct_tree;
 #[cfg(feature = "ocr")]
 pub(crate) use format::is_complete_data_table;
 pub use format::table_to_markdown;
-pub(crate) use grid::join_wrapped_cells;
 pub use structured::{cells_to_markdown, StructuredCell};
 
 use crate::types::TextItem;
