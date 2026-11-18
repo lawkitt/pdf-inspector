@@ -1369,7 +1369,26 @@ fn table_item_keys_on_pages(
         let base_size =
             markdown::analysis::calculate_font_stats_from_items(&page_items).most_common_size;
         for table in tables::detect_tables(&page_items, base_size, false) {
-            let held: HashSet<usize> = table.item_indices.iter().copied().collect();
+            let mut held: HashSet<usize> = table.item_indices.iter().copied().collect();
+            // A top row set well apart from the rest (more than one and a
+            // half row pitches) is no header the table carries on: a running
+            // header split over the table's columns can join it.
+            let mut gaps: Vec<f32> = table
+                .rows
+                .windows(2)
+                .map(|pair| (pair[0] - pair[1]).abs())
+                .collect();
+            if let [first, second, ..] = table.rows[..] {
+                gaps.sort_by(f32::total_cmp);
+                let pitch = gaps[gaps.len() / 2];
+                if (first - second).abs() > 1.5 * pitch {
+                    held.retain(|&index| {
+                        page_items
+                            .get(index)
+                            .is_none_or(|item| (item.y - first).abs() >= (item.y - second).abs())
+                    });
+                }
+            }
             keys.extend(
                 held.iter()
                     .filter_map(|&index| page_items.get(index))
@@ -1388,9 +1407,9 @@ fn table_item_keys_on_pages(
 /// The column-header line right above a detected table that the detector
 /// left out: header text set larger than the body is no candidate for its
 /// font passes, so the table starts at its first data row. The lowest line
-/// above that row, within two row pitches, counts as the header when its
-/// runs all sit over the table and over at least two of its columns, and
-/// over at least half of them.
+/// above that row, within one and a half row pitches, counts as the header
+/// when its runs all sit over the table and over at least two of its
+/// columns, and over at least half of them.
 fn header_line_above<'a>(
     items: &'a [TextItem],
     held: &HashSet<usize>,
@@ -1417,7 +1436,7 @@ fn header_line_above<'a>(
         .iter()
         .enumerate()
         .filter(|(index, item)| {
-            !held.contains(index) && item.y > top + 1.0 && item.y <= top + 2.0 * pitch
+            !held.contains(index) && item.y > top + 1.0 && item.y <= top + 1.5 * pitch
         })
         .map(|(_, item)| item)
         .collect();
@@ -1497,6 +1516,61 @@ mod repeated_table_header_tests {
         for header_size in [10.0, 12.0] {
             continued_table_keeps_its_header(header_size);
         }
+    }
+
+    /// A running header split across the page (title over the first
+    /// column, revision over the third) a little more than a row pitch above
+    /// the table is still a running header.
+    #[test]
+    fn a_split_running_header_over_a_table_still_goes() {
+        let columns = [72.0, 220.0, 350.0, 460.0];
+        let mut items = Vec::new();
+        for page in 1..=3 {
+            items.push(item(page, "Northwind Report", 72.0, 732.0, 90.0));
+            items.push(item(page, "Revision 3", 350.0, 732.0, 60.0));
+            for (x, text) in
+                columns
+                    .iter()
+                    .zip(["Item code", "Description", "Quantity", "Unit price"])
+            {
+                items.push(item(page, text, *x, 700.0, 55.0));
+            }
+            for line in 1..=12 {
+                let row = page * 100 + line;
+                let y = 700.0 - line as f32 * 20.0;
+                let cells = [
+                    format!("NW-{row}"),
+                    format!("Widget model {row}"),
+                    format!("{}", 10 + line),
+                    format!("{}.25", 3 + line),
+                ];
+                for (x, text) in columns.iter().zip(&cells) {
+                    items.push(item(page, text, *x, y, 50.0));
+                }
+            }
+        }
+        let removed = repeated_header_footer_items(
+            &items,
+            &HashMap::new(),
+            &HashMap::new(),
+            3,
+            &HashMap::new(),
+        )
+        .items;
+        let removed_text: Vec<(u32, &str)> = items
+            .iter()
+            .filter(|item| removed.contains(&HeaderFooterItemKey::from(*item)))
+            .map(|item| (item.page, item.text.as_str()))
+            .collect();
+        assert_eq!(
+            removed_text,
+            [
+                (2, "Northwind Report"),
+                (2, "Revision 3"),
+                (3, "Northwind Report"),
+                (3, "Revision 3"),
+            ]
+        );
     }
 
     fn continued_table_keeps_its_header(header_size: f32) {
