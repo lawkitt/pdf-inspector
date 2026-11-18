@@ -11,6 +11,8 @@ use pdf_inspector::vision::{
 };
 #[cfg(feature = "render-pdfium")]
 use pdf_inspector::vision::{PdfiumRenderer, RenderError, RenderOptions};
+#[cfg(feature = "ocr")]
+use pdf_inspector::AnnotationKind;
 
 const MODEL_DIRECTORY_ENV: &str = "PDF_INSPECTOR_OCR_TEST_MODELS";
 const IMAGE_ENV: &str = "PDF_INSPECTOR_OCR_TEST_IMAGE";
@@ -185,6 +187,73 @@ fn auto_rejects_garbled_native_recovery_and_continues_to_ocr() {
         error,
         OcrPipelineError::ModelAcquire(_) | OcrPipelineError::ModelStore(_)
     ));
+}
+
+/// A scanned page under a FreeText box, a note and a highlight with a
+/// comment, and a stamp: OCR reads the page and the stamp, the comments stay
+/// out of the Markdown and are reported as annotations, and asking for
+/// comment annotations to be drawn brings their text back.
+#[cfg(all(feature = "ocr", feature = "render-pdfium"))]
+#[test]
+fn ocr_leaves_comment_annotations_out_of_a_scanned_page() {
+    let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
+        eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
+        return;
+    };
+    let Some(_renderer) = load_renderer() else {
+        return;
+    };
+
+    let bytes = std::fs::read("tests/fixtures/scanned_comments.pdf").unwrap();
+    let ocr = OcrOptions::new()
+        .mode(OcrMode::Force)
+        .minimum_confidence(0.3)
+        .model_directory(model_directory)
+        .model_downloads(ModelDownloadPolicy::Offline);
+    let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().ocr(ocr.clone())).unwrap();
+
+    assert_eq!(result.pages_routed_to_ocr, vec![1]);
+    let markdown = result.markdown.to_lowercase();
+    for kept in ["approved", "delivery", "otter"] {
+        assert!(
+            markdown.contains(kept),
+            "{kept:?} missing from {markdown:?}"
+        );
+    }
+    for comment in ["zebra", "walrus", "heron", "reviewer", "sticky"] {
+        assert!(
+            !markdown.contains(comment),
+            "{comment:?} reached the Markdown: {markdown:?}"
+        );
+    }
+    let reported: Vec<_> = result
+        .annotations
+        .iter()
+        .map(|annotation| (annotation.kind, annotation.text.as_str()))
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            (AnnotationKind::FreeText, "Reviewer remark zebra"),
+            (AnnotationKind::Text, "Sticky note walrus"),
+            (AnnotationKind::Highlight, "Highlight comment heron"),
+        ]
+    );
+
+    let drawn = process_pdf_with_ocr_mem(
+        &bytes,
+        OcrPdfOptions::new()
+            .ocr(ocr)
+            .render(RenderOptions::new().comment_annotations(true)),
+    )
+    .unwrap();
+    let markdown = drawn.markdown.to_lowercase();
+    for comment in ["zebra", "walrus"] {
+        assert!(
+            markdown.contains(comment),
+            "{comment:?} missing from {markdown:?}"
+        );
+    }
 }
 
 fn recognize(

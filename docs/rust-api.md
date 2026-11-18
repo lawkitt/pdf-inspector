@@ -196,6 +196,25 @@ for page in pages {
 }
 ```
 
+By default the render leaves out comment-type annotations: sticky notes
+(`/Text`), FreeText, popups and text markup (`/Highlight`, `/Underline`,
+`/StrikeOut`, `/Squiggly`), whose text is reported as
+[annotations](#annotations) instead of being read by OCR. Every other
+annotation (stamps, ink, file attachments, links, shapes, form widgets) is
+drawn. `RenderOptions::new().comment_annotations(true)` draws comments as
+well, and `.annotations(false)` leaves out every annotation. To hide them,
+the renderer opens a copy of the file followed by one incremental update
+that sets the Hidden flag on each comment annotation; the update is
+encrypted like the file. A file without comment annotations is rendered as
+given. When the comments cannot all be found or hidden, the original is
+rendered with no annotations at all (form fields are still drawn) and a
+warning is logged, so a comment's text never reaches OCR: lopdf cannot read
+the file, a page or `/Annots` entry it lists (an object stream past the
+8 MiB decompression bound, a damaged object), more than 100,000 `/Annots`
+entries, PDFium counting other pages than lopdf, an encrypted file whose
+`/Encrypt` dictionary is not an indirect object, or PDFium failing to open
+the copy.
+
 Browser WASM remains on the default text-only path and does not expose native
 PDFium rendering.
 
@@ -555,6 +574,13 @@ and never fails the extraction. The work is bounded: at most `MAX_ANNOTATIONS`
 cut at `MAX_ANNOTATION_TEXT_CHARS` (32,768) characters, author and date at
 `MAX_ANNOTATION_AUTHOR_CHARS` (512) and `MAX_ANNOTATION_DATE_CHARS` (64), at
 most `MAX_ANNOTATION_QUADS` (1,000) quads, and at most 1 MiB of `/RC`.
+
+A page routed to OCR is read from its rendering, so the renderer leaves
+these annotations out: by default `RenderOptions` hides notes (`/Text`),
+FreeText, popups and text markup, and their text reaches the caller only
+here. Stamps, ink, file attachments, links, shapes and form widgets are
+drawn and read like the rest of the page. See
+[Optional native page rendering](#optional-native-page-rendering).
 
 ## Processing modes
 

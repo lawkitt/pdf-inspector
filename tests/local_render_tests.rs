@@ -198,3 +198,312 @@ fn rejects_zero_and_out_of_range_page_numbers() {
         Err(RenderError::PageOutOfBounds { .. })
     ));
 }
+
+/// Regions of `tests/fixtures/scanned_comments.pdf` (see
+/// `scripts/make_ocr_comment_fixture.py`), as PDF `(x0, y0, x1, y1)`.
+mod scanned_comments {
+    pub const FREE_TEXT: (f64, f64, f64, f64) = (72.0, 520.0, 372.0, 556.0);
+    pub const NOTE: (f64, f64, f64, f64) = (392.0, 470.0, 592.0, 500.0);
+    pub const HIGHLIGHT: (f64, f64, f64, f64) = (72.0, 680.0, 276.0, 698.0);
+    pub const STAMP: (f64, f64, f64, f64) = (72.0, 280.0, 292.0, 340.0);
+    pub const BODY: (f64, f64, f64, f64) = (60.0, 620.0, 560.0, 710.0);
+    pub const INK: (f64, f64, f64, f64) = (340.0, 280.0, 560.0, 340.0);
+    pub const FIELD: (f64, f64, f64, f64) = (72.0, 180.0, 372.0, 216.0);
+}
+
+/// Pixels inside the PDF-space `region` of `page` that satisfy `test`.
+fn count_in(
+    page: &pdf_inspector::vision::RenderedPage,
+    region: (f64, f64, f64, f64),
+    test: impl Fn(u8, u8, u8) -> bool,
+) -> usize {
+    let transform = page.transform();
+    let (ax, ay) = transform.page_to_pixel(region.0, region.1);
+    let (bx, by) = transform.page_to_pixel(region.2, region.3);
+    let clamp_x = |v: f64| (v.max(0.0) as u32).min(page.width());
+    let clamp_y = |v: f64| (v.max(0.0) as u32).min(page.height());
+    let (x0, x1) = (clamp_x(ax.min(bx)), clamp_x(ax.max(bx)));
+    let (y0, y1) = (clamp_y(ay.min(by)), clamp_y(ay.max(by)));
+    let pixels = page.pixels();
+    let mut count = 0;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = y as usize * page.stride() + x as usize * 3;
+            if test(pixels[i], pixels[i + 1], pixels[i + 2]) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn dark(r: u8, g: u8, b: u8) -> bool {
+    r < 128 && g < 128 && b < 128
+}
+
+fn yellow(r: u8, g: u8, b: u8) -> bool {
+    r > 200 && g > 200 && b < 100
+}
+
+fn red(r: u8, g: u8, b: u8) -> bool {
+    r > 150 && g < 80 && b < 80
+}
+
+fn blue(r: u8, g: u8, b: u8) -> bool {
+    r < 80 && g < 80 && b > 150
+}
+
+/// The fixture's comments are left out and everything else is drawn.
+fn assert_comments_hidden(page: &pdf_inspector::vision::RenderedPage, name: &str) {
+    use scanned_comments::*;
+    assert_eq!(count_in(page, FREE_TEXT, dark), 0, "{name}: FreeText drawn");
+    assert_eq!(count_in(page, NOTE, dark), 0, "{name}: note drawn");
+    assert_eq!(
+        count_in(page, HIGHLIGHT, yellow),
+        0,
+        "{name}: highlight drawn"
+    );
+    assert!(count_in(page, STAMP, red) > 500, "{name}: stamp missing");
+    assert!(count_in(page, INK, blue) > 300, "{name}: ink missing");
+    assert!(count_in(page, FIELD, dark) > 200, "{name}: field missing");
+    assert!(
+        count_in(page, BODY, dark) > 1000,
+        "{name}: page image missing"
+    );
+}
+
+/// No annotation is drawn but the form field and the page.
+fn assert_no_annotations(page: &pdf_inspector::vision::RenderedPage, name: &str) {
+    use scanned_comments::*;
+    assert_eq!(count_in(page, FREE_TEXT, dark), 0, "{name}: FreeText drawn");
+    assert_eq!(count_in(page, NOTE, dark), 0, "{name}: note drawn");
+    assert_eq!(count_in(page, STAMP, red), 0, "{name}: stamp drawn");
+    assert_eq!(count_in(page, INK, blue), 0, "{name}: ink drawn");
+    assert!(count_in(page, FIELD, dark) > 200, "{name}: field missing");
+    assert!(
+        count_in(page, BODY, dark) > 1000,
+        "{name}: page image missing"
+    );
+}
+
+fn render_first_page(
+    renderer: &PdfiumRenderer,
+    bytes: &[u8],
+    password: Option<&str>,
+    options: &RenderOptions,
+) -> pdf_inspector::vision::RenderedPage {
+    renderer
+        .render_pages(bytes, &[1], password, &options.clone().dpi(72.0))
+        .unwrap()
+        .remove(0)
+}
+
+/// By default the render leaves out notes, FreeText and text markup while it
+/// keeps the stamp and the page itself; `comment_annotations(true)` draws
+/// them, and `annotations(false)` still leaves out every annotation.
+#[test]
+fn comment_annotations_are_left_out_of_the_render_by_default() {
+    use scanned_comments::*;
+    let Some(renderer) = load_renderer() else {
+        return;
+    };
+    let bytes = std::fs::read("tests/fixtures/scanned_comments.pdf").unwrap();
+
+    let hidden = render_first_page(&renderer, &bytes, None, &RenderOptions::new());
+    assert_comments_hidden(&hidden, "default");
+
+    let drawn = render_first_page(
+        &renderer,
+        &bytes,
+        None,
+        &RenderOptions::new().comment_annotations(true),
+    );
+    assert!(count_in(&drawn, FREE_TEXT, dark) > 200, "FreeText missing");
+    assert!(count_in(&drawn, NOTE, dark) > 200, "note missing");
+    assert!(
+        count_in(&drawn, HIGHLIGHT, yellow) > 500,
+        "highlight missing"
+    );
+    assert!(count_in(&drawn, STAMP, red) > 500, "stamp missing");
+    assert!(count_in(&drawn, INK, blue) > 300, "ink missing");
+    assert!(count_in(&drawn, FIELD, dark) > 200, "field missing");
+
+    let none = render_first_page(
+        &renderer,
+        &bytes,
+        None,
+        &RenderOptions::new()
+            .annotations(false)
+            .comment_annotations(true),
+    );
+    assert_no_annotations(&none, "annotations(false)");
+}
+
+/// The fixture rewritten by lopdf: with object streams and a
+/// cross-reference stream, and encrypted with RC4 (owner password only),
+/// AES-128 (a user password) and AES-256. Comments stay hidden and the page
+/// and stamp still render, so the hidden copy's update decrypts and chains
+/// to the original in each.
+#[test]
+fn comment_annotations_are_left_out_of_rewritten_and_encrypted_files() {
+    use lopdf::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
+    use lopdf::{Document, EncryptionState, EncryptionVersion, Permissions, SaveOptions};
+    use scanned_comments::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    let Some(renderer) = load_renderer() else {
+        return;
+    };
+    let original = std::fs::read("tests/fixtures/scanned_comments.pdf").unwrap();
+    let fixture = || Document::load_mem(&original).unwrap();
+    let save = |mut doc: Document, options: SaveOptions| {
+        let mut bytes = Vec::new();
+        doc.save_with_options(&mut bytes, options).unwrap();
+        bytes
+    };
+    let encrypted = |version: fn(&Document) -> EncryptionState| {
+        let mut doc = fixture();
+        // Encryption keys derive from the file identifier.
+        let id = lopdf::Object::String(
+            b"scanned-comments".to_vec(),
+            lopdf::StringFormat::Hexadecimal,
+        );
+        doc.trailer.set("ID", vec![id.clone(), id]);
+        let state = version(&doc);
+        doc.encrypt(&state).unwrap();
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    };
+    let streams = SaveOptions::builder()
+        .use_object_streams(true)
+        .use_xref_streams(true)
+        .build();
+
+    let variants: Vec<(&str, Vec<u8>, Option<&str>)> = vec![
+        ("object streams", save(fixture(), streams), None),
+        (
+            "RC4, owner password only",
+            encrypted(|doc| {
+                EncryptionState::try_from(EncryptionVersion::V2 {
+                    document: doc,
+                    owner_password: "owner",
+                    user_password: "",
+                    key_length: 128,
+                    permissions: Permissions::all(),
+                })
+                .unwrap()
+            }),
+            None,
+        ),
+        (
+            "AES-128, user password",
+            encrypted(|doc| {
+                let filter: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+                EncryptionState::try_from(EncryptionVersion::V4 {
+                    document: doc,
+                    encrypt_metadata: true,
+                    crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), filter)]),
+                    stream_filter: b"StdCF".to_vec(),
+                    string_filter: b"StdCF".to_vec(),
+                    owner_password: "owner",
+                    user_password: "reader",
+                    permissions: Permissions::all(),
+                })
+                .unwrap()
+            }),
+            Some("reader"),
+        ),
+        (
+            "AES-256, owner password only",
+            encrypted(|_| {
+                let filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+                EncryptionState::try_from(EncryptionVersion::V5 {
+                    encrypt_metadata: true,
+                    crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), filter)]),
+                    file_encryption_key: &[7; 32],
+                    stream_filter: b"StdCF".to_vec(),
+                    string_filter: b"StdCF".to_vec(),
+                    owner_password: "owner",
+                    user_password: "",
+                    permissions: Permissions::all(),
+                })
+                .unwrap()
+            }),
+            None,
+        ),
+    ];
+
+    for (name, bytes, password) in variants {
+        let hidden = render_first_page(&renderer, &bytes, password, &RenderOptions::new());
+        assert_comments_hidden(&hidden, name);
+
+        let drawn = render_first_page(
+            &renderer,
+            &bytes,
+            password,
+            &RenderOptions::new().comment_annotations(true),
+        );
+        assert!(
+            count_in(&drawn, FREE_TEXT, dark) > 200,
+            "{name}: FreeText missing"
+        );
+    }
+}
+
+/// When the comments cannot all be found, the page is rendered with no
+/// annotations rather than with them: here the page has more `/Annots`
+/// entries than are examined, and in the second file the FreeText sits in an
+/// object stream that inflates past the bound lopdf reads, so lopdf cannot
+/// load the document at all while PDFium can.
+#[test]
+fn unverifiable_comments_render_without_annotations() {
+    use lopdf::{Document, Object, SaveOptions, StringFormat};
+
+    let Some(renderer) = load_renderer() else {
+        return;
+    };
+    let original = std::fs::read("tests/fixtures/scanned_comments.pdf").unwrap();
+
+    let mut doc = Document::load_mem(&original).unwrap();
+    let page_id = *doc.get_pages().get(&1).unwrap();
+    let page = doc.get_dictionary_mut(page_id).unwrap();
+    let mut annots = vec![Object::Null; 100_000];
+    annots.extend(
+        page.get(b"Annots")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    page.set("Annots", annots);
+    let mut crowded = Vec::new();
+    doc.save_to(&mut crowded).unwrap();
+    let page = render_first_page(&renderer, &crowded, None, &RenderOptions::new());
+    assert_no_annotations(&page, "100,000 /Annots entries");
+
+    let mut doc = Document::load_mem(&original).unwrap();
+    // 9 MiB of zeros compress to almost nothing in the object stream.
+    doc.add_object(Object::String(vec![0; 9 << 20], StringFormat::Hexadecimal));
+    let options = SaveOptions::builder()
+        .use_object_streams(true)
+        .use_xref_streams(true)
+        .max_objects_per_stream(1000)
+        .compression_level(6)
+        .build();
+    let mut packed = Vec::new();
+    doc.save_with_options(&mut packed, options).unwrap();
+    assert!(packed.len() < 2 << 20, "{} bytes", packed.len());
+    let page = render_first_page(&renderer, &packed, None, &RenderOptions::new());
+    assert_no_annotations(&page, "oversized object stream");
+    // PDFium itself reads the packed file in full.
+    let drawn = render_first_page(
+        &renderer,
+        &packed,
+        None,
+        &RenderOptions::new().comment_annotations(true),
+    );
+    assert!(count_in(&drawn, scanned_comments::FREE_TEXT, dark) > 200);
+}
