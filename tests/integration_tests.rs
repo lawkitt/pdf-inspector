@@ -12188,7 +12188,8 @@ fn make_court_file_pdf(header: impl Fn(u32) -> String) -> Vec<u8> {
 }
 
 /// [`make_court_file_pdf`], except that each page in `scanned` is a
-/// full-page image with only the header drawn over it as native text.
+/// full-page image with three native lines over it: the header, a registry
+/// note and a stamp.
 fn make_court_file_pdf_with_scans(header: impl Fn(u32) -> String, scanned: &[u32]) -> Vec<u8> {
     use lopdf::{dictionary, Document, Object, Stream};
 
@@ -12219,7 +12220,9 @@ fn make_court_file_pdf_with_scans(header: impl Fn(u32) -> String, scanned: &[u32
         if scanned.contains(&page) {
             let content = format!(
                 "q 612 0 0 792 0 0 cm /Im0 Do Q\n\
-                 BT /F1 10 Tf 72 750 Td ({}) Tj ET\n",
+                 BT /F1 10 Tf 72 750 Td ({}) Tj ET\n\
+                 BT /F1 10 Tf 72 400 Td (Received by the registry) Tj ET\n\
+                 BT /F1 10 Tf 72 40 Td (Scanned copy stamp) Tj ET\n",
                 header(page)
             );
             let kid = add_page(
@@ -12298,6 +12301,38 @@ fn test_repeated_header_stays_on_the_first_page_whose_text_is_kept() {
         process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new().page_numbers([3])).expect("page 3");
     assert!(!selected.markdown.contains("Case No. 2-123/2026"));
     assert_eq!(selected.repeated_lines_by_page, vec![lines(3, 1)]);
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn test_a_page_that_needs_ocr_does_not_spoil_a_page_number() {
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    // Codex on #18: the scan on page 1 carries a number out of step with
+    // the clean pages' page numbers. It takes no part, so pages 2-4 still
+    // prove their page-numbered header.
+    let pdf = make_court_file_pdf_with_scans(
+        |page| {
+            format!(
+                "Annual Report of the Board {}",
+                if page == 1 { 245 } else { page }
+            )
+        },
+        &[1],
+    );
+    let result = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native pass");
+    let with_header: Vec<u32> = result
+        .pages
+        .iter()
+        .filter(|page| page.markdown.contains("Annual Report of the Board"))
+        .map(|page| page.page_number)
+        .collect();
+    assert_eq!(with_header, [2]);
+    let lines = |page, lines| pdf_inspector::PageRepeatedLines { page, lines };
+    assert_eq!(
+        result.repeated_lines_by_page,
+        vec![lines(3, 1), lines(4, 1)]
+    );
 }
 
 #[cfg(feature = "ocr")]

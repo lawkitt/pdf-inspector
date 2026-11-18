@@ -1450,6 +1450,10 @@ mod tests {
             "Стр. 3 из 9 Приложение",
             "Pages 3",
             "Pager 3",
+            // A Russian label needs its number.
+            "Страница",
+            "Стр.",
+            "стр из 9",
         ] {
             assert!(!is_page_number_line(text), "{text}");
         }

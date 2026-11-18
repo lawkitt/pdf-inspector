@@ -86,8 +86,8 @@ pub(crate) fn is_page_number_line(text: &str) -> bool {
     let is_of = |word: &str| word == "of" || word == "из";
     let labelled = ["page", "страница", "стр.", "стр"]
         .iter()
-        .find_map(|label| lowercase.strip_prefix(label));
-    if let Some(rest) = labelled {
+        .find_map(|label| Some((*label, lowercase.strip_prefix(label)?)));
+    if let Some((label, rest)) = labelled {
         // "Page" must not run into a word ("Pages", "Pager"); a number may
         // follow it directly ("Page3").
         if rest
@@ -98,11 +98,14 @@ pub(crate) fn is_page_number_line(text: &str) -> bool {
             return false;
         }
         let words: Vec<&str> = rest.split_whitespace().collect();
+        // "Page", "Page of" and "Page of 9", their number missing, are kept
+        // from the English rule before; a Russian label needs its number, so
+        // a form's own "Страница" or "Стр." caption stays.
+        let english = label == "page";
         return match words.as_slice() {
-            [] => true,
-            // "Page 3", or "Page of" with its number missing.
-            [word] => is_number(word) || is_of(word),
-            [of, total] => is_of(of) && is_number(total),
+            [] => english,
+            [word] => is_number(word) || (english && is_of(word)),
+            [of, total] => english && is_of(of) && is_number(total),
             [number, of, total] => is_number(number) && is_of(of) && is_number(total),
             _ => false,
         };

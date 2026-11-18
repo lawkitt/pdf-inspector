@@ -907,46 +907,35 @@ fn extract_pages_markdown_mem_impl(
                 .unwrap_or_default()
         })
     };
-    let repeated_header_footer = if strip_repeated_headers_footers {
-        let find = |unreliable: &HashSet<u32>| {
-            repeated_header_footer_items(
-                &all_items,
-                &page_thresholds,
-                &chart_regions,
-                page_count,
-                &page_bounds,
-                unreliable,
-            )
-        };
-        let found = find(&HashSet::new());
-        if found.items.is_empty() {
-            found
-        } else {
-            // A page whose native text never reaches the Markdown (it needs
-            // OCR, and its text is left out when OCR does not run or
-            // replaced when it does) takes no part: it would keep a row
-            // whose repeats go elsewhere, so no copy would be left, and
-            // count rows its own empty content never showed. Only signals
-            // known before any row is removed decide, and for every page,
-            // so a call for some pages chooses as a call for all would.
-            let text_pages: BTreeSet<u32> = all_items.iter().map(|item| item.page).collect();
-            let unreliable: HashSet<u32> = text_pages
-                .into_iter()
-                .filter(|&page| {
-                    let signals = signals_for(page);
-                    gid_pages.contains(&page)
-                        || text_quality.pages_needing_ocr.contains(&page)
-                        || signals.template_image_needs_ocr
-                        || signals.has_vector_text
-                        || signals.has_invisible_text_layer
-                })
-                .collect();
-            if unreliable.is_empty() {
-                found
-            } else {
-                find(&unreliable)
-            }
-        }
+    let repeated_header_footer = if strip_repeated_headers_footers && page_count >= 3 {
+        // A page whose native text never reaches the Markdown (it needs OCR,
+        // and its text is left out when OCR does not run or replaced when it
+        // does) takes no part, neither teaching the pass nor judged by it: it
+        // would keep a row whose repeats go elsewhere, so no copy would be
+        // left, count rows its own empty content never showed, or spoil a
+        // page number the other pages keep in step. Only signals known before
+        // any row is removed decide, and for every page, so a call for some
+        // pages chooses as a call for all would.
+        let text_pages: BTreeSet<u32> = all_items.iter().map(|item| item.page).collect();
+        let unreliable: HashSet<u32> = text_pages
+            .into_iter()
+            .filter(|&page| {
+                let signals = signals_for(page);
+                gid_pages.contains(&page)
+                    || text_quality.pages_needing_ocr.contains(&page)
+                    || signals.template_image_needs_ocr
+                    || signals.has_vector_text
+                    || signals.has_invisible_text_layer
+            })
+            .collect();
+        repeated_header_footer_items(
+            &all_items,
+            &page_thresholds,
+            &chart_regions,
+            page_count,
+            &page_bounds,
+            &unreliable,
+        )
     } else {
         RepeatedHeaderFooter::default()
     };

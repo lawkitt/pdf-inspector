@@ -377,7 +377,8 @@ const MAX_UNNUMBERED_FRONT_PAGES: i64 = 10;
 /// 4" on pages 5 and 6 after a cover and a contents page; "Invoice 4171" to
 /// "Invoice 4174" on pages 1 to 4 do not.
 struct ComparisonKeys {
-    folio_templates: HashSet<String>,
+    /// Learned page-number template -> its printed number minus the page.
+    folio_templates: HashMap<String, i64>,
 }
 
 impl ComparisonKeys {
@@ -413,22 +414,29 @@ impl ComparisonKeys {
                 }
                 in_step && plausible
             })
-            .map(|(template, _)| template)
+            .map(|(template, occurrences)| {
+                let (page, value) = occurrences[0];
+                (template, i64::from(value) - i64::from(page))
+            })
             .collect();
         Self { folio_templates }
     }
 
-    /// The row's key, and its length for the length floor: the
-    /// whitespace-collapsed text's characters, its page-number slot aside.
-    fn key(&self, text: &str) -> (String, usize) {
+    /// The key of the row on `page`, and its length for the length floor:
+    /// the whitespace-collapsed text's characters, its page-number slot
+    /// aside. The slot is a page number only when it keeps the learned step
+    /// on this page too: a page that taught nothing (one too sparse to have
+    /// edge rows) cannot pass "Annual Report 4174" off as page 4.
+    fn key(&self, text: &str, page: u32) -> (String, usize) {
         let collapsed = normalize_whitespace(text);
         // Templates are learned and matched without whitespace, the key's
         // own form, so spellings that differ only in spacing share one
         // page-number check.
         for leading in [false, true] {
-            if let Some((template, _)) = folio_slot(&collapsed, leading) {
+            if let Some((template, value)) = folio_slot(&collapsed, leading) {
                 let key = without_whitespace(&template);
-                if self.folio_templates.contains(&key) {
+                let offset = i64::from(value) - i64::from(page);
+                if self.folio_templates.get(&key) == Some(&offset) {
                     let chars = template.replace(FOLIO, "").trim().chars().count();
                     return (key, chars);
                 }
@@ -440,6 +448,24 @@ impl ComparisonKeys {
 
 fn without_whitespace(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Whether `text` is nothing but a plausible page number for `page`: a
+/// number of up to four digits that equals the page index or trails it by
+/// up to [`MAX_UNNUMBERED_FRONT_PAGES`].
+fn is_bare_page_number(text: &str, page: u32) -> bool {
+    let token = text.trim();
+    if token.is_empty() || token.chars().count() > 4 {
+        return false;
+    }
+    let mut value = 0u32;
+    for c in token.chars() {
+        match decimal_digit_value(c) {
+            Some(digit) => value = value * 10 + digit,
+            None => return false,
+        }
+    }
+    value >= 1 && (-MAX_UNNUMBERED_FRONT_PAGES..=0).contains(&(i64::from(value) - i64::from(page)))
 }
 
 /// A parenthesized annotation marker: a short (≤3 chars) token of digits or
@@ -673,7 +699,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
         let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
         for (text, page, y) in rows {
-            let (key, chars) = keys.key(text);
+            let (key, chars) = keys.key(text, *page);
             if chars < 10 || is_decorative_separator(&key) {
                 continue;
             }
@@ -757,7 +783,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         if protected_bands.contains(&band_key(line)) {
             continue;
         }
-        let (key, _) = keys.key(&text);
+        let (key, _) = keys.key(&text, line.page);
         if candidates.contains(&key) {
             let first = first_page_individual.entry(key).or_insert(line.page);
             if line.page > *first {
@@ -780,7 +806,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
             continue;
         }
         let (_, coalesced) = coalesced_band(&lines, indices);
-        let (key, _) = keys.key(&coalesced);
+        let (key, _) = keys.key(&coalesced, page);
         if band_candidates.contains(&key) {
             let first = first_page_band.entry(key).or_insert(page);
             if page < *first {
@@ -801,7 +827,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         if is_structural_line(coalesced.trim()) {
             continue;
         }
-        let (key, _) = keys.key(&coalesced);
+        let (key, _) = keys.key(&coalesced, page);
         if band_candidates.contains(&key) {
             let first = first_page_band.get(&key).copied().unwrap_or(0);
             if page > first {
@@ -812,9 +838,26 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         }
     }
 
-    // (c) Y-band sibling propagation: if any member is removed, remove all
-    //     members (provided the band is at an edge position and the band is
-    //     not structurally protected).
+    // (c) Y-band sibling propagation: if any member is removed, remove the
+    //     members that repeat too (provided the band is at an edge position
+    //     and the band is not structurally protected). A member repeats when
+    //     its own text, short or not, shows at a page edge on as many pages
+    //     as a repeat needs, or when it is a bare page number. One that
+    //     changes from page to page ("Invoice No. 4172" beside a repeated
+    //     "Acme Holdings") is the page's own text and stays.
+    let mut fragment_pages: HashMap<String, HashSet<u32>> = HashMap::new();
+    for (text, page, _) in &edge_lines {
+        let (key, _) = keys.key(text, *page);
+        fragment_pages.entry(key).or_default().insert(*page);
+    }
+    let repeats = |line: &TextLine| -> bool {
+        let text = line.text();
+        let (key, _) = keys.key(&text, line.page);
+        fragment_pages
+            .get(&key)
+            .is_some_and(|pages| pages.len() as u32 >= threshold)
+            || is_bare_page_number(&text, line.page)
+    };
     for (&(page, y_bucket), indices) in &y_bands {
         if protected_bands.contains(&(page, y_bucket)) {
             continue;
@@ -825,7 +868,9 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         }
         if indices.iter().any(|idx| removal_set.contains(idx)) {
             for &idx in indices {
-                removal_set.insert(idx);
+                if repeats(&lines[idx]) {
+                    removal_set.insert(idx);
+                }
             }
         }
     }
@@ -1961,6 +2006,55 @@ mod tests {
             4,
         );
         assert_eq!(header_pages(&result, "Annual Report of the Board").len(), 4);
+    }
+
+    #[test]
+    fn a_learned_page_number_must_keep_step_on_every_page() {
+        // Codex on #18: three full pages teach "Annual Report N"; a sparse
+        // page 4, too short to teach anything, shows a different number.
+        let mut lines = headed_pages(3, |p| format!("Annual Report {p}"));
+        lines.push(make_line("Annual Report 4174", 10.0, 4, 750.0, None));
+        lines.push(make_line(
+            "уникальный текст страницы 4",
+            10.0,
+            4,
+            600.0,
+            None,
+        ));
+        let result = strip_repeated_lines(lines, 4);
+        assert_eq!(header_pages(&result, "Annual Report"), [1, 4]);
+        assert!(result.iter().any(|l| l.text() == "Annual Report 4174"));
+    }
+
+    #[test]
+    fn a_changing_identifier_beside_a_repeated_fragment_stays() {
+        // Codex on #18: one header row in two pieces on one baseline. The
+        // left piece repeats; the right one changes and is the page's own.
+        let mut lines = headed_pages(4, |_| "Acme Holdings Quarterly".into());
+        for page in 1..=4u32 {
+            let mut invoice = make_line(
+                &format!("Invoice No. {}", 4170 + page),
+                10.0,
+                page,
+                750.0,
+                None,
+            );
+            invoice.items[0].x = 400.0;
+            lines.push(invoice);
+            // A bare page number on the same row goes with the header.
+            let mut folio = make_line(&page.to_string(), 10.0, page, 750.0, None);
+            folio.items[0].x = 540.0;
+            lines.push(folio);
+        }
+        let result = strip_repeated_lines(lines, 4);
+        assert_eq!(header_pages(&result, "Acme Holdings Quarterly"), [1]);
+        assert_eq!(header_pages(&result, "Invoice No."), [1, 2, 3, 4]);
+        let folios: Vec<u32> = result
+            .iter()
+            .filter(|l| l.y == 750.0 && l.text().chars().all(|c| c.is_ascii_digit()))
+            .map(|l| l.page)
+            .collect();
+        assert_eq!(folios, [1]);
     }
 
     #[test]
