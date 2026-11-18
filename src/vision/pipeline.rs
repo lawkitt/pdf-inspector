@@ -213,6 +213,13 @@ pub struct OcrPdfResult {
     /// text, with how many stretches. A page routed to OCR is read from its
     /// rendering, which does not paint that text either.
     pub invisible_text_by_page: Vec<crate::PageInvisibleText>,
+    /// Selected pages whose final Markdown left out repeated running header
+    /// or footer rows, with how many, in page order: counted from the
+    /// content each page kept (native extraction, OCR, or both fused; for
+    /// OCR, the repeats are found across the recognized pages). With
+    /// `MarkdownOptions::strip_headers_footers` off it is empty. See
+    /// [`PageRepeatedLines`](crate::PageRepeatedLines).
+    pub repeated_lines_by_page: Vec<crate::PageRepeatedLines>,
     /// Selected pages where deterministic table detection found tables.
     pub pages_with_tables: Vec<u32>,
     /// Selected pages where deterministic layout found multiple columns.
@@ -284,6 +291,7 @@ pub fn process_pdf_with_ocr_mem(
         options.ocr.mode != OcrMode::Off,
     )?;
     let mut native = extraction.result;
+    let native_repeated = extraction.repeated_rows_by_page;
     let page_count = extraction.page_count;
     let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
     // The renderer reads the document as the loader repaired it, when it
@@ -450,6 +458,7 @@ pub fn process_pdf_with_ocr_mem(
             &fusion_options,
             &native_candidates,
             &fusion_routes,
+            &native_repeated,
         )?
     } else {
         // Resolve the native renderer before any network request so a missing
@@ -472,12 +481,22 @@ pub fn process_pdf_with_ocr_mem(
             &fusion_options,
             &native_candidates,
             &fusion_routes,
+            &native_repeated,
             options.retain_recognition.then_some(&mut recognition),
         )?
     };
     fused.render_time_ms = fused
         .render_time_ms
         .saturating_add(supplemental_preflight_ms);
+    let repeated_lines_by_page = fused
+        .pages
+        .iter()
+        .filter(|page| page.provenance.repeated_lines > 0)
+        .map(|page| crate::PageRepeatedLines {
+            page: page.page_number,
+            lines: page.provenance.repeated_lines,
+        })
+        .collect();
     for page in &mut fused.pages {
         if recovered_natively.contains(&page.page_number) {
             page.provenance
@@ -513,6 +532,7 @@ pub fn process_pdf_with_ocr_mem(
         images_by_page: native.images_by_page,
         form_field_names_by_page: native.form_field_names_by_page,
         invisible_text_by_page: native.invisible_text_by_page,
+        repeated_lines_by_page,
         pages_with_tables: pages_with_tables.clone(),
         pages_with_columns: native.pages_with_columns,
         is_complex: native.is_complex || !pages_with_tables.is_empty(),
@@ -586,33 +606,20 @@ fn run_and_fuse_ocr_chunks<R, O>(
     fusion_options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
     fusion_routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_repeated: &BTreeMap<u32, Vec<String>>,
     mut recognition: Option<&mut Vec<OcrPage>>,
 ) -> Result<FusedPages, OcrPipelineError>
 where
     R: PageRenderer,
     O: OcrEngine,
 {
-    let routed: BTreeSet<u32> = routed_pages.iter().copied().collect();
-    let native_by_number: BTreeMap<u32, &PageMarkdown> = native_pages
-        .iter()
-        .map(|page| (page.page + 1, page))
-        .collect();
-    let mut pages_by_number = BTreeMap::new();
+    // Recognize every routed page first, so the document-wide header/footer
+    // pass in fusion sees all of them; each chunk's bitmaps are dropped as
+    // soon as it is recognized, and only the spans are kept.
+    let mut pages = Vec::with_capacity(routed_pages.len());
     let mut render_time_ms = 0u64;
     let mut ocr_time_ms = 0u64;
-
     for chunk in routed_pages.chunks(ocr_page_chunk_size(engine.preferred_page_concurrency())) {
-        let native_chunk = chunk
-            .iter()
-            .map(|page_number| {
-                clone_native_page(
-                    native_by_number
-                        .get(page_number)
-                        .copied()
-                        .expect("every routed page has a native page"),
-                )
-            })
-            .collect::<Vec<_>>();
         let run = run_ocr_pages(
             renderer,
             engine,
@@ -622,77 +629,31 @@ where
             render_options,
             ocr_options,
         )?;
-        let fused = fuse_ocr_pages_adaptive_with_routes(
-            &native_chunk,
-            &run,
-            document_page_count,
-            fusion_options,
-            native_candidates,
-            fusion_routes,
-        )?;
-        if let Some(recognition) = recognition.as_mut() {
-            recognition.extend(run.pages.into_iter().map(|page| page.ocr));
-        }
-        render_time_ms = render_time_ms.saturating_add(fused.render_time_ms);
-        ocr_time_ms = ocr_time_ms.saturating_add(fused.ocr_time_ms);
-        for page in fused.pages {
-            pages_by_number.insert(page.page_number, page);
-        }
-        // `run` and its rendered bitmaps are released before the next chunk.
+        render_time_ms = render_time_ms.saturating_add(run.render_time_ms);
+        ocr_time_ms = ocr_time_ms.saturating_add(run.ocr_time_ms);
+        pages.extend(run.pages.into_iter().map(|mut page| {
+            page.rendered.release_pixels();
+            page
+        }));
     }
-
-    let native_only = select_native_pages(native_pages, |page| !routed.contains(&page));
-    if !native_only.is_empty() {
-        let fused = fuse_ocr_pages_adaptive_with_routes(
-            &native_only,
-            &OcrRun {
-                pages: Vec::new(),
-                render_time_ms: 0,
-                ocr_time_ms: 0,
-            },
-            document_page_count,
-            fusion_options,
-            native_candidates,
-            fusion_routes,
-        )?;
-        for page in fused.pages {
-            pages_by_number.insert(page.page_number, page);
-        }
-    }
-
-    let pages = native_pages
-        .iter()
-        .map(|native| {
-            pages_by_number
-                .remove(&(native.page + 1))
-                .expect("every native page is fused exactly once")
-        })
-        .collect();
-    Ok(FusedPages {
+    let run = OcrRun {
         pages,
         render_time_ms,
         ocr_time_ms,
-    })
-}
-
-fn select_native_pages(
-    native_pages: &[PageMarkdown],
-    include: impl Fn(u32) -> bool,
-) -> Vec<PageMarkdown> {
-    native_pages
-        .iter()
-        .filter(|page| include(page.page + 1))
-        .map(clone_native_page)
-        .collect()
-}
-
-fn clone_native_page(page: &PageMarkdown) -> PageMarkdown {
-    PageMarkdown {
-        page: page.page,
-        markdown: page.markdown.clone(),
-        needs_ocr: page.needs_ocr,
-        ocr_reason: page.ocr_reason.clone(),
+    };
+    let fused = fuse_ocr_pages_adaptive_with_routes(
+        native_pages,
+        &run,
+        document_page_count,
+        fusion_options,
+        native_candidates,
+        fusion_routes,
+        native_repeated,
+    )?;
+    if let Some(recognition) = recognition.as_mut() {
+        recognition.extend(run.pages.into_iter().map(|page| page.ocr));
     }
+    Ok(fused)
 }
 
 fn load_renderer(options: &OcrPdfOptions) -> Result<PdfiumRenderer, RenderError> {
@@ -1128,6 +1089,7 @@ mod tests {
                 ocr_confidence: None,
                 timings: VisionTimings::default(),
                 warnings: Vec::new(),
+                repeated_lines: 0,
                 hosted_recommended: false,
             },
         };
@@ -1321,6 +1283,7 @@ mod tests {
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
             &routes,
+            &BTreeMap::new(),
             Some(&mut recognition),
         )
         .unwrap();
@@ -1341,6 +1304,168 @@ mod tests {
             .pages
             .iter()
             .all(|page| page.provenance.hosted_recommended));
+    }
+
+    /// Renders 600 x 800 pt pages at 300 x 400 px.
+    struct ScanRenderer;
+
+    impl PageRenderer for ScanRenderer {
+        type Error = std::convert::Infallible;
+
+        fn render_pages(
+            &self,
+            _pdf_bytes: &[u8],
+            pages: &[u32],
+            _password: Option<&str>,
+            _options: &RenderOptions,
+        ) -> Result<Vec<super::super::RenderedPage>, Self::Error> {
+            Ok(pages
+                .iter()
+                .map(|&page| {
+                    let transform = super::super::PageTransform::from_corners(
+                        300,
+                        400,
+                        (0.0, 800.0),
+                        (600.0, 800.0),
+                        (0.0, 0.0),
+                    )
+                    .unwrap();
+                    super::super::RenderedPage::new(
+                        page,
+                        600.0,
+                        800.0,
+                        300,
+                        400,
+                        300,
+                        super::super::RenderPixelFormat::Gray8,
+                        vec![255; 120_000],
+                        transform,
+                    )
+                    .unwrap()
+                })
+                .collect())
+        }
+    }
+
+    /// Reads a court-file header, then 16 body lines unique to the page.
+    struct CourtFileEngine {
+        model: super::super::ModelIdentity,
+    }
+
+    impl OcrEngine for CourtFileEngine {
+        type Error = std::convert::Infallible;
+
+        fn model(&self) -> &super::super::ModelIdentity {
+            &self.model
+        }
+
+        fn recognize(
+            &self,
+            pages: &[super::super::RenderedPage],
+            _options: &OcrOptions,
+        ) -> Result<Vec<super::super::OcrPage>, Self::Error> {
+            let span = |text: String, top: f32| super::super::OcrSpan {
+                text,
+                polygon: super::super::ImageQuad::new([
+                    super::super::ImagePoint::new(30.0, top),
+                    super::super::ImagePoint::new(270.0, top),
+                    super::super::ImagePoint::new(270.0, top + 9.0),
+                    super::super::ImagePoint::new(30.0, top + 9.0),
+                ]),
+                confidence: 0.9,
+                orientation_degrees: None,
+            };
+            Ok(pages
+                .iter()
+                .map(|rendered| {
+                    assert!(
+                        !rendered.pixels().is_empty(),
+                        "recognition reads the bitmap"
+                    );
+                    let page = rendered.page();
+                    let mut spans = vec![span("Дело № 2-123/2026".to_string(), 12.0)];
+                    spans.extend((0..16u32).map(|line| {
+                        span(
+                            format!("Sheet {page} line {line}: the parties agree as follows."),
+                            60.0 + line as f32 * 18.0,
+                        )
+                    }));
+                    super::super::OcrPage {
+                        page_number: page,
+                        spans,
+                        mean_confidence: Some(0.9),
+                        model: self.model.clone(),
+                        processing_time_ms: 0,
+                        warnings: Vec::new(),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn repeated_scan_headers_are_found_across_ocr_chunks() {
+        // Six pages recognize in two chunks (four, then two); the header's
+        // repeats on pages 5 and 6 still go, against page 1.
+        let native_pages = (0..6)
+            .map(|page| PageMarkdown {
+                page,
+                markdown: String::new(),
+                needs_ocr: true,
+                ocr_reason: Some(crate::OCR_REASON_SCANNED.to_string()),
+            })
+            .collect::<Vec<_>>();
+        let routed_pages = (1..=6).collect::<Vec<_>>();
+        let routes = routed_pages
+            .iter()
+            .map(|&page| (page, OcrFusionRoute::FullPage))
+            .collect();
+        let mut recognition = Vec::new();
+        let fused = run_and_fuse_ocr_chunks(
+            &ScanRenderer,
+            &CourtFileEngine {
+                model: super::super::ModelIdentity::new("test-ocr", "v1"),
+            },
+            b"test",
+            &routed_pages,
+            None,
+            &RenderOptions::new(),
+            &OcrOptions::new().mode(OcrMode::Force),
+            &native_pages,
+            6,
+            &OcrFusionOptions::new().markdown(MarkdownOptions::default()),
+            &BTreeMap::new(),
+            &routes,
+            &BTreeMap::new(),
+            Some(&mut recognition),
+        )
+        .unwrap();
+
+        let with_header: Vec<u32> = fused
+            .pages
+            .iter()
+            .filter(|page| page.markdown.contains("Дело № 2-123/2026"))
+            .map(|page| page.page_number)
+            .collect();
+        assert_eq!(with_header, [1]);
+        assert_eq!(
+            fused
+                .pages
+                .iter()
+                .map(|page| page.provenance.repeated_lines)
+                .collect::<Vec<_>>(),
+            [0, 1, 1, 1, 1, 1]
+        );
+        for page in &fused.pages {
+            assert!(page
+                .markdown
+                .contains(&format!("Sheet {} line 15:", page.page_number)));
+        }
+        // Raw recognition is evidence before fusion: every header stays.
+        assert_eq!(recognition.len(), 6);
+        assert!(recognition
+            .iter()
+            .all(|page| page.spans[0].text == "Дело № 2-123/2026"));
     }
 
     #[test]

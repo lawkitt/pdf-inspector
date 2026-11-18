@@ -194,6 +194,25 @@ pub struct PageInvisibleText {
     pub stretches: u32,
 }
 
+/// The rows of a running header or footer a single 1-indexed page left out
+/// because they repeat a row kept on an earlier page.
+///
+/// A row is left out only as an exact repeat: the same text (letters,
+/// digits, punctuation and case; runs of spaces aside), in the same place
+/// at the page's top or bottom edge, on at least three pages and at least
+/// 30% of them. The first page that shows it keeps it. Numbers count, so
+/// `Case No. 2-123/2026` does not repeat `Case No. 2-124/2026`; the one
+/// exception is a page number at the row's start or end that rises with the
+/// page (`Annual Report 5`, `Annual Report 6`). A standalone page number is
+/// left out by page-number removal instead and is not counted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRepeatedLines {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// Rows left out: one per visual row, however many text runs it holds.
+    pub lines: u32,
+}
+
 /// The shortest side, in points, an image must be drawn at to count in
 /// [`PageImages`]: about 1.4 mm.
 pub const MIN_COUNTED_IMAGE_SIDE_PT: f32 = 4.0;
@@ -613,6 +632,11 @@ pub struct PagesExtractionResult {
 
 pub(crate) struct InternalPagesExtraction {
     pub(crate) result: PagesExtractionResult,
+    /// The requested pages' running header or footer rows left out as
+    /// repeats (their text); empty unless the caller asked for repeats to be
+    /// stripped.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) repeated_rows_by_page: BTreeMap<u32, Vec<String>>,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -744,8 +768,8 @@ fn extract_pages_markdown_mem_impl(
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
-    let repeated_header_footer_items = if strip_repeated_headers_footers {
-        repeated_header_footer_item_keys(
+    let repeated_header_footer = if strip_repeated_headers_footers {
+        repeated_header_footer_items(
             &all_items,
             &page_thresholds,
             &chart_regions,
@@ -753,7 +777,7 @@ fn extract_pages_markdown_mem_impl(
             &page_bounds,
         )
     } else {
-        HashSet::new()
+        RepeatedHeaderFooter::default()
     };
 
     // When caller doesn't specify pages, return every page in document order.
@@ -801,7 +825,9 @@ fn extract_pages_markdown_mem_impl(
             .zip(&page_number_removal_mask)
             .filter(|(item, _)| {
                 item.page == page_1idx
-                    && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
+                    && !repeated_header_footer
+                        .items
+                        .contains(&HeaderFooterItemKey::from(*item))
             })
             .map(|(item, remove)| (item.clone(), *remove))
             .unzip();
@@ -974,6 +1000,13 @@ fn extract_pages_markdown_mem_impl(
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        repeated_rows_by_page: repeated_header_footer.rows_for(
+            &pages_slice
+                .iter()
+                .filter_map(|page| page.checked_add(1))
+                .collect::<Vec<_>>(),
+        ),
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         page_count,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         supplemental_ocr_regions,
@@ -1031,7 +1064,7 @@ fn supplemental_ocr_image_region(item: &TextItem) -> Option<PdfRect> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct HeaderFooterItemKey {
+pub(crate) struct HeaderFooterItemKey {
     page: u32,
     x: u32,
     y: u32,
@@ -1049,13 +1082,47 @@ impl From<&TextItem> for HeaderFooterItemKey {
     }
 }
 
-fn repeated_header_footer_item_keys(
+/// Repeated header/footer items found by the document-wide pass.
+#[derive(Debug, Default)]
+pub(crate) struct RepeatedHeaderFooter {
+    /// Items to leave out of the Markdown.
+    pub(crate) items: HashSet<HeaderFooterItemKey>,
+    /// 1-indexed page -> the text of each row removed as a repeat of a row
+    /// kept on an earlier page, top to bottom.
+    pub(crate) rows_by_page: BTreeMap<u32, Vec<String>>,
+}
+
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+impl RepeatedHeaderFooter {
+    /// The requested pages' removed rows.
+    pub(crate) fn rows_for(&self, pages: &[u32]) -> BTreeMap<u32, Vec<String>> {
+        pages
+            .iter()
+            .filter_map(|page| {
+                self.rows_by_page
+                    .get(page)
+                    .map(|rows| (*page, rows.clone()))
+            })
+            .collect()
+    }
+}
+
+/// Running headers and footers proven by cross-page repetition alone: a row
+/// stays on the first page that shows it, and its exact repeats in the same
+/// place go, on three or more of `page_count` pages. Short documents have no
+/// such evidence and keep everything; the per-page typographic fallback that
+/// whole-document Markdown conversion applies to them would leave out even a
+/// first occurrence, with nothing to count.
+pub(crate) fn repeated_header_footer_items(
     items: &[TextItem],
     page_thresholds: &HashMap<u32, f32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     page_count: u32,
     page_bounds: &extractor::PageVerticalBounds,
-) -> HashSet<HeaderFooterItemKey> {
+) -> RepeatedHeaderFooter {
+    if page_count < 3 {
+        return RepeatedHeaderFooter::default();
+    }
     let candidates = items
         .iter()
         .filter(|item| {
@@ -1073,16 +1140,56 @@ fn repeated_header_footer_item_keys(
         chart_regions,
         page_bounds,
     );
-    let all_items: HashSet<_> = lines
+    let line_rows: Vec<(u32, i32, f32, String, Vec<HeaderFooterItemKey>)> = lines
         .iter()
-        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .map(|line| {
+            (
+                line.page,
+                (line.y * 10.0).round() as i32,
+                line.items
+                    .iter()
+                    .map(|item| item.x)
+                    .fold(f32::INFINITY, f32::min),
+                line.text(),
+                line.items.iter().map(HeaderFooterItemKey::from).collect(),
+            )
+        })
         .collect();
     let kept = markdown::strip_repeated_header_footer_lines(lines, page_count);
     let kept_items: HashSet<_> = kept
         .iter()
         .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
         .collect();
-    all_items.difference(&kept_items).cloned().collect()
+    let mut removed = RepeatedHeaderFooter::default();
+    // One visual row, however many lines it was grouped into: its removed
+    // lines' text, left to right.
+    // (page, row from the top) -> (left edge, text) of each removed line.
+    type RowKey = (u32, std::cmp::Reverse<i32>);
+    let mut rows: BTreeMap<RowKey, Vec<(f32, String)>> = BTreeMap::new();
+    for (page, row, left, text, keys) in line_rows {
+        let mut line_removed = false;
+        for key in keys {
+            if !kept_items.contains(&key) {
+                line_removed = true;
+                removed.items.insert(key);
+            }
+        }
+        if line_removed {
+            rows.entry((page, std::cmp::Reverse(row)))
+                .or_default()
+                .push((left, text));
+        }
+    }
+    for ((page, _), mut parts) in rows {
+        parts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let text = parts
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        removed.rows_by_page.entry(page).or_default().push(text);
+    }
+    removed
 }
 
 #[cfg(all(test, feature = "ocr", not(target_arch = "wasm32")))]
@@ -1136,13 +1243,17 @@ mod ocr_header_footer_tests {
             thresholds.insert(page, 0.1);
         }
 
-        let removed = repeated_header_footer_item_keys(
-            &items,
-            &thresholds,
-            &HashMap::new(),
-            3,
-            &HashMap::new(),
+        let repeated =
+            repeated_header_footer_items(&items, &thresholds, &HashMap::new(), 3, &HashMap::new());
+        assert_eq!(
+            repeated.rows_by_page,
+            BTreeMap::from([
+                (2, vec!["Repeated report header".to_string()]),
+                (3, vec!["Repeated report header".to_string()]),
+            ]),
+            "pages 2 and 3 each leave out the header row page 1 keeps"
         );
+        let removed = repeated.items;
         assert_eq!(removed.len(), 2);
         for page in 1..=3 {
             assert_eq!(

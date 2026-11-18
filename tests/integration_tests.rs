@@ -11687,3 +11687,172 @@ fn invisible_text_stays_out_and_is_counted_in_stretches() {
         assert!(!native.markdown.contains("SECRET"));
     }
 }
+
+/// Four letter pages under a court-file header: `header(page)` at the top,
+/// a case-exhibit footer whose number changes per page, a folio, and twelve
+/// body lines unique to the page.
+fn make_court_file_pdf(header: impl Fn(u32) -> String) -> Vec<u8> {
+    use lopdf::{dictionary, Document};
+
+    let mut doc = Document::with_version("1.5");
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let pages_id = doc.new_object_id();
+    let exhibits = [0, 4171, 4382, 4593, 4604];
+    let mut kids = Vec::new();
+    for page in 1..=4u32 {
+        let mut content = format!(
+            "BT /F1 10 Tf 72 750 Td ({}) Tj ET\n\
+             BT /F1 10 Tf 72 40 Td (Exhibit register entry {}) Tj ET\n\
+             BT /F1 10 Tf 540 40 Td ({page}) Tj ET\n",
+            header(page),
+            exhibits[page as usize],
+        );
+        for line in 0..12u32 {
+            content.push_str(&format!(
+                "BT /F1 10 Tf 72 {} Td (Paragraph {line} of sheet {page}: the parties agree.) Tj ET\n",
+                680 - 30 * line
+            ));
+        }
+        kids.push(add_page(
+            &mut doc,
+            pages_id,
+            &content,
+            LETTER_BOX,
+            None,
+            &[("F1", font_id)],
+        ));
+    }
+    finish_document(doc, pages_id, kids)
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn test_repeated_header_keeps_its_first_page_and_is_counted() {
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    // mdoc's native pass: the OCR pipeline with OCR off, default Markdown
+    // options (headers and footers stripped).
+    let pdf = make_court_file_pdf(|_| "Case No. 2-123/2026 District Court".to_string());
+    let result = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native pass");
+    let with_header: Vec<u32> = result
+        .pages
+        .iter()
+        .filter(|page| page.markdown.contains("Case No. 2-123/2026"))
+        .map(|page| page.page_number)
+        .collect();
+    assert_eq!(with_header, [1]);
+    let lines = |page, lines| pdf_inspector::PageRepeatedLines { page, lines };
+    assert_eq!(
+        result.repeated_lines_by_page,
+        vec![lines(2, 1), lines(3, 1), lines(4, 1)]
+    );
+    assert_eq!(
+        result
+            .pages
+            .iter()
+            .map(|page| page.provenance.repeated_lines)
+            .collect::<Vec<_>>(),
+        [0, 1, 1, 1]
+    );
+    for page in &result.pages {
+        // The footer's number changes, so it is no repeat; body text stays.
+        let sheet = page.page_number;
+        assert!(
+            page.markdown.contains("Exhibit register entry"),
+            "{}",
+            page.markdown
+        );
+        assert!(page
+            .markdown
+            .contains(&format!("Paragraph 11 of sheet {sheet}")));
+    }
+    // A page selection counts only the selected pages, from the whole
+    // document's evidence.
+    let selected =
+        process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new().page_numbers([3])).expect("page 3");
+    assert_eq!(selected.repeated_lines_by_page, vec![lines(3, 1)]);
+    assert!(!selected.markdown.contains("Case No. 2-123/2026"));
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn test_header_whose_case_number_changes_is_kept_and_not_counted() {
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    let pdf = make_court_file_pdf(|page| format!("Case No. 2-12{page}/2026 District Court"));
+    let result = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native pass");
+    for page in &result.pages {
+        let sheet = page.page_number;
+        assert!(
+            page.markdown
+                .contains(&format!("Case No. 2-12{sheet}/2026 District Court")),
+            "{}",
+            page.markdown
+        );
+    }
+    assert!(result.repeated_lines_by_page.is_empty());
+}
+
+#[test]
+fn test_per_page_extraction_keeps_every_running_header() {
+    // Per-page extraction treats pages independently: no repeat is stripped.
+    let pdf = make_court_file_pdf(|_| "Case No. 2-123/2026 District Court".to_string());
+    let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
+    assert!(result
+        .pages
+        .iter()
+        .all(|page| page.markdown.contains("Case No. 2-123/2026")));
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn test_two_page_native_footer_stays_on_both_pages() {
+    use lopdf::{dictionary, Document};
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    // A small footer set well apart from the body on both pages of a
+    // two-page document: no repetition evidence, so it stays on both
+    // pages in the pipeline mdoc runs, and nothing is counted.
+    let mut doc = Document::with_version("1.5");
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let pages_id = doc.new_object_id();
+    let mut kids = Vec::new();
+    for page in 1..=2u32 {
+        let mut content =
+            String::from("BT /F1 7 Tf 72 30 Td (Confidential draft of the agreement) Tj ET\n");
+        for line in 0..14u32 {
+            content.push_str(&format!(
+                "BT /F1 11 Tf 72 {} Td (Clause {line} of sheet {page}: the parties agree.) Tj ET\n",
+                700 - 16 * line
+            ));
+        }
+        kids.push(add_page(
+            &mut doc,
+            pages_id,
+            &content,
+            LETTER_BOX,
+            None,
+            &[("F1", font_id)],
+        ));
+    }
+    let pdf = finish_document(doc, pages_id, kids);
+    let result = process_pdf_with_ocr_mem(&pdf, OcrPdfOptions::new()).expect("native pass");
+    assert_eq!(
+        result
+            .markdown
+            .matches("Confidential draft of the agreement")
+            .count(),
+        2,
+        "{}",
+        result.markdown
+    );
+    assert!(result.repeated_lines_by_page.is_empty());
+}

@@ -1,6 +1,6 @@
 //! Geometry-aware OCR Markdown assembly and native-text fusion.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use thiserror::Error;
@@ -182,7 +182,7 @@ pub fn ocr_page_to_markdown(
     document_page_count: u32,
     options: &MarkdownOptions,
 ) -> String {
-    let (items, _) = ocr_text_items(page);
+    let (items, _) = ocr_text_items(page, &HashSet::new());
     let markdown = to_markdown_from_items_with_rects_and_page_count(
         items,
         options.clone(),
@@ -214,6 +214,7 @@ pub fn fuse_ocr_pages(
         options,
         &BTreeMap::new(),
         &routes,
+        &BTreeMap::new(),
     )
 }
 
@@ -234,6 +235,7 @@ pub(crate) fn fuse_ocr_pages_adaptive(
         options,
         native_candidates,
         &routes,
+        &BTreeMap::new(),
     )
 }
 
@@ -246,6 +248,9 @@ fn full_page_routes(ocr_run: &OcrRun) -> BTreeMap<u32, OcrFusionRoute> {
 }
 
 /// OCR-pipeline fusion with an explicit route mode for every processed page.
+/// `native_repeated` holds the rows native extraction left out of each
+/// page as repeats (their text), so each page counts what its final content
+/// left out.
 pub(crate) fn fuse_ocr_pages_adaptive_with_routes(
     native_pages: &[PageMarkdown],
     ocr_run: &OcrRun,
@@ -253,6 +258,7 @@ pub(crate) fn fuse_ocr_pages_adaptive_with_routes(
     options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
     routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_repeated: &BTreeMap<u32, Vec<String>>,
 ) -> Result<FusedPages, OcrFusionError> {
     fuse_ocr_pages_impl(
         native_pages,
@@ -261,6 +267,7 @@ pub(crate) fn fuse_ocr_pages_adaptive_with_routes(
         options,
         native_candidates,
         routes,
+        native_repeated,
     )
 }
 
@@ -271,6 +278,7 @@ fn fuse_ocr_pages_impl(
     options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
     routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_repeated: &BTreeMap<u32, Vec<String>>,
 ) -> Result<FusedPages, OcrFusionError> {
     validate_options(options)?;
 
@@ -296,6 +304,18 @@ fn fuse_ocr_pages_impl(
         }
     }
 
+    let repeated = if options.markdown.strip_headers_footers {
+        repeated_ocr_header_footer_spans(native_pages, ocr_run, routes, native_candidates)
+    } else {
+        RepeatedOcrSpans::default()
+    };
+    // Page furniture on OCR text is judged across pages only, by the pass
+    // above: a box height is no font size, so the per-page typographic
+    // fallback for short documents would guess.
+    let mut ocr_markdown_options = options.markdown.clone();
+    ocr_markdown_options.strip_headers_footers = false;
+    let no_spans = HashSet::new();
+
     let render_shares = equal_time_shares(ocr_run.render_time_ms, ocr_run.pages.len());
     let render_by_page: BTreeMap<u32, u64> = ocr_run
         .pages
@@ -312,7 +332,8 @@ fn fuse_ocr_pages_impl(
 
         let (markdown, source, ocr_model, ocr_confidence, ocr_ms, hosted_recommended) =
             if let Some(local) = ocr_by_page.get(&page_number) {
-                let (ocr_items, discarded_spans) = ocr_text_items(local);
+                let repeated_spans = repeated.spans.get(&page_number).unwrap_or(&no_spans);
+                let (ocr_items, discarded_spans) = ocr_text_items(local, repeated_spans);
                 if discarded_spans > 0 {
                     warnings.push(format!(
                         "discarded {discarded_spans} OCR spans with unusable text or geometry"
@@ -341,11 +362,11 @@ fn fuse_ocr_pages_impl(
                     OcrFusionRoute::FullPage => {
                         let markdown = to_markdown_from_items_with_rects_and_page_count(
                             ocr_items,
-                            options.markdown.clone(),
+                            ocr_markdown_options.clone(),
                             &[],
                             document_page_count,
                         );
-                        preserve_ocr_line_breaks(&markdown, local)
+                        preserve_ocr_line_breaks_without(&markdown, local, repeated_spans)
                     }
                 };
                 let (markdown, source, adaptive_recommends_hosted) = if let Some(candidate) =
@@ -398,6 +419,17 @@ fn fuse_ocr_pages_impl(
                 )
             };
 
+        let repeated_lines = repeated_lines_left_out(
+            source,
+            &markdown,
+            native_repeated
+                .get(&page_number)
+                .map_or(&[][..], Vec::as_slice),
+            repeated
+                .rows
+                .get(&page_number)
+                .map_or(&[][..], Vec::as_slice),
+        );
         pages.push(FusedPageMarkdown {
             page_number,
             markdown,
@@ -415,6 +447,7 @@ fn fuse_ocr_pages_impl(
                     assembly_ms: elapsed_ms(assembly_started),
                 },
                 warnings,
+                repeated_lines,
                 hosted_recommended,
             },
         });
@@ -581,10 +614,23 @@ fn assess_text_candidate(markdown: &str) -> Option<TextCandidateQuality> {
 }
 
 /// Converts recognized line polygons to ordinary PDF-space text items.
-fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
+/// The page's OCR spans as positioned text items, leaving out `skip` (span
+/// indices), and how many spans had unusable text or geometry.
+fn ocr_text_items(page: &RoutedOcrPage, skip: &HashSet<usize>) -> (Vec<TextItem>, usize) {
+    let (items, discarded) = indexed_ocr_text_items(page, skip);
+    (items.into_iter().map(|(_, item)| item).collect(), discarded)
+}
+
+fn indexed_ocr_text_items(
+    page: &RoutedOcrPage,
+    skip: &HashSet<usize>,
+) -> (Vec<(usize, TextItem)>, usize) {
     let mut discarded = 0usize;
     let mut items = Vec::with_capacity(page.ocr.spans.len());
-    for span in &page.ocr.spans {
+    for (index, span) in page.ocr.spans.iter().enumerate() {
+        if skip.contains(&index) {
+            continue;
+        }
         if span.text.trim().is_empty() {
             discarded += 1;
             continue;
@@ -603,39 +649,42 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             f64::from(right - left),
             f64::from(bottom - top),
         );
-        items.push(TextItem {
-            text: span.text.trim().to_string(),
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-            font: "OCR".to_string(),
-            font_tag: String::new(),
-            legacy_symbol_rewrite: false,
-            font_size: rect.height.max(1.0),
-            page: page.rendered.page(),
-            is_bold: false,
-            is_italic: false,
-            font_weight: None,
-            bold_source: None,
-            fixed_pitch: None,
-            fill_color: None,
-            stroke_color: None,
-            render_mode: None,
-            is_underline: false,
-            is_strikeout: false,
-            layout_strikeout: false,
-            rotation: 0.0,
-            advance_known: true,
-            item_type: ItemType::Text,
-            mcid: None,
-            baseline_shift: 0.0,
-        });
+        items.push((
+            index,
+            TextItem {
+                text: span.text.trim().to_string(),
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                font: "OCR".to_string(),
+                font_tag: String::new(),
+                legacy_symbol_rewrite: false,
+                font_size: rect.height.max(1.0),
+                page: page.rendered.page(),
+                is_bold: false,
+                is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
+                is_underline: false,
+                is_strikeout: false,
+                layout_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
+                item_type: ItemType::Text,
+                mcid: None,
+                baseline_shift: 0.0,
+            },
+        ));
     }
     // OCR engines do not share an ordering contract. Geometry gives the
     // deterministic top-to-bottom seed expected by the existing layout
     // pipeline, which can still replace it with column-aware reading order.
-    items.sort_by(|first, second| {
+    items.sort_by(|(_, first), (_, second)| {
         first
             .page
             .cmp(&second.page)
@@ -643,6 +692,129 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             .then(first.x.total_cmp(&second.x))
     });
     (items, discarded)
+}
+
+/// Repeated header/footer evidence across a run's full-page OCR.
+#[derive(Debug, Default)]
+struct RepeatedOcrSpans {
+    /// 1-indexed page -> indices of the spans to leave out.
+    spans: BTreeMap<u32, HashSet<usize>>,
+    /// 1-indexed page -> the text of each row those spans formed.
+    rows: BTreeMap<u32, Vec<String>>,
+}
+
+/// Rows the page's final content left out as repeats: those removed from
+/// the source it kept. Fused content holds both sources, so a row removed
+/// from one counts only when the other did not bring it back (whitespace
+/// and Markdown escapes aside), and a row removed from both counts once.
+fn repeated_lines_left_out(
+    source: PageContentSource,
+    markdown: &str,
+    native_rows: &[String],
+    ocr_rows: &[String],
+) -> u32 {
+    let count = |rows: usize| u32::try_from(rows).unwrap_or(u32::MAX);
+    match source {
+        PageContentSource::Native => count(native_rows.len()),
+        PageContentSource::Ocr => count(ocr_rows.len()),
+        PageContentSource::Fused => {
+            let squeeze = |text: &str| -> String {
+                text.chars()
+                    .filter(|c| !c.is_whitespace() && *c != '\\')
+                    .collect()
+            };
+            let shown = squeeze(markdown);
+            let native: Vec<String> = native_rows.iter().map(|row| squeeze(row)).collect();
+            let mut rows = native.clone();
+            rows.extend(
+                ocr_rows
+                    .iter()
+                    .map(|row| squeeze(row))
+                    .filter(|row| !native.contains(row)),
+            );
+            count(
+                rows.iter()
+                    .filter(|row| !row.is_empty() && !shown.contains(row.as_str()))
+                    .count(),
+            )
+        }
+    }
+}
+
+/// Finds running headers and footers in full-page OCR by the native
+/// document-wide repetition pass, over the recognized pages whose content
+/// will be OCR: a row stays on the first such page that shows it, and its
+/// exact repeats in the same place go, on three or more of those pages.
+///
+/// Left out of the pass, so they neither lose a row nor anchor one:
+/// image-region OCR, which only adds to a native page; a page that may keep
+/// a native candidate instead of its OCR, whose first occurrence would never
+/// reach the output; and table rows (heuristic detection on the page's
+/// spans), so a table's column headers repeated on each page stay with
+/// their table, as whole-document conversion claims tables before it strips.
+fn repeated_ocr_header_footer_spans(
+    native_pages: &[PageMarkdown],
+    ocr_run: &OcrRun,
+    routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+) -> RepeatedOcrSpans {
+    let may_keep_native: BTreeSet<u32> = native_pages
+        .iter()
+        .filter(|page| page.needs_ocr && native_candidates.contains_key(&(page.page + 1)))
+        .map(|page| page.page + 1)
+        .collect();
+    let full_pages: Vec<&RoutedOcrPage> = ocr_run
+        .pages
+        .iter()
+        .filter(|page| {
+            let number = page.rendered.page();
+            matches!(routes.get(&number), Some(OcrFusionRoute::FullPage))
+                && !may_keep_native.contains(&number)
+        })
+        .collect();
+    let Ok(page_count) = u32::try_from(full_pages.len()) else {
+        return RepeatedOcrSpans::default();
+    };
+    let mut spans_by_item: HashMap<crate::HeaderFooterItemKey, Vec<(u32, usize)>> = HashMap::new();
+    let mut items = Vec::new();
+    for page in full_pages {
+        let (page_items, _) = indexed_ocr_text_items(page, &HashSet::new());
+        let plain: Vec<TextItem> = page_items.iter().map(|(_, item)| item.clone()).collect();
+        let base_size =
+            crate::markdown::analysis::calculate_font_stats_from_items(&plain).most_common_size;
+        let in_tables: HashSet<usize> = crate::tables::detect_tables(&plain, base_size, false)
+            .into_iter()
+            .flat_map(|table| table.item_indices)
+            .collect();
+        for (position, (index, item)) in page_items.into_iter().enumerate() {
+            if in_tables.contains(&position) {
+                continue;
+            }
+            spans_by_item
+                .entry(crate::HeaderFooterItemKey::from(&item))
+                .or_default()
+                .push((item.page, index));
+            items.push(item);
+        }
+    }
+    let repeated = crate::repeated_header_footer_items(
+        &items,
+        &HashMap::new(),
+        &HashMap::new(),
+        page_count,
+        // As OCR Markdown conversion does: the calibrated folio bands.
+        &HashMap::new(),
+    );
+    let mut result = RepeatedOcrSpans {
+        spans: BTreeMap::new(),
+        rows: repeated.rows_by_page,
+    };
+    for key in &repeated.items {
+        for &(page, index) in spans_by_item.get(key).into_iter().flatten() {
+            result.spans.entry(page).or_default().insert(index);
+        }
+    }
+    result
 }
 
 fn image_quad_bounds(
@@ -680,11 +852,23 @@ fn image_quad_bounds(
 }
 
 fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
+    preserve_ocr_line_breaks_without(markdown, page, &HashSet::new())
+}
+
+/// [`preserve_ocr_line_breaks`] for a page whose `skip` spans (indices)
+/// were left out of the Markdown.
+fn preserve_ocr_line_breaks_without(
+    markdown: &str,
+    page: &RoutedOcrPage,
+    skip: &HashSet<usize>,
+) -> String {
     let spans: Vec<(&str, f32, f32, f32, f32)> = page
         .ocr
         .spans
         .iter()
-        .filter_map(|span| {
+        .enumerate()
+        .filter(|(index, _)| !skip.contains(index))
+        .filter_map(|(_, span)| {
             let (left, top, right, bottom) = image_quad_bounds(
                 &span.polygon.points,
                 page.rendered.width(),
@@ -1259,6 +1443,7 @@ mod tests {
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
             &routes,
+            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -1303,6 +1488,7 @@ mod tests {
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
             &routes,
+            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -1993,5 +2179,302 @@ mod tests {
     fn time_shares_preserve_batch_total() {
         assert_eq!(equal_time_shares(8, 3), vec![3, 3, 2]);
         assert_eq!(equal_time_shares(8, 0), Vec::<u64>::new());
+    }
+
+    /// A scanned A4-like page (600 x 800 pt, drawn at 300 x 400 px): an
+    /// optional `header` at the top edge, then 16 body lines unique to the
+    /// page. `header_height` is the header box in pixels (body boxes are 9).
+    fn scanned_page(page: u32, header: Option<&str>, header_height: f32) -> RoutedOcrPage {
+        let transform =
+            PageTransform::from_corners(300, 400, (0.0, 800.0), (600.0, 800.0), (0.0, 0.0))
+                .unwrap();
+        let rendered = RenderedPage::new(
+            page,
+            600.0,
+            800.0,
+            300,
+            400,
+            300,
+            RenderPixelFormat::Gray8,
+            vec![255; 120_000],
+            transform,
+        )
+        .unwrap();
+        let mut spans = Vec::new();
+        if let Some(header) = header {
+            spans.push(positioned_span(
+                header,
+                30.0,
+                12.0,
+                200.0,
+                12.0 + header_height,
+            ));
+        }
+        for line in 0..16u32 {
+            let top = 60.0 + line as f32 * 18.0;
+            spans.push(positioned_span(
+                &format!("Страница {page}, строка {line}: условия договора поставки."),
+                30.0,
+                top,
+                270.0,
+                top + 9.0,
+            ));
+        }
+        RoutedOcrPage {
+            rendered,
+            ocr: OcrPage {
+                page_number: page,
+                spans,
+                mean_confidence: Some(0.9),
+                model: ModelIdentity::new("test-ocr", "v1"),
+                processing_time_ms: 7,
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    fn fuse_scans(pages: Vec<RoutedOcrPage>, options: &OcrFusionOptions) -> FusedPages {
+        let native: Vec<PageMarkdown> = pages
+            .iter()
+            .map(|page| native(page.rendered.page() - 1, "", true))
+            .collect();
+        let count = pages.len() as u32;
+        fuse_ocr_pages(&native, &run(pages), count, options).unwrap()
+    }
+
+    fn strip_options() -> OcrFusionOptions {
+        OcrFusionOptions::new().markdown(MarkdownOptions::default())
+    }
+
+    fn pages_showing(fused: &FusedPages, text: &str) -> Vec<u32> {
+        fused
+            .pages
+            .iter()
+            .filter(|page| page.markdown.contains(text))
+            .map(|page| page.page_number)
+            .collect()
+    }
+
+    fn repeated_lines(fused: &FusedPages) -> Vec<u32> {
+        fused
+            .pages
+            .iter()
+            .map(|page| page.provenance.repeated_lines)
+            .collect()
+    }
+
+    #[test]
+    fn scan_header_repeated_exactly_stays_on_its_first_page_only() {
+        let fused = fuse_scans(
+            (1..=4)
+                .map(|page| scanned_page(page, Some("Дело № 2-123/2026"), 9.0))
+                .collect(),
+            &strip_options(),
+        );
+        assert_eq!(pages_showing(&fused, "Дело № 2-123/2026"), [1]);
+        assert_eq!(repeated_lines(&fused), [0, 1, 1, 1]);
+        for page in 1..=4u32 {
+            for line in 0..16u32 {
+                assert_eq!(
+                    pages_showing(&fused, &format!("Страница {page}, строка {line}:")),
+                    [page],
+                    "body text must survive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scan_header_whose_case_number_changes_is_kept_on_every_page() {
+        // Numbers count: a header that differs in a number is not a repeat,
+        // whether the number sits inside it or at its end.
+        let fused = fuse_scans(
+            (1..=4)
+                .map(|page| {
+                    let header = format!("Дело № 2-12{page}/2026");
+                    scanned_page(page, Some(&header), 9.0)
+                })
+                .collect(),
+            &strip_options(),
+        );
+        for page in 1..=4u32 {
+            assert_eq!(
+                pages_showing(&fused, &format!("Дело № 2-12{page}/2026")),
+                [page]
+            );
+        }
+        assert_eq!(repeated_lines(&fused), [0, 0, 0, 0]);
+
+        let fused = fuse_scans(
+            [(1, 4171), (2, 4382), (3, 4593)]
+                .into_iter()
+                .map(|(page, case)| {
+                    let header = format!("Case file number {case}");
+                    scanned_page(page, Some(&header), 9.0)
+                })
+                .collect(),
+            &strip_options(),
+        );
+        assert_eq!(pages_showing(&fused, "Case file number 4382"), [2]);
+        assert_eq!(pages_showing(&fused, "Case file number 4593"), [3]);
+        assert_eq!(repeated_lines(&fused), [0, 0, 0]);
+    }
+
+    #[test]
+    fn scan_header_with_its_page_number_still_strips_as_a_repeat() {
+        // A running header that carries the page number at its end differs
+        // only by a number that rises with the page: today's page-number
+        // tolerance, kept.
+        let fused = fuse_scans(
+            (1..=3)
+                .map(|page| {
+                    let header = format!("Annual Report of the Board {page}");
+                    scanned_page(page, Some(&header), 9.0)
+                })
+                .collect(),
+            &strip_options(),
+        );
+        assert_eq!(pages_showing(&fused, "Annual Report of the Board"), [1]);
+        assert_eq!(repeated_lines(&fused), [0, 1, 1]);
+    }
+
+    #[test]
+    fn scan_header_repeated_on_two_pages_stays_on_both() {
+        // Two pages are no repetition evidence. A shorter box set apart
+        // from the body is no evidence either on OCR text: the per-page
+        // typographic fallback for short native documents does not apply.
+        let fused = fuse_scans(
+            (1..=2)
+                .map(|page| scanned_page(page, Some("Дело № 2-123/2026"), 6.0))
+                .collect(),
+            &strip_options(),
+        );
+        assert_eq!(pages_showing(&fused, "Дело № 2-123/2026"), [1, 2]);
+        assert_eq!(repeated_lines(&fused), [0, 0]);
+    }
+
+    #[test]
+    fn scan_headers_stay_when_stripping_is_off() {
+        let options = OcrFusionOptions::new().markdown(MarkdownOptions {
+            strip_headers_footers: false,
+            ..MarkdownOptions::default()
+        });
+        let fused = fuse_scans(
+            (1..=4)
+                .map(|page| scanned_page(page, Some("Дело № 2-123/2026"), 9.0))
+                .collect(),
+            &options,
+        );
+        assert_eq!(pages_showing(&fused, "Дело № 2-123/2026"), [1, 2, 3, 4]);
+        assert_eq!(repeated_lines(&fused), [0, 0, 0, 0]);
+    }
+
+    /// A scanned page opening with a priced table: a column-header row,
+    /// then eight rows of items unique to the page, then body lines.
+    fn scanned_table_page(page: u32) -> RoutedOcrPage {
+        let mut routed = scanned_page(page, None, 9.0);
+        let mut spans = Vec::new();
+        let row = |spans: &mut Vec<OcrSpan>, top: f32, cells: [&str; 3]| {
+            for (cell, (left, right)) in
+                cells
+                    .iter()
+                    .zip([(30.0, 120.0), (150.0, 200.0), (220.0, 270.0)])
+            {
+                spans.push(positioned_span(cell, left, top, right, top + 9.0));
+            }
+        };
+        row(&mut spans, 12.0, ["Description", "Quantity", "Amount"]);
+        for line in 0..8u32 {
+            let item = format!("Item {page}-{line} cable reel");
+            let quantity = format!("{}", line + 2);
+            let amount = format!("{}.00", (page * 100 + line) * 3);
+            row(
+                &mut spans,
+                26.0 + line as f32 * 12.0,
+                [&item, &quantity, &amount],
+            );
+        }
+        for line in 0..10u32 {
+            let top = 150.0 + line as f32 * 18.0;
+            spans.push(positioned_span(
+                &format!("Sheet {page} note {line}: delivery terms apply to every item."),
+                30.0,
+                top,
+                270.0,
+                top + 9.0,
+            ));
+        }
+        routed.ocr.spans = spans;
+        routed
+    }
+
+    #[test]
+    fn a_tables_repeated_column_headers_stay_with_each_table() {
+        let fused = fuse_scans((1..=3).map(scanned_table_page).collect(), &strip_options());
+        assert_eq!(pages_showing(&fused, "Description"), [1, 2, 3]);
+        assert_eq!(pages_showing(&fused, "Quantity"), [1, 2, 3]);
+        assert_eq!(repeated_lines(&fused), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_page_that_may_keep_its_native_text_takes_no_part_in_repeats() {
+        // Page 1 has a native candidate without the header, so it may keep
+        // that instead of its OCR: it cannot hold the first occurrence, and
+        // two pages remain, too few to prove a repeat.
+        let pages: Vec<RoutedOcrPage> = (1..=3)
+            .map(|page| scanned_page(page, Some("Дело № 2-123/2026"), 9.0))
+            .collect();
+        let native: Vec<PageMarkdown> = (0..3).map(|page| native(page, "", true)).collect();
+        let candidates = BTreeMap::from([(
+            1,
+            native_candidate(
+                "Страница 1, строка 0: условия договора поставки, согласованные сторонами.\n",
+            ),
+        )]);
+        let fused = fuse_ocr_pages_adaptive(&native, &run(pages), 3, &strip_options(), &candidates)
+            .unwrap();
+        assert_eq!(pages_showing(&fused, "Дело № 2-123/2026")[1..], [2, 3]);
+        assert_eq!(repeated_lines(&fused), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_fused_page_counts_only_rows_its_content_left_out() {
+        let header = ["Дело № 2-123/2026".to_string()];
+        let footer = ["Confidential: Acme".to_string()];
+        let both = [header[0].clone(), footer[0].clone()];
+        // Native text that kept the header brings it back.
+        let shown = "Дело № 2-123/2026\n\nТекст страницы.\n";
+        assert_eq!(
+            repeated_lines_left_out(PageContentSource::Fused, shown, &[], &header),
+            0
+        );
+        assert_eq!(
+            repeated_lines_left_out(PageContentSource::Fused, "Текст.\n", &[], &header),
+            1
+        );
+        // A row removed from both sources is one row; escapes and spacing
+        // do not bring a row back.
+        assert_eq!(
+            repeated_lines_left_out(PageContentSource::Fused, "Текст.\n", &both, &header),
+            2
+        );
+        assert_eq!(
+            repeated_lines_left_out(
+                PageContentSource::Fused,
+                "Confi dential: Acme\n",
+                &footer,
+                &[]
+            ),
+            0
+        );
+        // A single source counts what it removed.
+        assert_eq!(
+            repeated_lines_left_out(PageContentSource::Native, shown, &both, &[]),
+            2
+        );
+        assert_eq!(
+            repeated_lines_left_out(PageContentSource::Ocr, shown, &both, &header),
+            1
+        );
     }
 }

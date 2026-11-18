@@ -363,6 +363,13 @@ impl RenderedPage {
         &self.pixels
     }
 
+    /// Drops the bitmap once recognition has read it, keeping the page's
+    /// size and transform for assembly; [`pixels`](Self::pixels) is empty
+    /// afterwards.
+    pub(crate) fn release_pixels(&mut self) {
+        self.pixels = Vec::new();
+    }
+
     /// Consumes the page and returns its pixel buffer.
     pub fn into_pixels(self) -> Vec<u8> {
         self.pixels
