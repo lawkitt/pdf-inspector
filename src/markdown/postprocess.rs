@@ -270,24 +270,15 @@ fn collapse_dot_leaders(text: &str) -> String {
     DOT_LEADER_RE.replace_all(text, " ... ").to_string()
 }
 
-/// Fix words broken across lines with spaces before the continuation
-/// e.g., "Limoeiro do Nort e" -> "Limoeiro do Norte"
+/// Rejoin words broken at line ends ("de-\nfendant").
+///
+/// A spaced hyphen inside a line ("party - buyer") stays as written: the
+/// spaces are in the PDF's text or were measured from real gaps, and
+/// joining them deleted dashes from prose (mdoc#952). Upstream joined
+/// every Latin "word - word" for compounds like "Limoeiro - Norte"; the
+/// fork keeps the text the page shows instead.
 fn fix_hyphenation(text: &str) -> String {
-    use once_cell::sync::Lazy;
-
-    // Fix "word - word" patterns that should be "word-word" (compound words)
-    // But be careful not to break list items (which start with "- ")
-    static SPACED_HYPHEN_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"([a-zA-ZáàâãéèêíïóôõöúçñÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ]) - ([a-zA-ZáàâãéèêíïóôõöúçñÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ])").unwrap()
-    });
-
-    let result = SPACED_HYPHEN_RE
-        .replace_all(text, |caps: &regex::Captures| {
-            format!("{}-{}", &caps[1], &caps[2])
-        })
-        .to_string();
-
-    dehyphenate_line_breaks(&result)
+    dehyphenate_line_breaks(text)
 }
 
 /// What a line-break hyphen pair should become. Policy output only — how the
@@ -664,6 +655,10 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     static PLAIN_WORD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(&format!("{WORD}{{3,}}")).unwrap());
     static HYPHENATED_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})-({WORD}{{2,}})")).unwrap());
+    // "co - op" written with spaces still says the document knows "co-op":
+    // evidence only; the spaced text itself stays as written (mdoc#952).
+    static SPACED_COMPOUND_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(&format!("({WORD}{{2,}}) - ({WORD}{{2,}})")).unwrap());
 
     // The document is its own dictionary: whole words and hyphenated
     // compounds as they appear away from line breaks. Two exclusions keep the
@@ -693,7 +688,10 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     for m in PLAIN_WORD_RE.find_iter(&scrubbed) {
         words.insert(m.as_str().to_lowercase());
     }
-    for caps in HYPHENATED_RE.captures_iter(&scrubbed) {
+    for caps in HYPHENATED_RE
+        .captures_iter(&scrubbed)
+        .chain(SPACED_COMPOUND_RE.captures_iter(&scrubbed))
+    {
         hyphenated.insert(format!(
             "{}-{}",
             caps[1].to_lowercase(),
@@ -1379,8 +1377,28 @@ mod tests {
     // --- fix_hyphenation ---
 
     #[test]
-    fn test_fix_hyphenation_spaced_hyphen() {
-        assert_eq!(fix_hyphenation("Limoeiro - Norte"), "Limoeiro-Norte");
+    fn test_fix_hyphenation_keeps_a_spaced_dash() {
+        // mdoc#952: prose dashes keep their spaces, Latin or Cyrillic.
+        assert_eq!(
+            fix_hyphenation("The parties - both of them - agree."),
+            "The parties - both of them - agree."
+        );
+        assert_eq!(fix_hyphenation("Limoeiro - Norte"), "Limoeiro - Norte");
+        assert_eq!(fix_hyphenation("São - Paulo"), "São - Paulo");
+        assert_eq!(
+            fix_hyphenation("сторона - покупатель"),
+            "сторона - покупатель"
+        );
+    }
+
+    #[test]
+    fn test_fix_hyphenation_spaced_compound_is_still_evidence() {
+        // mdoc#952 review: "co - op" stays spaced, and still keeps the
+        // hyphen of a "co- op" broken at a line end.
+        assert_eq!(
+            fix_hyphenation("The co - op met. After the co- op vote."),
+            "The co - op met. After the co-op vote."
+        );
     }
 
     #[test]
@@ -1388,19 +1406,6 @@ mod tests {
         assert_eq!(
             fix_hyphenation("- item one\n- item two"),
             "- item one\n- item two"
-        );
-    }
-
-    #[test]
-    fn test_fix_hyphenation_accented_chars() {
-        assert_eq!(fix_hyphenation("São - Paulo"), "São-Paulo");
-    }
-
-    #[test]
-    fn test_fix_hyphenation_multiple_instances() {
-        assert_eq!(
-            fix_hyphenation("one - two and three - four"),
-            "one-two and three-four"
         );
     }
 

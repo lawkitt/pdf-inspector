@@ -42,7 +42,7 @@ l
 
 **TABLE 1**
 
-**Freon<sup>®</sup>12 Saturation Properties-Temperature Table**
+**Freon<sup>®</sup>12 Saturation Properties - Temperature Table**
 
 |Temp|Pressure||Volume||Density||Enthalpy|||Entropy|Temp|
 |---|---|---|---|---|---|---|---|---|---|---|---|
