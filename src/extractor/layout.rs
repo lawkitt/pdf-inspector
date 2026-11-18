@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::PageVerticalBounds;
-use crate::text_utils::{effective_width, sort_line_items};
+use crate::text_utils::{
+    effective_width, ends_with_identifier_label, sort_line_items, MAX_UNNUMBERED_FRONT_PAGES,
+};
 use crate::types::{TextItem, TextLine};
 use log::debug;
 
@@ -1291,8 +1293,22 @@ fn mark_repeated_folio_candidates(
             let plausible_magnitude = values
                 .iter()
                 .all(|(_, value, _)| *value <= max_plausible_folio);
+            // A printed page number equals its page's index, or trails it by
+            // a few pages of unnumbered front matter; in a two-page spread it
+            // does so against twice the index. One ahead of the page is no
+            // page number: identifiers that rise one per page (4171, 4172,
+            // ...) lead it too, as does an excerpt's carried-over numbering,
+            // which then stays in the text.
+            let trails_page = |pages_per_sheet: i64| {
+                values.iter().all(|&(page, value, _)| {
+                    let offset = i64::from(value) - pages_per_sheet * i64::from(page);
+                    (-MAX_UNNUMBERED_FRONT_PAGES * pages_per_sheet..=0).contains(&offset)
+                })
+            };
+            let plausible_offset = trails_page(1) || trails_page(2);
 
-            if mostly_unique && mostly_tracks_page_order && plausible_magnitude {
+            if mostly_unique && mostly_tracks_page_order && plausible_magnitude && plausible_offset
+            {
                 for (_, _, index) in values {
                     explicit_folio[index] = true;
                 }
@@ -1552,6 +1568,10 @@ fn page_number_context_masks(
 ) -> (Vec<bool>, Vec<bool>) {
     let mut contextual = vec![false; items.len()];
     let mut explicit_folio = vec![false; items.len()];
+    // Numbers labelled as a document's own ("Invoice No." then "4", "Дело №"
+    // then "12"): never a folio, however far apart the two runs are and
+    // whatever the other pages show.
+    let mut labelled = vec![false; items.len()];
     let mut occurrences_by_signature: HashMap<String, Vec<ContextualCandidateOccurrence>> =
         HashMap::new();
     let mut indices_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -1585,6 +1605,15 @@ fn page_number_context_masks(
 
         for mut row in rows {
             row.sort_by(|&left, &right| items[left].x.total_cmp(&items[right].x));
+            for pair in row.windows(2) {
+                let (before, number) = (pair[0], pair[1]);
+                if candidate_values[number].is_some()
+                    && candidate_values[before].is_none()
+                    && ends_with_identifier_label(&items[before].text)
+                {
+                    labelled[number] = true;
+                }
+            }
             let mut start = 0;
             while start < row.len() {
                 let mut end = start + 1;
@@ -1813,6 +1842,12 @@ fn page_number_context_masks(
         document_page_count,
         &mut explicit_folio,
     );
+    for (index, labelled) in labelled.into_iter().enumerate() {
+        if labelled {
+            contextual[index] = true;
+            explicit_folio[index] = false;
+        }
+    }
 
     (contextual, explicit_folio)
 }
@@ -3690,9 +3725,119 @@ mod tests {
         assert_eq!(page_number_value(&folio_foot, &a4), Some(9));
     }
 
+    /// Four Letter pages, each with `row(page)` at y=760 (the top margin)
+    /// and body text below; the items of each row are laid out left to
+    /// right, `gap` points apart.
+    fn margin_rows(pages: u32, gap: f32, row: impl Fn(u32) -> Vec<String>) -> Vec<TextItem> {
+        let mut items = Vec::new();
+        for page in 1..=pages {
+            let mut x = 72.0;
+            for text in row(page) {
+                let item = make_item(page, x, 760.0, &text);
+                x += item.width + gap;
+                items.push(item);
+            }
+            for line in 0..10 {
+                items.push(make_item(
+                    page,
+                    72.0,
+                    600.0 - line as f32 * 14.0,
+                    &format!("Body line {line} on page {page}"),
+                ));
+            }
+        }
+        items
+    }
+
+    /// The margin row's text on each page after folio filtering.
+    fn kept_rows(items: Vec<TextItem>, pages: u32) -> Vec<String> {
+        let kept = filter_markdown_page_numbers(items, pages);
+        (1..=pages)
+            .map(|page| {
+                kept.iter()
+                    .filter(|item| item.page == page && item.y == 760.0)
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn numbers_labelled_as_identifiers_are_never_folios() {
+        // Codex on #18: "Invoice No." and its number as separate runs in the
+        // top margin. Set close (contextual, the recurrence check marked it
+        // a folio) or tab-aligned (an isolated number), it stays.
+        for gap in [6.0, 40.0] {
+            for label in [
+                "Acme Holdings Invoice No.",
+                "Acme Holdings invoice",
+                "Supply contract, Case #",
+                "Арбитражный суд, дело №",
+                "Арбитражный суд, Дело",
+                "Счёт на оплату №",
+                "Договор поставки, приложение",
+            ] {
+                let rows = kept_rows(
+                    margin_rows(4, gap, |page| vec![label.into(), page.to_string()]),
+                    4,
+                );
+                for (page, row) in (1..=4).zip(&rows) {
+                    assert_eq!(row, &format!("{label} {page}"), "gap {gap}");
+                }
+            }
+        }
+        // A page word before the number sign labels a page number.
+        let rows = kept_rows(
+            margin_rows(4, 40.0, |page| vec!["Page No.".into(), page.to_string()]),
+            4,
+        );
+        assert!(rows.iter().all(|row| row == "Page No."), "{rows:?}");
+        // So does a plain running head: its folio still goes.
+        let rows = kept_rows(
+            margin_rows(4, 40.0, |page| {
+                vec!["Acme Holdings annual report".into(), page.to_string()]
+            }),
+            4,
+        );
+        assert!(rows.iter().all(|row| row == "Acme Holdings annual report"));
+    }
+
+    #[test]
+    fn a_recurring_number_ahead_of_its_page_is_no_folio() {
+        let head = |value: u32| vec![value.to_string(), "Company report".into()];
+        // In step with the page index: a folio, removed.
+        let rows = kept_rows(margin_rows(4, 6.0, |page| head(page)), 4);
+        assert!(rows.iter().all(|row| row == "Company report"), "{rows:?}");
+        // After two unnumbered front pages (printed 1 on page 3).
+        let rows = kept_rows(
+            margin_rows(6, 6.0, |page| {
+                if page <= 2 {
+                    vec!["Front matter".into()]
+                } else {
+                    head(page - 2)
+                }
+            }),
+            6,
+        );
+        assert!(
+            rows[2..].iter().all(|row| row == "Company report"),
+            "{rows:?}"
+        );
+        // A two-page spread per sheet: printed 2, 4, 6, 8.
+        let rows = kept_rows(margin_rows(4, 6.0, |page| head(2 * page)), 4);
+        assert!(rows.iter().all(|row| row == "Company report"), "{rows:?}");
+        // Ahead of the page index, as identifiers rising one per page are
+        // (and an excerpt's carried-over numbering): kept.
+        let rows = kept_rows(margin_rows(4, 6.0, |page| head(41 + page)), 4);
+        for (page, row) in (1..=4).zip(&rows) {
+            assert_eq!(row, &format!("{} Company report", 41 + page));
+        }
+    }
+
     #[test]
     fn contextual_deep_margin_gate_uses_the_measured_bands() {
-        // A recurring "42 Company report" running head shares its baseline
+        // A recurring "1 Company report" running head shares its baseline
         // with words, so only the deep-margin gate can strip it. That gate
         // has to read the same bands as candidacy or the two disagree about
         // what a margin is. A4's top band is 769.89, the calibrated one 720,
@@ -3701,7 +3846,7 @@ mod tests {
         let running_head = |y: f32| {
             let mut items = Vec::new();
             for page in 1..=5u32 {
-                items.push(make_item(page, 72.0, y, &format!("{}", 41 + page)));
+                items.push(make_item(page, 72.0, y, &format!("{page}")));
                 items.push(make_item(page, 90.0, y, "Company report"));
                 items.push(make_item(page, 72.0, 500.0, "Body content that stays"));
             }

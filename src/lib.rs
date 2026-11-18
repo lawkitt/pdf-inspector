@@ -8114,7 +8114,7 @@ mod tests {
         for page in 1..=4 {
             for row in 0..8 {
                 let y = 20.0 + row as f32 * 8.0;
-                let mut folio = test_item(&(row * 10 + page).to_string(), 25.0, y, 12.0, 10.0);
+                let mut folio = test_item(&page.to_string(), 25.0, y, 12.0, 10.0);
                 folio.page = page;
                 let mut footer =
                     test_item(&format!("Footer row {row} summary"), 43.0, y, 470.0, 10.0);

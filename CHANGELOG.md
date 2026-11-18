@@ -90,6 +90,16 @@ version and date. Earlier releases are described in their
   keep a header that was dropped from every other page, so no copy was left
   when OCR did not run, and its repeats were counted; or its out-of-step
   number could stop the other pages' page-numbered header from repeating.
+- Page numbers removed before layout: a margin number whose neighbour on the
+  same row ends with an identifier label ("Invoice No.", "Case #", "Дело №",
+  "Счёт на оплату №", "приложение"; the list repeated headers use) is the
+  document's own number and stays, wherever it is set. Before, "Invoice No."
+  and the number 1 to 4 as separate runs in the top margin lost the number
+  on every page. "Page No." still labels a page number. A number that
+  recurs beside the same text on every page is taken for a running folio
+  only when it equals the page index or trails it by up to 10 pages (twice
+  the index on two-page spreads); one ahead of it (numbering carried over
+  from a longer document, "42 Company report" on page 1) now stays.
 - A Markdown line is removed as a page number only when the whole line is
   one ("3", "- 3 -", "Page 3", "Page 3 of 9", "3 of 9", and the Russian
   "Страница 3", "Стр. 3 из 9", "3 из 9"; a Russian label alone stays). A

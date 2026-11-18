@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::text_utils::{ends_with_identifier_label, MAX_UNNUMBERED_FRONT_PAGES};
 use crate::types::TextLine;
 
 /// Strip page-edge furniture on documents too short for repetition evidence.
@@ -286,83 +287,6 @@ fn folio_slot(collapsed: &str, leading: bool) -> Option<(String, u32)> {
     };
     Some((template, value))
 }
-
-/// Words that label the number after them as a document's own number, not
-/// a page's: "No.", "№", "#", and the kinds of document and part that carry
-/// one, in English and Russian. Compared lowercase, with closing "." and ":"
-/// removed.
-const IDENTIFIER_LABELS: [&str; 52] = [
-    "no",
-    "nº",
-    "n°",
-    "nr",
-    "num",
-    "number",
-    "#",
-    "№",
-    "id",
-    "ref",
-    "reference",
-    "invoice",
-    "case",
-    "file",
-    "order",
-    "account",
-    "contract",
-    "agreement",
-    "claim",
-    "docket",
-    "act",
-    "lot",
-    "item",
-    "exhibit",
-    "annex",
-    "appendix",
-    "schedule",
-    "attachment",
-    "chapter",
-    "section",
-    "article",
-    "clause",
-    "version",
-    "rev",
-    "счёт",
-    "счет",
-    "дело",
-    "договор",
-    "заказ",
-    "акт",
-    "номер",
-    "протокол",
-    "приказ",
-    "решение",
-    "постановление",
-    "приложение",
-    "глава",
-    "раздел",
-    "статья",
-    "пункт",
-    "лот",
-    "редакция",
-];
-
-/// Whether the text before a closing number ends with an
-/// [identifier label](IDENTIFIER_LABELS) ("Invoice No.", "Дело №", "Case").
-fn ends_with_identifier_label(rest: &str) -> bool {
-    let Some(last) = rest.split(' ').next_back() else {
-        return false;
-    };
-    let word = last.trim_end_matches(['.', ':']).to_lowercase();
-    word.ends_with('№') || word.ends_with('#') || IDENTIFIER_LABELS.contains(&word.as_str())
-}
-
-/// How far a printed page number may trail the page's index in the file:
-/// up to this many pages of unnumbered front matter (a cover, a contents
-/// page) before printed page 1. A printed number ahead of the page index
-/// (numbering carried over from a longer document) is not taken as a page
-/// number, because identifiers that rise one per page (invoice 4171, 4172,
-/// ...) lead it too; such a header stays on every page.
-const MAX_UNNUMBERED_FRONT_PAGES: i64 = 10;
 
 /// Comparison keys for repetition. Two rows repeat only when their text is
 /// the same, letters, numbers, punctuation and case included: "Case 2-123"

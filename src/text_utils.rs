@@ -6,6 +6,96 @@
 
 use crate::types::{ItemType, TextItem};
 
+/// Words that label the number after them as a document's own number, not
+/// a page's: "No.", "№", "#", and the kinds of document and part that carry
+/// one, in English and Russian. Compared lowercase, with closing "." and ":"
+/// removed.
+pub(crate) const IDENTIFIER_LABELS: [&str; 52] = [
+    "no",
+    "nº",
+    "n°",
+    "nr",
+    "num",
+    "number",
+    "#",
+    "№",
+    "id",
+    "ref",
+    "reference",
+    "invoice",
+    "case",
+    "file",
+    "order",
+    "account",
+    "contract",
+    "agreement",
+    "claim",
+    "docket",
+    "act",
+    "lot",
+    "item",
+    "exhibit",
+    "annex",
+    "appendix",
+    "schedule",
+    "attachment",
+    "chapter",
+    "section",
+    "article",
+    "clause",
+    "version",
+    "rev",
+    "счёт",
+    "счет",
+    "дело",
+    "договор",
+    "заказ",
+    "акт",
+    "номер",
+    "протокол",
+    "приказ",
+    "решение",
+    "постановление",
+    "приложение",
+    "глава",
+    "раздел",
+    "статья",
+    "пункт",
+    "лот",
+    "редакция",
+];
+
+/// Whether the text before a number ends with an
+/// [identifier label](IDENTIFIER_LABELS) ("Invoice No.", "Дело №", "Case"):
+/// the number is then a document's own, not a page's. A number sign after a
+/// page word ("Page No.", "Стр. №") still labels a page number.
+pub(crate) fn ends_with_identifier_label(before: &str) -> bool {
+    let normalize = |word: &str| word.trim_end_matches(['.', ':']).to_lowercase();
+    let mut words = before.split_whitespace().rev();
+    let Some(last) = words.next().map(normalize) else {
+        return false;
+    };
+    let identifier =
+        last.ends_with('№') || last.ends_with('#') || IDENTIFIER_LABELS.contains(&last.as_str());
+    let number_sign = matches!(
+        last.as_str(),
+        "no" | "nº" | "n°" | "nr" | "num" | "number" | "#" | "№" | "номер"
+    );
+    let after_page_word = words
+        .next()
+        .map(normalize)
+        .is_some_and(|word| matches!(word.as_str(), "page" | "стр" | "страница"));
+    identifier && !(number_sign && after_page_word)
+}
+
+/// How far a printed page number may trail the page's index in the file:
+/// up to this many pages of unnumbered front matter (a cover, a contents
+/// page) before printed page 1. A printed number ahead of the page index
+/// (numbering carried over from a longer document) is not taken as a page
+/// number, because identifiers that rise one per page (invoice 4171, 4172,
+/// ...) lead it too; such a header stays on every page.
+pub(crate) const MAX_UNNUMBERED_FRONT_PAGES: i64 = 10;
+
 /// Return whether text is an explicit page-number expression.
 ///
 /// This strict form is suitable before layout, where removing one numeric item
