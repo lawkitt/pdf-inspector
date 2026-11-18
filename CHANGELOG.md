@@ -112,6 +112,17 @@ version and date. Earlier releases are described in their
   on a dark fill: forms skipped every white-filled run, though the page's
   own text stopped being filtered by colour for exactly that reason. Such
   runs are now judged like the page's own, against what lies under them.
+- OCR no longer holds on to the working memory of the largest page it has
+  seen. The OCR engine stays loaded for the life of the process, and its
+  ONNX Runtime sessions ran with the CPU arena and memory patterns on, so
+  each session kept the buffers of its biggest page. Recognizing pages one
+  call at a time, as a resumable import does, left a process holding
+  1.2 GiB at 150 dpi and 2.2 GiB at 200 dpi on a 10-core Mac (1.7 and
+  2.9 GiB on an iPhone 17 Pro). Sessions now run without the arena and
+  without memory patterns: 0.25 and 0.54 GiB on the Mac (0.76 and
+  0.98 GiB on the iPhone), with byte-identical output. Recognition takes
+  1–4% longer on the iPhone and about 12% longer on the Mac, which now
+  gets fresh memory for every page.
 - A simple font's ToUnicode CMap of fewer than ten entries keeps its say
   for the codes the embedded program does not read. Such a CMap yields to
   the program's own reading, and its entries were then dropped, so a code
