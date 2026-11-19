@@ -820,9 +820,11 @@ fn rows_left_out(
             let ocr_shown = Reading::Ocr.of(sources.1);
             let (fused_native, fused_ocr) =
                 (Reading::Native.of(shown_native), Reading::Ocr.of(shown_ocr));
-            let key = |row: &String| Reading::Row.of(row);
-            let native: Vec<String> = native_rows.iter().map(key).collect();
-            let ocr: Vec<String> = ocr_rows.iter().map(key).collect();
+            let native: Vec<String> = native_rows
+                .iter()
+                .map(|row| Reading::NativeRow.of(row))
+                .collect();
+            let ocr: Vec<String> = ocr_rows.iter().map(|row| Reading::Ocr.of(row)).collect();
             let copies = |rows: &[String], row: &str| rows.iter().filter(|r| *r == row).count();
             // Per text, how many copies the page left out: the copies the
             // page has (a source's kept ones plus those it removed, the
@@ -860,7 +862,7 @@ fn rows_left_out(
 }
 
 /// The inline tags conversion writes around styled runs (and a removed
-/// row's text holds around a super- or subscript).
+/// native row's text holds around a super- or subscript).
 const INLINE_TAGS: [&str; 8] = [
     "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
 ];
@@ -868,12 +870,12 @@ const INLINE_TAGS: [&str; 8] = [
 /// How text is read when a row's copies are counted. Spacing never counts.
 #[derive(Clone, Copy)]
 enum Reading {
-    /// A removed row's text: without the tags its line gave a super- or
-    /// subscript; every other character is the row's own.
-    Row,
-    /// OCR Markdown, which carries no styles: exactly as written, its
-    /// asterisks, underscores, backticks, tags and backslashes its own,
-    /// but a table row's escaped pipe is a pipe.
+    /// A row native extraction removed: without the tags its line writes
+    /// around a super- or subscript; every other character is its own.
+    NativeRow,
+    /// OCR Markdown and the rows OCR removed, which carry no styles:
+    /// exactly as written, asterisks, underscores, backticks, tag-like text
+    /// and backslashes included.
     Ocr,
     /// Native Markdown, whose styled runs conversion marks with asterisks
     /// (anywhere, even inside a word) and inline tags: without those, as
@@ -883,31 +885,15 @@ enum Reading {
 
 impl Reading {
     fn of(self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        for line in text.lines() {
-            let mut line = line.to_string();
-            if !matches!(self, Reading::Ocr) {
-                for tag in INLINE_TAGS {
-                    line = line.replace(tag, "");
-                }
+        let mut text = text.to_string();
+        if !matches!(self, Reading::Ocr) {
+            for tag in INLINE_TAGS {
+                text = text.replace(tag, "");
             }
-            // Conversion escapes a pipe only in a table cell, and a table
-            // row starts and ends with a pipe.
-            let trimmed = line.trim();
-            if !matches!(self, Reading::Row)
-                && trimmed.len() > 1
-                && trimmed.starts_with('|')
-                && trimmed.ends_with('|')
-            {
-                line = line.replace("\\|", "|");
-            }
-            out.extend(
-                line.chars().filter(|c| {
-                    !c.is_whitespace() && !(matches!(self, Reading::Native) && *c == '*')
-                }),
-            );
         }
-        out
+        text.chars()
+            .filter(|c| !c.is_whitespace() && !(matches!(self, Reading::Native) && *c == '*'))
+            .collect()
     }
 }
 
@@ -4040,18 +4026,39 @@ Terms of the agreement.
                 "{native}"
             );
         }
-        // A table cell's escaped pipe is its text's pipe.
-        let header = ["Fees | Costs Schedule".to_string()];
-        let native = "| Fees \\| Costs Schedule | 2026 |\n|---|---|\n\nTerms of the agreement.\n";
-        let (fused, _) = merge_native_and_ocr(native, ocr);
+        // Codex on #25, round 5: the pipeline's tables write a cell as it
+        // is, so a backslash in an OCR table row is the cell's own: the
+        // removed row's exact copy there is a copy.
+        let ocr_table = "| Clause A\\|B applies | 2026 |\n|---|---|\n\nTerms of the agreement.\n";
+        let (fused, _) = merge_native_and_ocr(native_body, ocr_table);
         assert!(rows_left_out(
             PageContentSource::Fused,
             &fused,
-            (native, ocr),
-            &[],
-            &header
+            (native_body, ocr_table),
+            &["Clause A\\|B applies".to_string()],
+            &[]
         )
         .is_empty());
+        // An OCR row's tag-like text is its own. OCR removed the header and
+        // kept one line: a plain copy is another text, an exact copy is the
+        // header's body copy (M18); either way one copy was left out.
+        for (kept, left) in [("Status open", 1), ("Status <u>open</u>", 1)] {
+            let ocr_kept = format!("Terms of the agreement.\n\n{kept}\n");
+            let (fused, _) = merge_native_and_ocr(native_body, &ocr_kept);
+            let removed = ["Status <u>open</u>".to_string()];
+            assert_eq!(
+                rows_left_out(
+                    PageContentSource::Fused,
+                    &fused,
+                    (native_body, &ocr_kept),
+                    &[],
+                    &removed
+                )
+                .len(),
+                left,
+                "{kept}"
+            );
+        }
         // Codex on #25: in prose, OCR's backslash before a pipe is its own.
         assert_eq!(left_out("Clause A|B applies", "Clause A\\|B applies"), 1);
         // Codex on #25: a long run of marks is walked once, not again from
