@@ -330,6 +330,8 @@ fn fuse_ocr_pages_impl(
         let assembly_started = Instant::now();
         let mut warnings = Vec::new();
 
+        // The native and OCR Markdown a fused page is made of, for its count.
+        let mut fused_sources = (String::new(), String::new());
         let (markdown, source, ocr_model, ocr_confidence, ocr_ms, hosted_recommended) =
             if let Some(local) = ocr_by_page.get(&page_number) {
                 let route = routes
@@ -379,6 +381,7 @@ fn fuse_ocr_pages_impl(
                         .get(&page_number)
                         .filter(|_| native.needs_ocr)
                 {
+                    fused_sources = (candidate.markdown().to_string(), ocr_markdown.clone());
                     let choice = choose_adaptive_content(
                         candidate,
                         &ocr_markdown,
@@ -388,6 +391,7 @@ fn fuse_ocr_pages_impl(
                     warnings.push(choice.warning);
                     (choice.markdown, choice.source, choice.recommend_hosted)
                 } else {
+                    fused_sources = (native.markdown.clone(), ocr_markdown.clone());
                     let (markdown, source) =
                         ocr_page_content(&native.markdown, native.needs_ocr, ocr_markdown);
                     (markdown, source, false)
@@ -426,6 +430,7 @@ fn fuse_ocr_pages_impl(
         let repeated_lines = repeated_lines_left_out(
             source,
             &markdown,
+            (&fused_sources.0, &fused_sources.1),
             native_repeated
                 .get(&page_number)
                 .map_or(&[][..], Vec::as_slice),
@@ -776,20 +781,27 @@ struct RepeatedOcrSpans {
 fn repeated_lines_left_out(
     source: PageContentSource,
     markdown: &str,
+    sources: (&str, &str),
     native_rows: &[String],
     ocr_rows: &[String],
 ) -> u32 {
-    u32::try_from(rows_left_out(source, markdown, native_rows, ocr_rows).len()).unwrap_or(u32::MAX)
+    u32::try_from(rows_left_out(source, markdown, sources, native_rows, ocr_rows).len())
+        .unwrap_or(u32::MAX)
 }
 
 /// Rows the page's final content left out as repeats (their text): those
-/// removed from the source it kept. Fused content holds both sources, so a
-/// row removed from one counts only when the other did not bring it back
+/// removed from the source it kept. Fused content holds both sources
+/// (`sources`: the native and the OCR Markdown it was made of), so a row
+/// removed from one counts only when the other did not bring it back
 /// (whitespace and Markdown escapes aside), and a row removed from both
-/// counts once.
+/// counts once. Copies are counted, not texts: a source that removed the
+/// header and kept the same sentence in its body shows the text once, and
+/// the page left one copy out unless it shows the text more often than
+/// that (M18).
 fn rows_left_out(
     source: PageContentSource,
     markdown: &str,
+    sources: (&str, &str),
     native_rows: &[String],
     ocr_rows: &[String],
 ) -> Vec<String> {
@@ -803,17 +815,39 @@ fn rows_left_out(
                     .collect()
             };
             let shown = squeeze(markdown);
+            let (native_shown, ocr_shown) = (squeeze(sources.0), squeeze(sources.1));
             let native: Vec<String> = native_rows.iter().map(|row| squeeze(row)).collect();
-            let mut rows: Vec<(&String, String)> =
-                native_rows.iter().zip(native.iter().cloned()).collect();
-            rows.extend(
-                ocr_rows
-                    .iter()
-                    .map(|row| (row, squeeze(row)))
-                    .filter(|(_, squeezed)| !native.contains(squeezed)),
-            );
-            rows.into_iter()
-                .filter(|(_, squeezed)| !squeezed.is_empty() && !shown.contains(squeezed.as_str()))
+            let ocr: Vec<String> = ocr_rows.iter().map(|row| squeeze(row)).collect();
+            let copies = |rows: &[String], row: &str| rows.iter().filter(|r| *r == row).count();
+            // Per text, how many copies the page left out: the copies the
+            // page has (a source's kept ones plus those it removed, the
+            // larger of the two sources) less those the content shows, at
+            // most the copies a source removed.
+            let mut left_out: HashMap<&str, usize> = HashMap::new();
+            for row in native.iter().chain(&ocr) {
+                if row.is_empty() || left_out.contains_key(row.as_str()) {
+                    continue;
+                }
+                let (from_native, from_ocr) = (copies(&native, row), copies(&ocr, row));
+                let on_page = (native_shown.matches(row.as_str()).count() + from_native)
+                    .max(ocr_shown.matches(row.as_str()).count() + from_ocr);
+                let missing = on_page
+                    .saturating_sub(shown.matches(row.as_str()).count())
+                    .min(from_native.max(from_ocr));
+                left_out.insert(row, missing);
+            }
+            // The native rows first, then the OCR's, each in order.
+            native_rows
+                .iter()
+                .zip(&native)
+                .chain(ocr_rows.iter().zip(&ocr))
+                .filter(|(_, squeezed)| {
+                    left_out.get_mut(squeezed.as_str()).is_some_and(|missing| {
+                        let take = *missing > 0;
+                        *missing = missing.saturating_sub(1);
+                        take
+                    })
+                })
                 .map(|(row, _)| row.clone())
                 .collect()
         }
@@ -1313,10 +1347,17 @@ pub(crate) fn strip_repeats_in_evidence(
                 evidence.native.as_ref().map_or(("", &[][..]), |native| {
                     (native.markdown.as_str(), native.repeated_rows.as_slice())
                 });
+            let ocr_shown = ocr_markdown.clone();
             let (markdown, source) =
                 ocr_page_content(native_markdown, evidence.native.is_none(), ocr_markdown);
             let ocr_rows = repeated.rows.get(&number).map_or(&[][..], Vec::as_slice);
-            let removed_rows = rows_left_out(source, &markdown, native_rows, ocr_rows);
+            let removed_rows = rows_left_out(
+                source,
+                &markdown,
+                (native_markdown, &ocr_shown),
+                native_rows,
+                ocr_rows,
+            );
             PageWithoutRepeats {
                 page_number: number,
                 markdown,
@@ -3716,40 +3757,104 @@ mod tests {
         let header = ["Дело № 2-123/2026".to_string()];
         let footer = ["Confidential: Acme".to_string()];
         let both = [header[0].clone(), footer[0].clone()];
+        let body = "Текст.
+";
         // Native text that kept the header brings it back.
-        let shown = "Дело № 2-123/2026\n\nТекст страницы.\n";
+        let shown = "Дело № 2-123/2026
+
+Текст страницы.
+";
         assert_eq!(
-            repeated_lines_left_out(PageContentSource::Fused, shown, &[], &header),
+            repeated_lines_left_out(
+                PageContentSource::Fused,
+                shown,
+                (
+                    shown,
+                    "Текст страницы.
+"
+                ),
+                &[],
+                &header
+            ),
             0
         );
         assert_eq!(
-            repeated_lines_left_out(PageContentSource::Fused, "Текст.\n", &[], &header),
+            repeated_lines_left_out(PageContentSource::Fused, body, (body, body), &[], &header),
             1
         );
         // A row removed from both sources is one row; escapes and spacing
         // do not bring a row back.
         assert_eq!(
-            repeated_lines_left_out(PageContentSource::Fused, "Текст.\n", &both, &header),
+            repeated_lines_left_out(PageContentSource::Fused, body, (body, body), &both, &header),
             2
         );
+        let spaced = "Confi dential: Acme
+";
         assert_eq!(
-            repeated_lines_left_out(
-                PageContentSource::Fused,
-                "Confi dential: Acme\n",
-                &footer,
-                &[]
-            ),
+            repeated_lines_left_out(PageContentSource::Fused, spaced, ("", spaced), &footer, &[]),
             0
         );
         // A single source counts what it removed.
         assert_eq!(
-            repeated_lines_left_out(PageContentSource::Native, shown, &both, &[]),
+            repeated_lines_left_out(PageContentSource::Native, shown, ("", ""), &both, &[]),
             2
         );
         assert_eq!(
-            repeated_lines_left_out(PageContentSource::Ocr, shown, &both, &header),
+            repeated_lines_left_out(PageContentSource::Ocr, shown, ("", ""), &both, &header),
             1
         );
+    }
+
+    #[test]
+    fn a_fused_page_counts_a_header_whose_sentence_stays() {
+        // Codex on #24 (M18): both sources removed the header of a sparse
+        // page and kept the same sentence in its body; OCR adds a paragraph,
+        // so the page is fused. The sentence it shows is the body copy: one
+        // row was left out, not none.
+        let header = ["Please sign and return this form".to_string()];
+        let native = "Please sign and return this form
+";
+        let ocr = "Please sign and return this form
+
+A stamp: received.
+";
+        let (fused, source) = merge_native_and_ocr(native, ocr);
+        assert_eq!(source, PageContentSource::Fused);
+        let rows =
+            |sources| rows_left_out(PageContentSource::Fused, &fused, sources, &header, &header);
+        assert_eq!(rows((native, ocr)), header);
+        // Removed from the native text only, with OCR keeping both copies:
+        // the content shows the native copy, so one copy is left out.
+        let ocr_both = "Please sign and return this form
+
+Please sign and return this form
+
+A stamp: received.
+";
+        assert_eq!(
+            rows_left_out(
+                PageContentSource::Fused,
+                &fused,
+                (native, ocr_both),
+                &header,
+                &[]
+            ),
+            header
+        );
+        // Native text that kept both copies brings the row back.
+        let native_both = "Please sign and return this form
+
+Please sign and return this form
+";
+        let (fused, _) = merge_native_and_ocr(native_both, ocr);
+        assert!(rows_left_out(
+            PageContentSource::Fused,
+            &fused,
+            (native_both, ocr),
+            &[],
+            &header
+        )
+        .is_empty());
     }
 
     /// [`scanned_page`] with a `footer` at the bottom edge too.
