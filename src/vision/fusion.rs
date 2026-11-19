@@ -835,7 +835,9 @@ fn rows_left_out(
                 if row.is_empty() || left_out.contains_key(row.as_str()) {
                     continue;
                 }
-                let in_native = Reading::Native.of(row);
+                // Against native text, a row loses only asterisks: its own
+                // tag-like text stays, to match no plain native copy.
+                let in_native = row.replace('*', "");
                 let (from_native, from_ocr) = (copies(&native, row), copies(&ocr, row));
                 let on_page = (copies_in(&native_shown, &in_native) + from_native)
                     .max(copies_in(&ocr_shown, row) + from_ocr);
@@ -886,10 +888,14 @@ enum Reading {
 impl Reading {
     fn of(self, text: &str) -> String {
         let mut text = text.to_string();
-        if !matches!(self, Reading::Ocr) {
-            for tag in INLINE_TAGS {
-                text = text.replace(tag, "");
-            }
+        // A line's text writes only script tags; conversion writes all.
+        let tags: &[&str] = match self {
+            Reading::NativeRow => &INLINE_TAGS[4..],
+            Reading::Ocr => &[],
+            Reading::Native => &INLINE_TAGS,
+        };
+        for tag in tags {
+            text = text.replace(tag, "");
         }
         text.chars()
             .filter(|c| !c.is_whitespace() && !(matches!(self, Reading::Native) && *c == '*'))
@@ -4096,6 +4102,29 @@ Terms of the agreement.
         .is_empty());
         // Prose that starts with a pipe is no table row.
         assert_eq!(left_out("Clause A|B applies", "| Clause A\\|B applies"), 1);
+        // Codex on #25, round 6: a row both sources removed with literal
+        // tag text is one row; and a plain native copy is another text.
+        let tagged = ["Status <u>open</u>".to_string()];
+        let ocr_plain = "Terms of the agreement.\n\nA stamp: received.\n";
+        let (fused, _) = merge_native_and_ocr(native_body, ocr_plain);
+        let both = rows_left_out(
+            PageContentSource::Fused,
+            &fused,
+            (native_body, ocr_plain),
+            &tagged,
+            &tagged,
+        );
+        assert_eq!(both.len(), 1);
+        let native_plain = "Status open\n\nTerms of the agreement.\n";
+        let (fused, _) = merge_native_and_ocr(native_plain, ocr_plain);
+        let left = rows_left_out(
+            PageContentSource::Fused,
+            &fused,
+            (native_plain, ocr_plain),
+            &[],
+            &tagged,
+        );
+        assert_eq!(left.len(), 1);
     }
 
     #[test]
