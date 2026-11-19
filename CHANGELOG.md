@@ -107,7 +107,11 @@ version and date. Earlier releases are described in their
   even if its own page box is unknown, nor when the learned place falls
   off it; without page boxes, the heights must agree the same way. A
   protected row (beside a heading or a numbered clause) never teaches the
-  place.
+  place. Such a page loses each repeated row only once: the row closest to
+  the place goes, and the same sentence also within the 5% stays,
+  uncounted; before, both went and both counted. Of two rows equally
+  close, the one above a header's place (below a footer's) goes. A header
+  and a footer each go from the same sparse page.
 - Repeated headers and footers need at least 30% of the pages, rounded up,
   as the rule states: on 11 pages, 4 pages, not 3.
 - Repeated headers and footers: a page whose native text never reaches the

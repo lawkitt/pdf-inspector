@@ -3818,6 +3818,11 @@ mod tests {
         let mut evidence: Vec<OcrRepeatEvidence> = serde_json::from_str(&json).unwrap();
         // Any order: the pass sorts the pages.
         evidence.reverse();
+        // Each page as its own run left it: nothing to compare, nothing out.
+        let unstripped: BTreeMap<u32, String> = page_runs
+            .iter()
+            .map(|page| (page.page_number, page.markdown.clone()))
+            .collect();
         for page in strip_repeats_in_evidence(&evidence, &options.markdown).unwrap() {
             let kept = page_runs
                 .iter_mut()
@@ -3858,8 +3863,14 @@ mod tests {
             );
             assert_eq!(page.repeated_lines, whole_page.provenance.repeated_lines);
             assert_eq!(page.removed_rows.len() as u32, page.repeated_lines);
+            // A removed row is gone: the page shows its text at most as
+            // often as its own run did, less each time it was removed. An
+            // identical sentence elsewhere on the page stays (M18).
             for row in &page.removed_rows {
-                assert!(!page.markdown.contains(row.as_str()), "{row} is shown");
+                let removed = page.removed_rows.iter().filter(|r| *r == row).count();
+                let before = unstripped[&page.page_number].matches(row.as_str()).count();
+                let after = page.markdown.matches(row.as_str()).count();
+                assert!(after <= before.saturating_sub(removed), "{row} is shown");
             }
         }
         assert_eq!(
@@ -4069,6 +4080,74 @@ mod tests {
         assert_eq!(pages_showing(&whole, header), [1]);
         assert_eq!(pages_showing(&whole, "Thank you for your order"), [4]);
         assert_eq!(repeated_lines(&whole), [0, 1, 1, 1]);
+    }
+
+    /// How many times `text` stands on each page.
+    fn occurrences(fused: &FusedPages, text: &str) -> Vec<usize> {
+        fused
+            .pages
+            .iter()
+            .map(|page| page.markdown.matches(text).count())
+            .collect()
+    }
+
+    #[test]
+    fn page_runs_drop_only_the_match_closest_to_a_sparse_pages_header() {
+        // Maintainer decision on mdoc#925 (M18): sparse page 4 shows the
+        // header of pages 1-3 at its place (foot at y=758) and again 20 pt
+        // lower, inside the 31.8 pt tolerance. Only the match at the place
+        // goes and counts, in one run and across page runs; the sentence
+        // stays. Before, both went and page 4 counted 2.
+        let header = "Please sign and return this form";
+        let pages = |tall: bool| {
+            move || {
+                let mut pages: Vec<RoutedOcrPage> = (1..=3)
+                    .map(|page| scanned_page(page, Some(header), 9.0))
+                    .collect();
+                let rows = [(header, 22.0), (header, 12.0)];
+                pages.push(if tall {
+                    // Mixed sizes: 1000 pt tall, the place 42 pt below its
+                    // top as on the 800 pt pages.
+                    tall_sparse_scanned_page(4, &rows)
+                } else {
+                    sparse_scanned_page(4, &rows)
+                });
+                pages
+            }
+        };
+        for tall in [false, true] {
+            let whole = assert_page_runs_match_one_run(
+                pages(tall),
+                &scanned_natives(4),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
+            assert_eq!(occurrences(&whole, header), [1, 0, 0, 1]);
+            assert_eq!(repeated_lines(&whole), [0, 1, 1, 1]);
+        }
+    }
+
+    #[test]
+    fn page_runs_drop_a_sparse_pages_header_and_footer() {
+        // M18: one match per learned row. A sparse page holding only the
+        // header and the footer of the full pages loses and counts both.
+        let header = "Дело № 2-123/2026";
+        let footer = "Confidential: Acme";
+        let whole = assert_page_runs_match_one_run(
+            || {
+                let mut pages: Vec<RoutedOcrPage> = (1..=3)
+                    .map(|page| scanned_page_with_footer(page, header, footer))
+                    .collect();
+                pages.push(sparse_scanned_page(4, &[(header, 12.0), (footer, 380.0)]));
+                pages
+            },
+            &scanned_natives(4),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pages_showing(&whole, header), [1]);
+        assert_eq!(pages_showing(&whole, footer), [1]);
+        assert_eq!(repeated_lines(&whole), [0, 2, 2, 2]);
     }
 
     #[test]

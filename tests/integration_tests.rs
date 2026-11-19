@@ -12504,6 +12504,75 @@ fn test_a_header_sentence_in_a_sparse_pages_body_stays_and_is_not_counted() {
 
 #[cfg(feature = "ocr")]
 #[test]
+fn test_a_sparse_page_loses_only_the_header_closest_to_its_place() {
+    use lopdf::{dictionary, Document};
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    // Maintainer decision on mdoc#925 (M18): "Please sign and return this
+    // form" heads Letter pages 1-3 at y=750. Sparse page 4 shows it at the
+    // header's place and again as a body sentence 15-16 pt lower, inside the
+    // 20 pt tolerance. Only the match at the place goes and counts; the
+    // sentence stays. Before, both went and page 4 counted 2. On a Letter
+    // page 4 the place is y=750; on a Legal one, 42 pt below its top, y=966.
+    const LEGAL_BOX: [i64; 4] = [0, 0, 612, 1008];
+    let header = "Please sign and return this form";
+    let pdf = |page_4_rows: [u32; 2], page_4_box: [i64; 4]| {
+        let mut doc = Document::with_version("1.5");
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let pages_id = doc.new_object_id();
+        let mut kids = Vec::new();
+        for page in 1..=4u32 {
+            let content = if page == 4 {
+                page_4_rows
+                    .iter()
+                    .map(|y| format!("BT /F1 10 Tf 72 {y} Td ({header}) Tj ET\n"))
+                    .collect()
+            } else {
+                let mut content = format!("BT /F1 10 Tf 72 750 Td ({header}) Tj ET\n");
+                for line in 0..12u32 {
+                    content.push_str(&format!(
+                        "BT /F1 10 Tf 72 {} Td (Paragraph {line} of sheet {page}: the parties agree.) Tj ET\n",
+                        680 - 30 * line
+                    ));
+                }
+                content
+            };
+            kids.push(add_page(
+                &mut doc,
+                pages_id,
+                &content,
+                if page == 4 { page_4_box } else { LETTER_BOX },
+                None,
+                &[("F1", font_id)],
+            ));
+        }
+        finish_document(doc, pages_id, kids)
+    };
+    let lines = |page, lines| pdf_inspector::PageRepeatedLines { page, lines };
+    let counted = vec![lines(2, 1), lines(3, 1), lines(4, 1)];
+    for (rows, page_box) in [
+        ([750, 735], LETTER_BOX),
+        ([735, 750], LETTER_BOX),
+        ([966, 950], LEGAL_BOX),
+    ] {
+        let result =
+            process_pdf_with_ocr_mem(&pdf(rows, page_box), OcrPdfOptions::new()).expect("native");
+        let shown: Vec<usize> = result
+            .pages
+            .iter()
+            .map(|page| page.markdown.matches(header).count())
+            .collect();
+        assert_eq!(shown, [1, 0, 0, 1], "rows {rows:?}");
+        assert_eq!(result.repeated_lines_by_page, counted, "rows {rows:?}");
+    }
+}
+
+#[cfg(feature = "ocr")]
+#[test]
 fn test_a_sparse_page_follows_the_edge_mixed_size_pages_agree_on() {
     use lopdf::{dictionary, Document};
     use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
