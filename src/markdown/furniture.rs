@@ -730,9 +730,10 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // With frames, a place is the distance from the edge the full pages keep
     // the row at: the top or the bottom, whichever they agree on. When they
     // agree on both, the one with clearly the steadier distance (a range of
-    // at most half the other's) wins, else the nearer one: Letter pages and
-    // an A4 page with the row at one height agree on
-    // the top loosely but on the bottom exactly. Full pages of mixed sizes
+    // at most half the other's) wins, else the nearer one, the bottom when
+    // both are as near (a row exactly halfway down, as before M17): Letter
+    // pages and an A4 page with the row at one height agree on the top
+    // loosely but on the bottom exactly. Full pages of mixed sizes
     // with the row at one height may agree on neither, or on the bottom
     // only: a distance from the top averaged over them is a place no page
     // uses. The full pages whose frames are known decide the edge; it takes
@@ -813,7 +814,7 @@ pub(crate) fn strip_repeated_lines_in_frames(
                             } else if top_range != bottom_range && bottom_range * 2.0 <= top_range {
                                 false
                             } else {
-                                top_at <= bottom_at
+                                top_at < bottom_at
                             };
                         Some(if from_the_top {
                             (true, top_at)
@@ -2545,6 +2546,37 @@ mod tests {
             let result = strip_repeated_lines_in_frames(lines(696.0), 4, &frames);
             assert_eq!(header_pages(&result, header), [1]);
         }
+    }
+
+    #[test]
+    fn a_row_exactly_halfway_down_is_measured_from_the_bottom() {
+        // Codex on lawkitt/mdoc#967: Letter pages 1-3 end with a repeated
+        // row at y=396, exactly halfway down (396 pt from either edge). The
+        // pages agree on both edges equally, so neither is the nearer; as
+        // before M17, the place is measured from the bottom. On sparse Legal
+        // page 4 that is y=396, not 612 (396 pt below its top): the row at
+        // 396 goes and the one at 612 stays.
+        let footer = "Please sign and return this form";
+        let mut lines = Vec::new();
+        for page in 1..=3u32 {
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("уникальный текст страницы {page}, строка {j}, body"),
+                    10.0,
+                    page,
+                    700.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+            lines.push(make_line(footer, 10.0, page, 396.0, None));
+        }
+        lines.push(make_line(footer, 10.0, 4, 612.0, None));
+        lines.push(make_line(footer, 10.0, 4, 396.0, None));
+        let mut frames = letter_frames(3);
+        frames.insert(4, (0.0, 1008.0));
+        let result = strip_repeated_lines_in_frames(lines, 4, &frames);
+        assert_eq!(kept_at(&result, 4, footer), [612.0]);
+        assert_eq!(header_pages(&result, footer), [1, 4]);
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header` at
