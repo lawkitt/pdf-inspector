@@ -700,64 +700,83 @@ pub(crate) fn strip_repeated_lines_in_frames(
         stddev / avg_span < POSITION_TOLERANCE
     };
     // Whether `y` on `page` is where the full pages show the repeated row
-    // `key`: within the same share of the full pages' span of its mean
-    // place. A sparse page has no edge rows to judge by, so this is its only
-    // position check. With every full page's frame known, the place is the
-    // distance from the edge the full pages keep the row at: the top or the
-    // bottom, whichever they agree on (spread within the same share). When
-    // they agree on both, the one with clearly the steadier distance (half
-    // the spread or less) wins, else the nearer one: Letter pages and an A4
-    // page with the row at one height agree on the top too, loosely, but on
-    // the bottom exactly. Full pages of mixed sizes with the row at one
-    // height may agree on neither, or on the bottom only: a distance from the
-    // top averaged over them is a place no page uses. When they agree on
-    // neither edge, a sparse page loses nothing, whether or not its own frame
-    // is known. Without the sparse page's frame, or without the full pages'
-    // frames, the height.
+    // `key`. A sparse page has no edge rows to judge by, so this is its only
+    // position check. The full pages' places agree when every one is within
+    // the same share of their span of the places' mean; a sparse row then
+    // matches within that share of the mean, so it is always that close to
+    // a place some full page uses. When the places do not agree, a sparse
+    // page loses nothing.
+    //
+    // With frames, a place is the distance from the edge the full pages keep
+    // the row at: the top or the bottom, whichever they agree on. When they
+    // agree on both, the one with clearly the steadier distance (at most
+    // half the other's deviation) wins, else the nearer one: Letter pages
+    // and an A4 page with the row at one height agree on the top loosely but
+    // on the bottom exactly. Full pages of mixed sizes with the row at one
+    // height may agree on neither, or on the bottom only: a distance from
+    // the top averaged over them is a place no page uses. The full pages
+    // whose frames are known rule out both edges even when some frame, or
+    // the sparse page's own, is not known. Without every frame, the height.
     let at_learned_position = |key: &str, page: u32, y: f32| -> bool {
         let Some(seen) = placements.get(key).filter(|seen| !seen.is_empty()) else {
             return false;
         };
-        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
-        let spread = |values: &[f32]| {
-            let center = mean(values);
-            let variance =
-                values.iter().map(|v| (v - center).powi(2)).sum::<f32>() / values.len() as f32;
-            variance.sqrt()
+        let share = |distance: f32| distance / full_page_span;
+        // The places' mean, with the largest deviation from it, when every
+        // place is within the tolerance of it.
+        let agreed = |places: &[f32]| -> Option<(f32, f32)> {
+            let mean = places.iter().sum::<f32>() / places.len() as f32;
+            let deviation = places
+                .iter()
+                .map(|place| (place - mean).abs())
+                .fold(0.0, f32::max);
+            (share(deviation) < POSITION_TOLERANCE).then_some((mean, deviation))
         };
-        let agree = |spread: f32| spread / full_page_span < POSITION_TOLERANCE;
-        let close = |offset: f32| offset.abs() / full_page_span < POSITION_TOLERANCE;
-        let at_height = || {
-            let heights: Vec<f32> = seen.iter().map(|&(_, seen_y)| seen_y).collect();
-            close(y - mean(&heights))
-        };
-        let frames: Option<Vec<(f32, (f32, f32))>> = seen
+        let close = |offset: f32| share(offset.abs()) < POSITION_TOLERANCE;
+        let framed: Vec<(f32, (f32, f32))> = seen
             .iter()
-            .map(|&(seen_page, seen_y)| page_frames.get(&seen_page).map(|&f| (seen_y, f)))
+            .filter_map(|&(seen_page, seen_y)| {
+                let &(b, t) = page_frames.get(&seen_page)?;
+                (t > b).then_some((seen_y, (b, t)))
+            })
             .collect();
-        let Some(frames) = frames.filter(|frames| frames.iter().all(|(_, (b, t))| t > b)) else {
-            return at_height();
-        };
-        let from_top: Vec<f32> = frames.iter().map(|&(y, (_, t))| t - y).collect();
-        let from_bottom: Vec<f32> = frames.iter().map(|&(y, (b, _))| y - b).collect();
-        let (top_spread, bottom_spread) = (spread(&from_top), spread(&from_bottom));
-        let from_the_top = match (agree(top_spread), agree(bottom_spread)) {
-            (false, false) => return false,
-            (true, false) => true,
-            (false, true) => false,
-            (true, true) if top_spread * 2.0 < bottom_spread => true,
-            (true, true) if bottom_spread * 2.0 < top_spread => false,
-            (true, true) => mean(&from_top) <= mean(&from_bottom),
-        };
-        match page_frames.get(&page) {
-            Some(&(bottom, top)) if top > bottom => {
-                if from_the_top {
-                    close((top - y) - mean(&from_top))
-                } else {
-                    close((y - bottom) - mean(&from_bottom))
+        let edge = if framed.is_empty() {
+            None
+        } else {
+            let from_top: Vec<f32> = framed.iter().map(|&(y, (_, t))| t - y).collect();
+            let from_bottom: Vec<f32> = framed.iter().map(|&(y, (b, _))| y - b).collect();
+            match (agreed(&from_top), agreed(&from_bottom)) {
+                (None, None) => return false,
+                (Some((at, _)), None) => Some((true, at)),
+                (None, Some((at, _))) => Some((false, at)),
+                (Some((top_at, top_dev)), Some((bottom_at, bottom_dev))) => {
+                    // Deviations within 1% of the tolerance are a tie.
+                    let tie = share((top_dev - bottom_dev).abs()) < POSITION_TOLERANCE / 100.0;
+                    let from_the_top = if !tie && top_dev * 2.0 <= bottom_dev {
+                        true
+                    } else if !tie && bottom_dev * 2.0 <= top_dev {
+                        false
+                    } else {
+                        top_at <= bottom_at
+                    };
+                    Some(if from_the_top {
+                        (true, top_at)
+                    } else {
+                        (false, bottom_at)
+                    })
                 }
             }
-            _ => at_height(),
+        };
+        match (edge, page_frames.get(&page)) {
+            (Some((from_the_top, at)), Some(&(bottom, top)))
+                if framed.len() == seen.len() && top > bottom =>
+            {
+                close(if from_the_top { top - y } else { y - bottom } - at)
+            }
+            _ => {
+                let heights: Vec<f32> = seen.iter().map(|&(_, seen_y)| seen_y).collect();
+                agreed(&heights).is_some_and(|(at, _)| close(y - at))
+            }
         }
     };
 
@@ -2030,6 +2049,87 @@ mod tests {
         };
         assert_eq!(header_pages(&with_page_6(956.0), header), [1, 6]);
         assert_eq!(header_pages(&with_page_6(750.0), header), [1]);
+    }
+
+    #[test]
+    fn a_sparse_page_follows_the_steadier_edge_at_exactly_half_the_deviation() {
+        // Codex on #23: full pages 775, 790 and 805 pt tall with the header
+        // at y=745, 750 and 755: 30, 40 and 50 pt below the top (deviation
+        // 10 pt), 745 to 755 pt above the bottom (deviation 5 pt, exactly
+        // half). The bottom wins: on sparse Legal page 4 the sentence 40 pt
+        // below the top stays, and at y=750 it goes.
+        let header = "Please sign and return this form";
+        let frames: HashMap<u32, (f32, f32)> = [
+            (1, (0.0, 775.0)),
+            (2, (0.0, 790.0)),
+            (3, (0.0, 805.0)),
+            (4, (0.0, 1008.0)),
+        ]
+        .into_iter()
+        .collect();
+        let with_page_4 = |y: f32| {
+            let mut lines = headed_pages(3, |_| header.into());
+            for line in lines.iter_mut().filter(|line| line.y == 750.0) {
+                line.y = [745.0, 750.0, 755.0][line.page as usize - 1];
+            }
+            lines.push(make_line(header, 10.0, 4, y, None));
+            lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+            strip_repeated_lines_in_frames(lines, 4, &frames)
+        };
+        assert_eq!(header_pages(&with_page_4(968.0), header), [1, 4]);
+        assert_eq!(header_pages(&with_page_4(750.0), header), [1]);
+    }
+
+    #[test]
+    fn a_sparse_page_keeps_a_row_no_full_page_puts_that_close() {
+        // Codex on #23: Letter pages 1-4 and a Legal page 5 whose box starts
+        // at y=50, all with the header at y=750: 750 pt above the bottom four
+        // times and 700 pt once. Their spread is 20 pt, inside the 21.75 pt
+        // tolerance, but their mean, 740 pt, is 40 pt from page 5's place:
+        // they do not agree, and from the top (42 pt, 308 pt) neither. On
+        // sparse Legal page 6 the sentence at y=725, 25 pt from every full
+        // page's place, stays.
+        let header = "Please sign and return this form";
+        let frames: HashMap<u32, (f32, f32)> = (1..=6)
+            .map(|page| {
+                let frame = match page {
+                    5 => (50.0, 1058.0),
+                    6 => (0.0, 1008.0),
+                    _ => (0.0, 792.0),
+                };
+                (page, frame)
+            })
+            .collect();
+        let mut lines = headed_pages(5, |_| header.into());
+        lines.push(make_line(header, 10.0, 6, 725.0, None));
+        lines.push(make_line("Thank you for your order", 10.0, 6, 380.0, None));
+        let result = strip_repeated_lines_in_frames(lines, 6, &frames);
+        assert_eq!(header_pages(&result, header), [1, 6]);
+    }
+
+    #[test]
+    fn a_full_page_without_a_frame_does_not_bypass_the_edges() {
+        // Codex on #23: Letter pages 1-3 and a Legal page 4 raised by 100 pt
+        // agree on neither edge (the header at y=750 on all of them). Full
+        // page 5 has no known frame. The known frames still rule out both
+        // edges, so the sentence at y=750 on sparse page 6 stays.
+        let header = "Please sign and return this form";
+        let frames: HashMap<u32, (f32, f32)> = [1, 2, 3, 4, 6]
+            .into_iter()
+            .map(|page| {
+                let frame = if page == 4 {
+                    (100.0, 1108.0)
+                } else {
+                    (0.0, 792.0)
+                };
+                (page, frame)
+            })
+            .collect();
+        let mut lines = headed_pages(5, |_| header.into());
+        lines.push(make_line(header, 10.0, 6, 750.0, None));
+        lines.push(make_line("Thank you for your order", 10.0, 6, 380.0, None));
+        let result = strip_repeated_lines_in_frames(lines, 6, &frames);
+        assert_eq!(header_pages(&result, header), [1, 6]);
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header(page)`.

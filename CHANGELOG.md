@@ -96,12 +96,13 @@ version and date. Earlier releases are described in their
   pages' span, the tolerance their own positions must keep. The same
   sentence elsewhere on that page is body text and stays, uncounted. Before,
   it was removed and counted wherever it stood. The edge is the one the
-  full pages keep the row at a steady distance from (within the same 5%):
-  full pages of mixed sizes with the header at one height agree from the
-  bottom, not from the top. When they agree on both, the edge with clearly
-  the steadier distance (half the spread or less) wins, else the nearer
-  one; when they agree on neither, a sparse page loses nothing, even if
-  its own page box is unknown.
+  full pages keep the row at a steady distance from, every page within the
+  same 5% of the pages' mean: full pages of mixed sizes with the header at
+  one height agree from the bottom, not from the top. When they agree on
+  both, the edge with clearly the steadier distance (at most half the
+  other's deviation) wins, else the nearer one. When they agree on neither,
+  a sparse page loses nothing, even if its own page box or a full page's
+  is unknown; without page boxes, the heights must agree the same way.
 - Repeated headers and footers need at least 30% of the pages, rounded up,
   as the rule states: on 11 pages, 4 pages, not 3.
 - Repeated headers and footers: a page whose native text never reaches the
