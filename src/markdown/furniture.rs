@@ -890,10 +890,14 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // and stays. Of two rows equally close, the one beyond the place (above
     // a header's place, below a footer's) is the header or footer. A row is
     // the page's clustered row, so a split or doubled header row goes whole.
-    // Rows in protected bands are never removed and are no match.
-    // (page, key) -> (distance from the place, line y, clustered row).
+    // Rows in protected bands are never removed and are no match. A row is
+    // judged once, by its clustered baseline, so copies of a sentence in
+    // one row cannot outscore the header.
+    // (page, key) -> (distance from the place, row baseline, clustered row).
     let mut sparse_matches: HashMap<(u32, String), (f64, f32, usize)> = HashMap::new();
-    for line in &lines {
+    // The sparse-page lines within the tolerance of their row's place.
+    let mut sparse_eligible: HashSet<usize> = HashSet::new();
+    for (idx, line) in lines.iter().enumerate() {
         let Some(rows) = page_rows.get(&line.page).filter(|rows| rows.len() <= 2) else {
             continue;
         };
@@ -913,24 +917,28 @@ pub(crate) fn strip_repeated_lines_in_frames(
             Some(&(bottom, top)) if top > bottom => (f64::from(bottom) + f64::from(top)) / 2.0,
             _ => full_page_middle,
         };
-        let top_side = place >= middle;
-        let distance = (f64::from(line.y) - place).abs();
-        if !within_tolerance(distance) {
+        // Exactly halfway down is a footer's half, as the edge it is
+        // measured from is the bottom there.
+        let top_side = place > middle;
+        if !within_tolerance(f64::from(line.y) - place) {
             continue;
         }
         let Some(row) = rows.iter().position(|&py| (py - line.y).abs() < 0.1) else {
             continue;
         };
+        sparse_eligible.insert(idx);
+        let row_y = rows[row];
+        let distance = (f64::from(row_y) - place).abs();
         let best = sparse_matches
             .entry((line.page, key))
-            .or_insert((distance, line.y, row));
+            .or_insert((distance, row_y, row));
         let beyond = if top_side {
-            line.y > best.1
+            row_y > best.1
         } else {
-            line.y < best.1
+            row_y < best.1
         };
         if distance < best.0 || (distance == best.0 && beyond) {
-            *best = (distance, line.y, row);
+            *best = (distance, row_y, row);
         }
     }
 
@@ -957,9 +965,10 @@ pub(crate) fn strip_repeated_lines_in_frames(
             let row = page_rows
                 .get(&line.page)
                 .and_then(|rows| rows.iter().position(|&py| (py - line.y).abs() < 0.1));
-            let closest = sparse_matches
-                .get(&(line.page, key.clone()))
-                .is_some_and(|&(_, _, best_row)| row == Some(best_row));
+            let closest = sparse_eligible.contains(&idx)
+                && sparse_matches
+                    .get(&(line.page, key.clone()))
+                    .is_some_and(|&(_, _, best_row)| row == Some(best_row));
             if !closest {
                 continue;
             }
@@ -2574,9 +2583,19 @@ mod tests {
         lines.push(make_line(footer, 10.0, 4, 396.0, None));
         let mut frames = letter_frames(3);
         frames.insert(4, (0.0, 1008.0));
-        let result = strip_repeated_lines_in_frames(lines, 4, &frames);
+        let result = strip_repeated_lines_in_frames(lines.clone(), 4, &frames);
         assert_eq!(kept_at(&result, 4, footer), [612.0]);
         assert_eq!(header_pages(&result, footer), [1, 4]);
+        // Codex on #24: on a sparse Letter page the place is the midpoint
+        // itself, a footer's half too, so of two rows 10 pt either side the
+        // lower one goes, with or without the frames.
+        let mut lines: Vec<TextLine> = lines.into_iter().filter(|l| l.page != 4).collect();
+        lines.push(make_line(footer, 10.0, 4, 406.0, None));
+        lines.push(make_line(footer, 10.0, 4, 386.0, None));
+        for frames in [HashMap::new(), letter_frames(4)] {
+            let result = strip_repeated_lines_in_frames(lines.clone(), 4, &frames);
+            assert_eq!(kept_at(&result, 4, footer), [406.0]);
+        }
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header` at
@@ -2709,6 +2728,23 @@ mod tests {
         lines.push(make_line(header, 10.0, 5, 760.0, None));
         let result = strip_repeated_lines_in_frames(lines, 5, &frames);
         assert_eq!(kept_at(&result, 5, header), [740.0]);
+    }
+
+    #[test]
+    fn copies_in_one_row_do_not_outscore_the_header() {
+        // Codex on #24: the header 10 pt above its place, and two copies of
+        // the sentence in one row 10 pt below it (740 and 740.0625, one
+        // clustered row at 740). The rows tie, so the upper row, the header,
+        // goes; both copies stay.
+        let header = "Please sign and return this form";
+        for frames in [HashMap::new(), letter_frames(4)] {
+            let mut lines = headed_pages(3, |_| header.into());
+            lines.push(make_line(header, 10.0, 4, 760.0, None));
+            lines.push(make_line(header, 10.0, 4, 740.0, None));
+            lines.push(make_line(header, 10.0, 4, 740.0625, None));
+            let result = strip_repeated_lines_in_frames(lines, 4, &frames);
+            assert_eq!(kept_at(&result, 4, header), [740.0, 740.0625]);
+        }
     }
 
     #[test]
