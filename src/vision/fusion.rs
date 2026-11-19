@@ -797,8 +797,8 @@ fn repeated_lines_left_out(
 /// source that removed the header and kept the same sentence in its body
 /// shows the text once, and the page left one copy out unless it shows the
 /// text more often than that (M18). A copy is found as [`copies_in`]
-/// finds it: spacing and the formatting conversion adds aside, every
-/// character of the row's text, literal asterisks included.
+/// finds it: spacing and what conversion may have added aside, every
+/// character of the row's text; in OCR text, literal asterisks included.
 fn rows_left_out(
     source: PageContentSource,
     markdown: &str,
@@ -814,8 +814,11 @@ fn rows_left_out(
             // is set aside, never a character.
             let squeeze =
                 |text: &str| -> Vec<char> { text.chars().filter(|c| !c.is_whitespace()).collect() };
-            let shown = markdown_chars(markdown);
-            let (native_shown, ocr_shown) = (markdown_chars(sources.0), markdown_chars(sources.1));
+            let shown = fused_pieces(markdown, sources.0);
+            let (native_shown, ocr_shown) = (
+                markdown_pieces(sources.0, true),
+                markdown_pieces(sources.1, false),
+            );
             let native: Vec<Vec<char>> = native_rows.iter().map(|row| squeeze(row)).collect();
             let ocr: Vec<Vec<char>> = ocr_rows.iter().map(|row| squeeze(row)).collect();
             let copies = |rows: &[Vec<char>], row: &[char]| {
@@ -863,17 +866,39 @@ const INLINE_TAGS: [&str; 8] = [
     "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
 ];
 
-/// `markdown`'s characters without spacing, each marked when it may be
-/// formatting conversion added rather than the text's own: an inline tag; a
-/// backslash before ASCII punctuation (an escape); a run of asterisks at a
-/// word's edge (emphasis opens before a word and closes after one, so it is
-/// never inside a word, nor stands between spaces). An asterisk inside a
-/// word, or alone between spaces, is literal text, as are underscores and
-/// backticks: conversion never writes them as inline formatting.
-fn markdown_chars(markdown: &str) -> Vec<(char, bool)> {
+/// One piece of Markdown as a row's text is matched against it: a character
+/// of the text, marked when conversion may have added it, or an inline tag
+/// conversion writes, never part of the text.
+#[derive(Clone, Copy, PartialEq)]
+enum MarkdownPiece {
+    Char(char, bool),
+    Tag,
+}
+
+/// A fused page's Markdown as [`markdown_pieces`] reads it: the native
+/// Markdown it starts with as converted text, the OCR additions after it as
+/// OCR text. Read whole as converted text if it does not start with the
+/// native Markdown.
+fn fused_pieces(fused: &str, native: &str) -> Vec<MarkdownPiece> {
+    let native = native.trim_end_matches('\n');
+    match fused.strip_prefix(native) {
+        Some(additions) if !native.is_empty() => {
+            let mut pieces = markdown_pieces(native, true);
+            pieces.extend(markdown_pieces(additions, false));
+            pieces
+        }
+        _ => markdown_pieces(fused, true),
+    }
+}
+
+/// `markdown`'s pieces without spacing. Conversion may have added: an
+/// inline tag; a backslash before ASCII punctuation (an escape); and, in
+/// `converted` text (native Markdown, whose styled runs conversion wraps in
+/// asterisks anywhere, even inside a word), any asterisk. OCR text carries
+/// no styles, so its asterisks are its own. Underscores and backticks are
+/// always the text's own: conversion never writes them inline.
+fn markdown_pieces(markdown: &str, converted: bool) -> Vec<MarkdownPiece> {
     let chars: Vec<char> = markdown.chars().collect();
-    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
-    let space = |c: Option<char>| c.is_none_or(char::is_whitespace);
     let mut out = Vec::with_capacity(chars.len());
     let mut i = 0;
     while i < chars.len() {
@@ -884,55 +909,64 @@ fn markdown_chars(markdown: &str) -> Vec<(char, bool)> {
             let tag: Vec<char> = tag.chars().collect();
             chars[i..].starts_with(&tag)
         }) {
-            out.extend(tag.chars().map(|c| (c, true)));
+            out.push(MarkdownPiece::Tag);
             i += tag.chars().count();
-        } else if c == '\\' && chars.get(i + 1).is_some_and(char::is_ascii_punctuation) {
-            out.push((c, true));
-            i += 1;
-        } else if c == '*' {
-            let start = i;
-            while chars.get(i) == Some(&'*') {
-                i += 1;
-            }
-            let (before, after) = (
-                start.checked_sub(1).map(|p| chars[p]),
-                chars.get(i).copied(),
-            );
-            let edge = !(word(before) && word(after)) && !(space(before) && space(after));
-            out.extend((start..i).map(|_| ('*', edge)));
         } else {
-            out.push((c, false));
+            let escape = c == '\\' && chars.get(i + 1).is_some_and(char::is_ascii_punctuation);
+            out.push(MarkdownPiece::Char(c, escape || (converted && c == '*')));
             i += 1;
         }
     }
     out
 }
 
-/// How many times `row` (a row's text without spacing) stands in Markdown
-/// read by [`markdown_chars`], without overlap: every character of the row
-/// in order, with only the marks conversion may have added passed over
-/// between them. A mark the row itself holds matches as text.
-fn copies_in(markdown: &[(char, bool)], row: &[char]) -> usize {
-    let Some(&first) = row.first() else {
-        return 0;
-    };
-    let match_at = |start: usize| -> Option<usize> {
-        let (mut at, mut next) = (start, 0);
-        while next < row.len() {
-            let &(c, mark) = markdown.get(at)?;
-            if c == row[next] {
-                next += 1;
-            } else if !(mark && at > start) {
+/// How many times `row` (a row's text without spacing) stands in
+/// `markdown`, without overlap: every character of the row in order, each
+/// matching a character of the Markdown, with only what conversion may
+/// have added passed over between them. A copy starts on the row's first
+/// character.
+fn copies_in(markdown: &[MarkdownPiece], row: &[char]) -> usize {
+    // The end of the shortest copy starting at `start`, if any: the
+    // matcher's states are the row positions reached, so a mark that may be
+    // either text or conversion's is tried both ways.
+    let copy_at = |start: usize| -> Option<usize> {
+        let mut states = vec![0usize];
+        for (at, piece) in markdown.iter().enumerate().skip(start) {
+            let mut next = Vec::new();
+            for &position in &states {
+                match *piece {
+                    MarkdownPiece::Char(c, _) if c == row[position] => next.push(position + 1),
+                    _ => {}
+                }
+                let passable = match *piece {
+                    MarkdownPiece::Char(_, mark) => mark,
+                    MarkdownPiece::Tag => true,
+                };
+                if passable && at > start {
+                    next.push(position);
+                }
+            }
+            next.sort_unstable();
+            next.dedup();
+            if next.last() == Some(&row.len()) {
+                return Some(at + 1);
+            }
+            if next.is_empty() {
                 return None;
             }
-            at += 1;
+            states = next;
         }
-        Some(at)
+        None
+    };
+    let Some(&first) = row.first() else {
+        return 0;
     };
     let mut count = 0;
     let mut at = 0;
     while at < markdown.len() {
-        match (markdown[at].0 == first).then(|| match_at(at)).flatten() {
+        let starts = markdown[at] == MarkdownPiece::Char(first, false)
+            || markdown[at] == MarkdownPiece::Char(first, true);
+        match starts.then(|| copy_at(at)).flatten() {
             Some(end) => {
                 count += 1;
                 at = end;
@@ -3994,6 +4028,9 @@ mod tests {
         for (removed, added) in [
             ("Claim A*12345", "Claim A12345"),
             ("Claim A12345", "Claim A*12345"),
+            // Codex on #25: beside punctuation too.
+            ("Claim A-12345", "Claim A-*12345"),
+            ("Claim A-*12345", "Claim A-12345"),
             ("Case_File_Signature", "CaseFileSignature"),
             ("CaseFileSignature", "Case_File_Signature"),
             ("Run `make` first", "Run make first"),
@@ -4019,6 +4056,44 @@ mod tests {
             &header
         )
         .is_empty());
+        // Codex on #25: a native copy styled in part, conversion's tags and
+        // asterisks inside a word, is the row OCR left out.
+        for native in [
+            "Claim <u>unpaid</u> fees
+
+Terms of the agreement.
+",
+            "Claim <sub>unpaid</sub> fees
+
+Terms of the agreement.
+",
+            "Claim A**12345**
+
+Terms of the agreement.
+",
+            "Claim *A*12345
+
+Terms of the agreement.
+",
+        ] {
+            let header = if native.contains("fees") {
+                ["Claim unpaid fees".to_string()]
+            } else {
+                ["Claim A12345".to_string()]
+            };
+            let (fused, _) = merge_native_and_ocr(native, ocr);
+            assert!(
+                rows_left_out(
+                    PageContentSource::Fused,
+                    &fused,
+                    (native, ocr),
+                    &[],
+                    &header
+                )
+                .is_empty(),
+                "{native}"
+            );
+        }
         // A table cell's escaped pipe is its text's pipe.
         let header = ["Fees | Costs Schedule".to_string()];
         let native = "Fees \\| Costs Schedule\n\nTerms of the agreement.\n";
