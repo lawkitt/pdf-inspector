@@ -724,7 +724,8 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // the sparse page (or the learned height), must lie within its frame
     // when that is known. A row in a protected band (beside a heading or a
     // numbered clause) is body text that is never removed, so its place
-    // teaches nothing about the header's.
+    // teaches nothing about the header's, and the other places must reach
+    // the repeat threshold without it.
     let at_learned_position = |key: &str, page: u32, y: f32| -> bool {
         let seen: Vec<(u32, f32)> = placements
             .get(key)
@@ -735,12 +736,15 @@ pub(crate) fn strip_repeated_lines_in_frames(
             })
             .copied()
             .collect();
-        if seen.is_empty() {
+        // The unprotected places must still make a repeat on their own.
+        let seen_pages: HashSet<u32> = seen.iter().map(|&(seen_page, _)| seen_page).collect();
+        if (seen_pages.len() as u32) < threshold {
             return false;
         }
-        let within_tolerance = |distance: f64| {
-            distance.abs() / f64::from(full_page_span) < f64::from(POSITION_TOLERANCE)
-        };
+        // The cutoff is compared in f32, as every other position check is,
+        // so a row exactly at 5% stays as it always has.
+        let within_tolerance =
+            |distance: f64| (distance.abs() as f32) / full_page_span < POSITION_TOLERANCE;
         // The places' mean, with the largest deviation from it, when every
         // place is within the tolerance of it.
         let agreed = |places: &[f64]| -> Option<(f64, f64)> {
@@ -2422,6 +2426,50 @@ mod tests {
         };
         assert_eq!(header_pages(&with_page_5(750.0), header), [1, 4, 5]);
         assert_eq!(header_pages(&with_page_5(966.0), header), [1, 4]);
+    }
+
+    #[test]
+    fn a_protected_row_does_not_make_up_the_repeat() {
+        // Codex on #23: the header on Letter pages 1-2 and the same sentence
+        // beside a numbered clause on full Legal page 3. The protected row
+        // counts towards the three-page repeat, but the two other pages
+        // alone are no repeat, so sparse Legal page 4 loses nothing, not
+        // even the sentence 42 pt below its top.
+        let header = "Please sign and return this form";
+        let frames: HashMap<u32, (f32, f32)> = (1..=4)
+            .map(|page| (page, (0.0, if page >= 3 { 1008.0 } else { 792.0 })))
+            .collect();
+        let mut lines = headed_pages(3, |_| header.into());
+        lines.push(make_line("1. The parties agree.", 10.0, 3, 750.0, None));
+        lines.push(make_line(header, 10.0, 4, 966.0, None));
+        lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+        let result = strip_repeated_lines_in_frames(lines, 4, &frames);
+        assert!(header_pages(&result, header).contains(&4));
+    }
+
+    #[test]
+    fn a_sparse_row_exactly_at_the_cutoff_stays() {
+        // Codex on #23: with the header at y=715 over body text down to
+        // y=315, the full pages span exactly 400 pt and the tolerance is
+        // exactly 20 pt. A sparse row 20 pt from the learned place is not
+        // within it, with or without frames; 19 pt is.
+        let header = "Please sign and return this form";
+        let lines = |y: f32| {
+            let mut lines = headed_pages(3, |_| header.into());
+            for line in lines.iter_mut().filter(|line| line.y == 750.0) {
+                line.y = 715.0;
+            }
+            lines.push(make_line(header, 10.0, 4, y, None));
+            lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+            lines
+        };
+        let frames: HashMap<u32, (f32, f32)> = (1..=4).map(|page| (page, (0.0, 792.0))).collect();
+        for frames in [HashMap::new(), frames] {
+            let result = strip_repeated_lines_in_frames(lines(695.0), 4, &frames);
+            assert_eq!(header_pages(&result, header), [1, 4]);
+            let result = strip_repeated_lines_in_frames(lines(696.0), 4, &frames);
+            assert_eq!(header_pages(&result, header), [1]);
+        }
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header(page)`.
