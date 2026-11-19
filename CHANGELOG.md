@@ -99,8 +99,9 @@ version and date. Earlier releases are described in their
   full pages keep the row at a steady distance from, every page within the
   same 5% of the pages' mean: full pages of mixed sizes with the header at
   one height agree from the bottom, not from the top. When they agree on
-  both, the edge with clearly the steadier distance (at most half the
-  other's deviation) wins, else the nearer one. The full pages whose page
+  both, the edge with clearly the steadier distance (a range of at most
+  half the other's, compared exactly) wins, else the nearer one. The full
+  pages whose page
   boxes are known decide the edge, at least two of them. When they agree
   on neither, or only one page box is known, a sparse page loses nothing,
   even if its own page box is unknown, nor when the learned place falls

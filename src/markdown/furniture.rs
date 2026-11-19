@@ -709,9 +709,9 @@ pub(crate) fn strip_repeated_lines_in_frames(
     //
     // With frames, a place is the distance from the edge the full pages keep
     // the row at: the top or the bottom, whichever they agree on. When they
-    // agree on both, the one with clearly the steadier distance (at most
-    // half the other's deviation) wins, else (equal deviations) the nearer
-    // one: Letter pages and an A4 page with the row at one height agree on
+    // agree on both, the one with clearly the steadier distance (a range of
+    // at most half the other's) wins, else the nearer one: Letter pages and
+    // an A4 page with the row at one height agree on
     // the top loosely but on the bottom exactly. Full pages of mixed sizes
     // with the row at one height may agree on neither, or on the bottom
     // only: a distance from the top averaged over them is a place no page
@@ -719,10 +719,10 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // two of them, since one page agrees with itself on both edges, and with
     // only one a sparse page loses nothing. Without the sparse page's own
     // frame, or without any full page's, the height. The statistics are in
-    // f64, and identical places deviate by exactly zero, so rounding cannot
-    // make one edge look steadier than the other; an exactly steady edge
-    // beats one that moves at all. The learned place, projected onto the
-    // sparse page, must lie within its frame.
+    // f64, and the ranges compared are exact, so rounding cannot make one
+    // edge look steadier than the other. The learned place, projected onto
+    // the sparse page (or the learned height), must lie within its frame
+    // when that is known.
     let at_learned_position = |key: &str, page: u32, y: f32| -> bool {
         let Some(seen) = placements.get(key).filter(|seen| !seen.is_empty()) else {
             return false;
@@ -763,23 +763,28 @@ pub(crate) fn strip_repeated_lines_in_frames(
                     (None, None) => return false,
                     (Some((at, _)), None) => Some((true, at)),
                     (None, Some((at, _))) => Some((false, at)),
-                    (Some((top_at, top_dev)), Some((bottom_at, bottom_dev))) => {
-                        // An exactly steady edge beats one that moves at
-                        // all; otherwise deviations equal up to f64 noise
-                        // tie, and "at most half" allows the same noise.
-                        const NOISE: f64 = 1e-6;
-                        let tie = (top_dev - bottom_dev).abs() < NOISE;
-                        let from_the_top = if top_dev == 0.0 && bottom_dev > 0.0 {
-                            true
-                        } else if bottom_dev == 0.0 && top_dev > 0.0 {
-                            false
-                        } else if !tie && top_dev * 2.0 <= bottom_dev + NOISE {
-                            true
-                        } else if !tie && bottom_dev * 2.0 <= top_dev + NOISE {
-                            false
-                        } else {
-                            top_at <= bottom_at
+                    (Some((top_at, _)), Some((bottom_at, _))) => {
+                        // Steadiness is the range (largest minus smallest
+                        // distance): exact for distances made from f32
+                        // coordinates, so no rounding can tip it, and equal
+                        // ranges (same-size pages) tie.
+                        let range = |distances: &[f64]| {
+                            let (low, high) = distances
+                                .iter()
+                                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), &d| {
+                                    (low.min(d), high.max(d))
+                                });
+                            high - low
                         };
+                        let (top_range, bottom_range) = (range(&from_top), range(&from_bottom));
+                        let from_the_top =
+                            if top_range != bottom_range && top_range * 2.0 <= bottom_range {
+                                true
+                            } else if top_range != bottom_range && bottom_range * 2.0 <= top_range {
+                                false
+                            } else {
+                                top_at <= bottom_at
+                            };
                         Some(if from_the_top {
                             (true, top_at)
                         } else {
@@ -797,9 +802,15 @@ pub(crate) fn strip_repeated_lines_in_frames(
                 let place = if from_the_top { top - at } else { bottom + at };
                 (bottom..=top).contains(&place) && within_tolerance(y - place)
             }
-            _ => {
+            (_, frame) => {
                 let heights: Vec<f64> = seen.iter().map(|&(_, seen_y)| f64::from(seen_y)).collect();
-                agreed(&heights).is_some_and(|(at, _)| within_tolerance(y - at))
+                // A known frame still bounds the learned height.
+                let on_the_page = |at: f64| {
+                    frame.is_none_or(|&(bottom, top)| {
+                        top <= bottom || (f64::from(bottom)..=f64::from(top)).contains(&at)
+                    })
+                };
+                agreed(&heights).is_some_and(|(at, _)| on_the_page(at) && within_tolerance(y - at))
             }
         }
     };
@@ -2331,6 +2342,53 @@ mod tests {
         lines.push(make_line("Thank you for your order", 10.0, 5, 380.0, None));
         let result = strip_repeated_lines_in_frames(lines, 5, &frames);
         assert_eq!(header_pages(&result, header), [1, 5]);
+    }
+
+    #[test]
+    fn a_learned_height_off_the_sparse_page_removes_nothing() {
+        // Codex on #23: the full pages' frames are unknown, so the height is
+        // learned (y=750); sparse page 4's frame is known and only 740 pt
+        // tall, so that height is off the page: the sentence at y=730 stays.
+        let header = "Please sign and return this form";
+        let frames: HashMap<u32, (f32, f32)> = [(4, (0.0, 740.0))].into_iter().collect();
+        let mut lines = headed_pages(3, |_| header.into());
+        lines.push(make_line(header, 10.0, 4, 730.0, None));
+        lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+        let result = strip_repeated_lines_in_frames(lines, 4, &frames);
+        assert_eq!(header_pages(&result, header), [1, 4]);
+    }
+
+    #[test]
+    fn the_steadier_edge_is_judged_exactly() {
+        // Codex on #23: frames from -792 to tops 0, 0 and 2^-19 with the
+        // header at y=-8, -8 and -8 + 2^-21. The bottom distances' range
+        // (2^-21) is a third of the top's (3 * 2^-21), far below any fixed
+        // noise threshold. The bottom wins: on sparse Legal page 4 the
+        // sentence 8 pt below the top stays, and at y=784 it goes.
+        let header = "Please sign and return this form";
+        let tiny = 2f32.powi(-21);
+        let frames: HashMap<u32, (f32, f32)> = [
+            (1, (-792.0, 0.0)),
+            (2, (-792.0, 0.0)),
+            (3, (-792.0, 4.0 * tiny)),
+            (4, (0.0, 1008.0)),
+        ]
+        .into_iter()
+        .collect();
+        let with_page_4 = |y: f32| {
+            let mut lines = headed_pages(3, |_| header.into());
+            for line in &mut lines {
+                line.y -= 758.0;
+                if line.page == 3 && line.y == -8.0 {
+                    line.y += tiny;
+                }
+            }
+            lines.push(make_line(header, 10.0, 4, y, None));
+            lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+            strip_repeated_lines_in_frames(lines, 4, &frames)
+        };
+        assert_eq!(header_pages(&with_page_4(1000.0), header), [1, 4]);
+        assert_eq!(header_pages(&with_page_4(784.0), header), [1]);
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header(page)`.
