@@ -792,12 +792,13 @@ fn repeated_lines_left_out(
 /// Rows the page's final content left out as repeats (their text): those
 /// removed from the source it kept. Fused content holds both sources
 /// (`sources`: the native and the OCR Markdown it was made of), so a row
-/// removed from one counts only when the other did not bring it back
-/// (whitespace and Markdown escapes aside), and a row removed from both
-/// counts once. Copies are counted, not texts: a source that removed the
-/// header and kept the same sentence in its body shows the text once, and
-/// the page left one copy out unless it shows the text more often than
-/// that (M18).
+/// removed from one counts only when the other did not bring it back, and
+/// a row removed from both counts once. Copies are counted, not texts: a
+/// source that removed the header and kept the same sentence in its body
+/// shows the text once, and the page left one copy out unless it shows the
+/// text more often than that (M18). A copy is found as [`copies_in`]
+/// finds it: spacing and the formatting conversion adds aside, every
+/// character of the row's text, literal asterisks included.
 fn rows_left_out(
     source: PageContentSource,
     markdown: &str,
@@ -809,44 +810,31 @@ fn rows_left_out(
         PageContentSource::Native => native_rows.to_vec(),
         PageContentSource::Ocr => ocr_rows.to_vec(),
         PageContentSource::Fused => {
-            // No spacing, escapes or emphasis asterisks, on both sides.
-            let squeeze = |text: &str| -> String {
-                text.chars()
-                    .filter(|c| !c.is_whitespace() && !matches!(c, '\\' | '*'))
-                    .collect()
+            // A row's own text, as extraction or OCR gave it: only spacing
+            // is set aside, never a character.
+            let squeeze =
+                |text: &str| -> Vec<char> { text.chars().filter(|c| !c.is_whitespace()).collect() };
+            let shown = markdown_chars(markdown);
+            let (native_shown, ocr_shown) = (markdown_chars(sources.0), markdown_chars(sources.1));
+            let native: Vec<Vec<char>> = native_rows.iter().map(|row| squeeze(row)).collect();
+            let ocr: Vec<Vec<char>> = ocr_rows.iter().map(|row| squeeze(row)).collect();
+            let copies = |rows: &[Vec<char>], row: &[char]| {
+                rows.iter().filter(|r| r.as_slice() == row).count()
             };
-            // The Markdown's visible text: also without the inline tags
-            // Markdown conversion writes, so a row and its formatted copy
-            // compare alike. Underscores and backticks are the text's own:
-            // conversion marks emphasis with asterisks only.
-            let visible = |markdown: &str| -> String {
-                let mut text = markdown.to_string();
-                for tag in [
-                    "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
-                ] {
-                    text = text.replace(tag, "");
-                }
-                squeeze(&text)
-            };
-            let shown = visible(markdown);
-            let (native_shown, ocr_shown) = (visible(sources.0), visible(sources.1));
-            let native: Vec<String> = native_rows.iter().map(|row| squeeze(row)).collect();
-            let ocr: Vec<String> = ocr_rows.iter().map(|row| squeeze(row)).collect();
-            let copies = |rows: &[String], row: &str| rows.iter().filter(|r| *r == row).count();
             // Per text, how many copies the page left out: the copies the
             // page has (a source's kept ones plus those it removed, the
             // larger of the two sources) less those the content shows, at
             // most the copies a source removed.
-            let mut left_out: HashMap<&str, usize> = HashMap::new();
+            let mut left_out: HashMap<&[char], usize> = HashMap::new();
             for row in native.iter().chain(&ocr) {
-                if row.is_empty() || left_out.contains_key(row.as_str()) {
+                if row.is_empty() || left_out.contains_key(row.as_slice()) {
                     continue;
                 }
                 let (from_native, from_ocr) = (copies(&native, row), copies(&ocr, row));
-                let on_page = (native_shown.matches(row.as_str()).count() + from_native)
-                    .max(ocr_shown.matches(row.as_str()).count() + from_ocr);
+                let on_page = (copies_in(&native_shown, row) + from_native)
+                    .max(copies_in(&ocr_shown, row) + from_ocr);
                 let missing = on_page
-                    .saturating_sub(shown.matches(row.as_str()).count())
+                    .saturating_sub(copies_in(&shown, row))
                     .min(from_native.max(from_ocr));
                 left_out.insert(row, missing);
             }
@@ -856,16 +844,103 @@ fn rows_left_out(
                 .zip(&native)
                 .chain(ocr_rows.iter().zip(&ocr))
                 .filter(|(_, squeezed)| {
-                    left_out.get_mut(squeezed.as_str()).is_some_and(|missing| {
-                        let take = *missing > 0;
-                        *missing = missing.saturating_sub(1);
-                        take
-                    })
+                    left_out
+                        .get_mut(squeezed.as_slice())
+                        .is_some_and(|missing| {
+                            let take = *missing > 0;
+                            *missing = missing.saturating_sub(1);
+                            take
+                        })
                 })
                 .map(|(row, _)| row.clone())
                 .collect()
         }
     }
+}
+
+/// The inline tags Markdown conversion writes around styled runs.
+const INLINE_TAGS: [&str; 8] = [
+    "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
+];
+
+/// `markdown`'s characters without spacing, each marked when it may be
+/// formatting conversion added rather than the text's own: an inline tag; a
+/// backslash before ASCII punctuation (an escape); a run of asterisks at a
+/// word's edge (emphasis opens before a word and closes after one, so it is
+/// never inside a word, nor stands between spaces). An asterisk inside a
+/// word, or alone between spaces, is literal text, as are underscores and
+/// backticks: conversion never writes them as inline formatting.
+fn markdown_chars(markdown: &str) -> Vec<(char, bool)> {
+    let chars: Vec<char> = markdown.chars().collect();
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let space = |c: Option<char>| c.is_none_or(char::is_whitespace);
+    let mut out = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if let Some(tag) = INLINE_TAGS.iter().find(|tag| {
+            let tag: Vec<char> = tag.chars().collect();
+            chars[i..].starts_with(&tag)
+        }) {
+            out.extend(tag.chars().map(|c| (c, true)));
+            i += tag.chars().count();
+        } else if c == '\\' && chars.get(i + 1).is_some_and(char::is_ascii_punctuation) {
+            out.push((c, true));
+            i += 1;
+        } else if c == '*' {
+            let start = i;
+            while chars.get(i) == Some(&'*') {
+                i += 1;
+            }
+            let (before, after) = (
+                start.checked_sub(1).map(|p| chars[p]),
+                chars.get(i).copied(),
+            );
+            let edge = !(word(before) && word(after)) && !(space(before) && space(after));
+            out.extend((start..i).map(|_| ('*', edge)));
+        } else {
+            out.push((c, false));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// How many times `row` (a row's text without spacing) stands in Markdown
+/// read by [`markdown_chars`], without overlap: every character of the row
+/// in order, with only the marks conversion may have added passed over
+/// between them. A mark the row itself holds matches as text.
+fn copies_in(markdown: &[(char, bool)], row: &[char]) -> usize {
+    let Some(&first) = row.first() else {
+        return 0;
+    };
+    let match_at = |start: usize| -> Option<usize> {
+        let (mut at, mut next) = (start, 0);
+        while next < row.len() {
+            let &(c, mark) = markdown.get(at)?;
+            if c == row[next] {
+                next += 1;
+            } else if !(mark && at > start) {
+                return None;
+            }
+            at += 1;
+        }
+        Some(at)
+    };
+    let mut count = 0;
+    let mut at = 0;
+    while at < markdown.len() {
+        match (markdown[at].0 == first).then(|| match_at(at)).flatten() {
+            Some(end) => {
+                count += 1;
+                at = end;
+            }
+            None => at += 1,
+        }
+    }
+    count
 }
 
 /// Finds running headers and footers in full-page OCR by the native
@@ -3893,6 +3968,103 @@ mod tests {
             ),
             identifier
         );
+    }
+
+    #[test]
+    fn a_fused_page_keeps_literal_marks_apart() {
+        // M19 (Codex on mdoc#969): only formatting conversion adds is passed
+        // over; a row's own asterisks, underscores and backticks count.
+        let stamp = |text: &str| format!("Terms of the agreement.\n\n{text}\n");
+        let native_body = "Terms of the agreement.\n";
+        let left_out = |removed: &str, added: &str| {
+            let ocr = stamp(added);
+            let (fused, source) = merge_native_and_ocr(native_body, &ocr);
+            assert_eq!(source, PageContentSource::Fused);
+            rows_left_out(
+                PageContentSource::Fused,
+                &fused,
+                (native_body, &ocr),
+                &[removed.to_string()],
+                &[],
+            )
+            .len()
+        };
+        // A distinct identifier OCR adds never brings a removed one back,
+        // whichever holds the mark.
+        for (removed, added) in [
+            ("Claim A*12345", "Claim A12345"),
+            ("Claim A12345", "Claim A*12345"),
+            ("Case_File_Signature", "CaseFileSignature"),
+            ("CaseFileSignature", "Case_File_Signature"),
+            ("Run `make` first", "Run make first"),
+            ("Run make first", "Run `make` first"),
+        ] {
+            assert_eq!(left_out(removed, added), 1, "{removed} / {added}");
+        }
+        // The same text does, marks and all.
+        for row in ["Claim A*12345", "Case_File_Signature", "Run `make` first"] {
+            assert_eq!(left_out(row, row), 0, "{row}");
+        }
+        // Emphasis around a row with a literal asterisk is conversion's: the
+        // bold native copy is the row.
+        let header = ["Claim A*12345".to_string()];
+        let native = "**Claim A*12345**\n\nTerms of the agreement.\n";
+        let ocr = "Terms of the agreement.\n\nA stamp: received.\n";
+        let (fused, _) = merge_native_and_ocr(native, ocr);
+        assert!(rows_left_out(
+            PageContentSource::Fused,
+            &fused,
+            (native, ocr),
+            &[],
+            &header
+        )
+        .is_empty());
+        // A table cell's escaped pipe is its text's pipe.
+        let header = ["Fees | Costs Schedule".to_string()];
+        let native = "Fees \\| Costs Schedule\n\nTerms of the agreement.\n";
+        let (fused, _) = merge_native_and_ocr(native, ocr);
+        assert!(rows_left_out(
+            PageContentSource::Fused,
+            &fused,
+            (native, ocr),
+            &[],
+            &header
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn page_runs_keep_a_literal_asterisk_apart() {
+        // M19 (Codex on mdoc#969): page 2 keeps its native text beside its
+        // OCR. Native extraction left out "Claim A*12345" as a repeat; the
+        // OCR adds a stamp "Claim A12345", another identifier. The stamp
+        // does not bring the row back: page 2 counts it beside the header
+        // its OCR lost, in one run and across page runs.
+        let header = "Дело № 2-123/2026";
+        let pages = || {
+            (1..=4)
+                .map(|page| {
+                    let mut scanned = scanned_page(page, Some(header), 9.0);
+                    if page == 2 {
+                        scanned.ocr.spans.push(positioned_span(
+                            "Claim A12345",
+                            30.0,
+                            350.0,
+                            120.0,
+                            359.0,
+                        ));
+                    }
+                    scanned
+                })
+                .collect()
+        };
+        let mut natives = scanned_natives(4);
+        natives[1] = native(1, "Native text of page two, set in its own words.\n", false);
+        let native_repeated = BTreeMap::from([(2, vec!["Claim A*12345".to_string()])]);
+        let whole =
+            assert_page_runs_match_one_run(pages, &natives, &BTreeMap::new(), &native_repeated);
+        assert_eq!(whole.pages[1].provenance.source, PageContentSource::Fused);
+        assert_eq!(repeated_lines(&whole), [0, 2, 1, 1]);
     }
 
     /// [`scanned_page`] with a `footer` at the bottom edge too.

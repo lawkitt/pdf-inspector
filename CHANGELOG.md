@@ -112,7 +112,11 @@ version and date. Earlier releases are described in their
   the place goes, and the same sentence also within the 5% stays,
   uncounted; before, both went and both counted. Of two rows equally
   close, the one above a header's place (below a footer's) goes. A header
-  and a footer each go from the same sparse page.
+  and a footer each go from the same sparse page. An OCR page fused with
+  native text counts a removed row by its copies, its own characters
+  included: only formatting conversion adds (emphasis asterisks at a word's
+  edge, inline tags, escapes) is passed over, so "Claim A12345" added by OCR
+  is not the removed "Claim A*12345".
 - Repeated headers and footers need at least 30% of the pages, rounded up,
   as the rule states: on 11 pages, 4 pages, not 3.
 - Repeated headers and footers: a page whose native text never reaches the
