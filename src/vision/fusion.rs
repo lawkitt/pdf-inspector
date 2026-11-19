@@ -796,9 +796,9 @@ fn repeated_lines_left_out(
 /// a row removed from both counts once. Copies are counted, not texts: a
 /// source that removed the header and kept the same sentence in its body
 /// shows the text once, and the page left one copy out unless it shows the
-/// text more often than that (M18). A copy is found as [`copies_in`]
-/// finds it: spacing and what conversion may have added aside, every
-/// character of the row's text; in OCR text, literal asterisks included.
+/// text more often than that (M18). Text is compared as [`Reading`]
+/// gives it: OCR text exactly, literal asterisks included; native text
+/// without asterisks, which conversion writes for styled runs.
 fn rows_left_out(
     source: PageContentSource,
     markdown: &str,
@@ -810,35 +810,35 @@ fn rows_left_out(
         PageContentSource::Native => native_rows.to_vec(),
         PageContentSource::Ocr => ocr_rows.to_vec(),
         PageContentSource::Fused => {
-            // A row's own text, as extraction or OCR gave it: only spacing
-            // is set aside, never a character.
-            let squeeze =
-                |text: &str| -> Vec<char> { text.chars().filter(|c| !c.is_whitespace()).collect() };
-            let shown = fused_pieces(markdown, sources.0);
-            let (native_shown, ocr_shown) = (
-                markdown_pieces(sources.0, true),
-                markdown_pieces(sources.1, false),
-            );
-            let native: Vec<Vec<char>> = native_rows.iter().map(|row| squeeze(row)).collect();
-            let ocr: Vec<Vec<char>> = ocr_rows.iter().map(|row| squeeze(row)).collect();
-            let copies = |rows: &[Vec<char>], row: &[char]| {
-                rows.iter().filter(|r| r.as_slice() == row).count()
+            // A fused page is its native Markdown followed by OCR additions.
+            let native_part = sources.0.trim_end_matches('\n');
+            let (shown_native, shown_ocr) = match markdown.strip_prefix(native_part) {
+                Some(additions) => (native_part, additions),
+                None => (markdown, ""),
             };
+            let native_shown = Reading::Native.of(sources.0);
+            let ocr_shown = Reading::Ocr.of(sources.1);
+            let (fused_native, fused_ocr) =
+                (Reading::Native.of(shown_native), Reading::Ocr.of(shown_ocr));
+            let key = |row: &String| Reading::Row.of(row);
+            let native: Vec<String> = native_rows.iter().map(key).collect();
+            let ocr: Vec<String> = ocr_rows.iter().map(key).collect();
+            let copies = |rows: &[String], row: &str| rows.iter().filter(|r| *r == row).count();
             // Per text, how many copies the page left out: the copies the
             // page has (a source's kept ones plus those it removed, the
             // larger of the two sources) less those the content shows, at
             // most the copies a source removed.
-            let mut left_out: HashMap<&[char], usize> = HashMap::new();
+            let mut left_out: HashMap<&str, usize> = HashMap::new();
             for row in native.iter().chain(&ocr) {
-                if row.is_empty() || left_out.contains_key(row.as_slice()) {
+                if row.is_empty() || left_out.contains_key(row.as_str()) {
                     continue;
                 }
+                let in_native = Reading::Native.of(row);
                 let (from_native, from_ocr) = (copies(&native, row), copies(&ocr, row));
-                let on_page = (copies_in(&native_shown, row) + from_native)
+                let on_page = (copies_in(&native_shown, &in_native) + from_native)
                     .max(copies_in(&ocr_shown, row) + from_ocr);
-                let missing = on_page
-                    .saturating_sub(copies_in(&shown, row))
-                    .min(from_native.max(from_ocr));
+                let shown = copies_in(&fused_native, &in_native) + copies_in(&fused_ocr, row);
+                let missing = on_page.saturating_sub(shown).min(from_native.max(from_ocr));
                 left_out.insert(row, missing);
             }
             // The native rows first, then the OCR's, each in order.
@@ -846,14 +846,12 @@ fn rows_left_out(
                 .iter()
                 .zip(&native)
                 .chain(ocr_rows.iter().zip(&ocr))
-                .filter(|(_, squeezed)| {
-                    left_out
-                        .get_mut(squeezed.as_slice())
-                        .is_some_and(|missing| {
-                            let take = *missing > 0;
-                            *missing = missing.saturating_sub(1);
-                            take
-                        })
+                .filter(|(_, key)| {
+                    left_out.get_mut(key.as_str()).is_some_and(|missing| {
+                        let take = *missing > 0;
+                        *missing = missing.saturating_sub(1);
+                        take
+                    })
                 })
                 .map(|(row, _)| row.clone())
                 .collect()
@@ -861,137 +859,65 @@ fn rows_left_out(
     }
 }
 
-/// The inline tags Markdown conversion writes around styled runs.
+/// The inline tags conversion writes around styled runs (and a removed
+/// row's text holds around a super- or subscript).
 const INLINE_TAGS: [&str; 8] = [
     "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
 ];
 
-/// One piece of Markdown as a row's text is matched against it: a character
-/// of the text, marked when conversion may have added it, or an inline tag
-/// conversion writes, never part of the text.
-#[derive(Clone, Copy, PartialEq)]
-enum MarkdownPiece {
-    Char(char, bool),
-    Tag,
+/// How text is read when a row's copies are counted. Spacing never counts.
+#[derive(Clone, Copy)]
+enum Reading {
+    /// A removed row's text: without the tags its line gave a super- or
+    /// subscript; every other character is the row's own.
+    Row,
+    /// OCR Markdown, which carries no styles: exactly as written, its
+    /// asterisks, underscores, backticks, tags and backslashes its own,
+    /// but a table row's escaped pipe is a pipe.
+    Ocr,
+    /// Native Markdown, whose styled runs conversion marks with asterisks
+    /// (anywhere, even inside a word) and inline tags: without those, as
+    /// literal asterisks there can't be told from conversion's.
+    Native,
 }
 
-/// A fused page's Markdown as [`markdown_pieces`] reads it: the native
-/// Markdown it starts with as converted text, the OCR additions after it as
-/// OCR text. Read whole as converted text if it does not start with the
-/// native Markdown.
-fn fused_pieces(fused: &str, native: &str) -> Vec<MarkdownPiece> {
-    let native = native.trim_end_matches('\n');
-    match fused.strip_prefix(native) {
-        Some(additions) if !native.is_empty() => {
-            let mut pieces = markdown_pieces(native, true);
-            pieces.extend(markdown_pieces(additions, false));
-            pieces
-        }
-        _ => markdown_pieces(fused, true),
-    }
-}
-
-/// `markdown`'s pieces without spacing. Conversion may have added a
-/// backslash before a pipe in a table row (a cell's escape, the only one it
-/// writes) and, in `converted` text (native Markdown), the marks of styled
-/// runs: inline tags, and asterisks anywhere, even inside a word. OCR text
-/// carries no styles, so its asterisks, tags and prose backslashes are its
-/// own. Underscores and backticks are always the text's own: conversion
-/// never writes them inline.
-fn markdown_pieces(markdown: &str, converted: bool) -> Vec<MarkdownPiece> {
-    let chars: Vec<char> = markdown.chars().collect();
-    let mut out = Vec::with_capacity(chars.len());
-    let mut table_row = false;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if i == 0 || chars[i - 1] == '\n' {
-            // A table row is a line that starts with a pipe.
-            table_row = chars[i..]
-                .iter()
-                .find(|c| !c.is_whitespace() || **c == '\n')
-                .is_some_and(|&c| c == '|');
-        }
-        if c.is_whitespace() {
-            i += 1;
-        } else if let Some(tag) = INLINE_TAGS.iter().filter(|_| converted).find(|tag| {
-            let tag: Vec<char> = tag.chars().collect();
-            chars[i..].starts_with(&tag)
-        }) {
-            out.push(MarkdownPiece::Tag);
-            i += tag.chars().count();
-        } else {
-            let escape = table_row && c == '\\' && chars.get(i + 1) == Some(&'|');
-            out.push(MarkdownPiece::Char(c, escape || (converted && c == '*')));
-            i += 1;
-        }
-    }
-    out
-}
-
-/// The most pieces a character of a row takes in Markdown: itself and the
-/// marks conversion may set around a one-character styled run (bold and
-/// italic open and close, an underline or strikeout tag pair, an escape).
-const MARKS_PER_CHARACTER: usize = 12;
-
-/// How many times `row` (a row's text without spacing) stands in
-/// `markdown`, without overlap: every character of the row in order, each
-/// matching a character of the Markdown, with only what conversion may
-/// have added passed over between them. A copy starts on the row's first
-/// character, and spans at most [`MARKS_PER_CHARACTER`] pieces per
-/// character of the row, so a long run of marks is never walked again from
-/// each of its pieces.
-fn copies_in(markdown: &[MarkdownPiece], row: &[char]) -> usize {
-    // The end of the shortest copy starting at `start`, if any: the
-    // matcher's states are the row positions reached, so a mark that may be
-    // either text or conversion's is tried both ways.
-    let longest = (row.len() + 1) * MARKS_PER_CHARACTER;
-    let copy_at = |start: usize| -> Option<usize> {
-        let mut states = vec![0usize];
-        for (at, piece) in markdown.iter().enumerate().skip(start).take(longest) {
-            let mut next = Vec::new();
-            for &position in &states {
-                match *piece {
-                    MarkdownPiece::Char(c, _) if c == row[position] => next.push(position + 1),
-                    _ => {}
-                }
-                let passable = match *piece {
-                    MarkdownPiece::Char(_, mark) => mark,
-                    MarkdownPiece::Tag => true,
-                };
-                if passable && at > start {
-                    next.push(position);
+impl Reading {
+    fn of(self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for line in text.lines() {
+            let mut line = line.to_string();
+            if !matches!(self, Reading::Ocr) {
+                for tag in INLINE_TAGS {
+                    line = line.replace(tag, "");
                 }
             }
-            next.sort_unstable();
-            next.dedup();
-            if next.last() == Some(&row.len()) {
-                return Some(at + 1);
+            // Conversion escapes a pipe only in a table cell, and a table
+            // row starts and ends with a pipe.
+            let trimmed = line.trim();
+            if !matches!(self, Reading::Row)
+                && trimmed.len() > 1
+                && trimmed.starts_with('|')
+                && trimmed.ends_with('|')
+            {
+                line = line.replace("\\|", "|");
             }
-            if next.is_empty() {
-                return None;
-            }
-            states = next;
+            out.extend(
+                line.chars().filter(|c| {
+                    !c.is_whitespace() && !(matches!(self, Reading::Native) && *c == '*')
+                }),
+            );
         }
-        None
-    };
-    let Some(&first) = row.first() else {
-        return 0;
-    };
-    let mut count = 0;
-    let mut at = 0;
-    while at < markdown.len() {
-        let starts = markdown[at] == MarkdownPiece::Char(first, false)
-            || markdown[at] == MarkdownPiece::Char(first, true);
-        match starts.then(|| copy_at(at)).flatten() {
-            Some(end) => {
-                count += 1;
-                at = end;
-            }
-            None => at += 1,
-        }
+        out
     }
-    count
+}
+
+/// How many times `row` stands in `text`, both read alike, without overlap.
+fn copies_in(text: &str, row: &str) -> usize {
+    if row.is_empty() {
+        0
+    } else {
+        text.matches(row).count()
+    }
 }
 
 /// Finds running headers and footers in full-page OCR by the native
@@ -4142,6 +4068,27 @@ Terms of the agreement.
         );
         assert_eq!(left.len(), 1);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Codex on #25, round 4: a row opening with a long mask against a
+        // longer one is a plain substring count too.
+        let started = std::time::Instant::now();
+        let row = format!("{}Claim A12345", "*".repeat(100));
+        let left = rows_left_out(PageContentSource::Fused, &fused, (&mask, ocr), &[], &[row]);
+        assert_eq!(left.len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A removed row's superscript tags are its line's, not its text.
+        let native = "Terms of the agreement.\n";
+        let ocr_title = "Terms of the agreement.\n\nTitle x2 edition\n";
+        let (fused, _) = merge_native_and_ocr(native, ocr_title);
+        assert!(rows_left_out(
+            PageContentSource::Fused,
+            &fused,
+            (native, ocr_title),
+            &["Title x<sup>2</sup> edition".to_string()],
+            &[]
+        )
+        .is_empty());
+        // Prose that starts with a pipe is no table row.
+        assert_eq!(left_out("Clause A|B applies", "| Clause A\\|B applies"), 1);
     }
 
     #[test]

@@ -113,10 +113,11 @@ version and date. Earlier releases are described in their
   uncounted; before, both went and both counted. Of two rows equally
   close, the one above a header's place (below a footer's) goes. A header
   and a footer each go from the same sparse page. An OCR page fused with
-  native text counts a removed row by its copies, its own characters
-  included: only what conversion may add is passed over (in native text,
-  emphasis asterisks and inline tags; anywhere, a table cell's escaped
-  pipe), so "Claim A12345" added by OCR is not the removed "Claim A*12345".
+  native text counts a removed row by its copies. OCR text is compared
+  exactly, its own asterisks included, so "Claim A12345" added by OCR is
+  not the removed "Claim A*12345"; native text is compared without the
+  asterisks and inline tags conversion writes for styled runs. A table
+  cell's escaped pipe is a pipe.
 - Repeated headers and footers need at least 30% of the pages, rounded up,
   as the rule states: on 11 pages, 4 pages, not 3.
 - Repeated headers and footers: a page whose native text never reaches the
