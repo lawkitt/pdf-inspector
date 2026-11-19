@@ -766,15 +766,16 @@ pub(crate) fn strip_repeated_lines_in_frames(
                     (Some((top_at, top_dev)), Some((bottom_at, bottom_dev))) => {
                         // An exactly steady edge beats one that moves at
                         // all; otherwise deviations equal up to f64 noise
-                        // tie.
-                        let tie = (top_dev - bottom_dev).abs() < 1e-6;
+                        // tie, and "at most half" allows the same noise.
+                        const NOISE: f64 = 1e-6;
+                        let tie = (top_dev - bottom_dev).abs() < NOISE;
                         let from_the_top = if top_dev == 0.0 && bottom_dev > 0.0 {
                             true
                         } else if bottom_dev == 0.0 && top_dev > 0.0 {
                             false
-                        } else if !tie && top_dev * 2.0 <= bottom_dev {
+                        } else if !tie && top_dev * 2.0 <= bottom_dev + NOISE {
                             true
-                        } else if !tie && bottom_dev * 2.0 <= top_dev {
+                        } else if !tie && bottom_dev * 2.0 <= top_dev + NOISE {
                             false
                         } else {
                             top_at <= bottom_at
@@ -2080,27 +2081,41 @@ mod tests {
         // at y=745, 750 and 755: 30, 40 and 50 pt below the top (deviation
         // 10 pt), 745 to 755 pt above the bottom (deviation 5 pt, exactly
         // half). The bottom wins: on sparse Legal page 4 the sentence 40 pt
-        // below the top stays, and at y=750 it goes.
+        // below the top stays, and at y=750 it goes. Codex's sixth review:
+        // tops 792, 792 and 793.5 with the header at 750, 750 and 750.5,
+        // where rounding made twice the bottom's deviation (1/3 pt) a hair
+        // more than the top's (2/3 pt).
         let header = "Please sign and return this form";
-        let frames: HashMap<u32, (f32, f32)> = [
-            (1, (0.0, 775.0)),
-            (2, (0.0, 790.0)),
-            (3, (0.0, 805.0)),
-            (4, (0.0, 1008.0)),
-        ]
-        .into_iter()
-        .collect();
-        let with_page_4 = |y: f32| {
-            let mut lines = headed_pages(3, |_| header.into());
-            for line in lines.iter_mut().filter(|line| line.y == 750.0) {
-                line.y = [745.0, 750.0, 755.0][line.page as usize - 1];
-            }
-            lines.push(make_line(header, 10.0, 4, y, None));
-            lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
-            strip_repeated_lines_in_frames(lines, 4, &frames)
+        let check = |tops: [f32; 3], places: [f32; 3], body: f32| {
+            let frames: HashMap<u32, (f32, f32)> = (1..=4)
+                .map(|page| {
+                    (
+                        page,
+                        (
+                            0.0,
+                            if page == 4 {
+                                1008.0
+                            } else {
+                                tops[page as usize - 1]
+                            },
+                        ),
+                    )
+                })
+                .collect();
+            let with_page_4 = |y: f32| {
+                let mut lines = headed_pages(3, |_| header.into());
+                for line in lines.iter_mut().filter(|line| line.y == 750.0) {
+                    line.y = places[line.page as usize - 1];
+                }
+                lines.push(make_line(header, 10.0, 4, y, None));
+                lines.push(make_line("Thank you for your order", 10.0, 4, 380.0, None));
+                strip_repeated_lines_in_frames(lines, 4, &frames)
+            };
+            assert_eq!(header_pages(&with_page_4(body), header), [1, 4]);
+            assert_eq!(header_pages(&with_page_4(750.0), header), [1]);
         };
-        assert_eq!(header_pages(&with_page_4(968.0), header), [1, 4]);
-        assert_eq!(header_pages(&with_page_4(750.0), header), [1]);
+        check([775.0, 790.0, 805.0], [745.0, 750.0, 755.0], 968.0);
+        check([792.0, 792.0, 793.5], [750.0, 750.0, 750.5], 966.0);
     }
 
     #[test]
