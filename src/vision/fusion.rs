@@ -891,12 +891,13 @@ fn fused_pieces(fused: &str, native: &str) -> Vec<MarkdownPiece> {
     }
 }
 
-/// `markdown`'s pieces without spacing. Conversion may have added: an
-/// inline tag; a backslash before ASCII punctuation (an escape); and, in
-/// `converted` text (native Markdown, whose styled runs conversion wraps in
-/// asterisks anywhere, even inside a word), any asterisk. OCR text carries
-/// no styles, so its asterisks are its own. Underscores and backticks are
-/// always the text's own: conversion never writes them inline.
+/// `markdown`'s pieces without spacing. Conversion may have added a
+/// backslash before a pipe (a table cell's escape, the only one it writes)
+/// and, in `converted` text (native Markdown), the marks of styled runs:
+/// inline tags, and asterisks anywhere, even inside a word. OCR text
+/// carries no styles, so its asterisks, tags and other backslashes are its
+/// own. Underscores and backticks are always the text's own: conversion
+/// never writes them inline.
 fn markdown_pieces(markdown: &str, converted: bool) -> Vec<MarkdownPiece> {
     let chars: Vec<char> = markdown.chars().collect();
     let mut out = Vec::with_capacity(chars.len());
@@ -905,14 +906,14 @@ fn markdown_pieces(markdown: &str, converted: bool) -> Vec<MarkdownPiece> {
         let c = chars[i];
         if c.is_whitespace() {
             i += 1;
-        } else if let Some(tag) = INLINE_TAGS.iter().find(|tag| {
+        } else if let Some(tag) = INLINE_TAGS.iter().filter(|_| converted).find(|tag| {
             let tag: Vec<char> = tag.chars().collect();
             chars[i..].starts_with(&tag)
         }) {
             out.push(MarkdownPiece::Tag);
             i += tag.chars().count();
         } else {
-            let escape = c == '\\' && chars.get(i + 1).is_some_and(char::is_ascii_punctuation);
+            let escape = c == '\\' && chars.get(i + 1) == Some(&'|');
             out.push(MarkdownPiece::Char(c, escape || (converted && c == '*')));
             i += 1;
         }
@@ -4031,6 +4032,9 @@ mod tests {
             // Codex on #25: beside punctuation too.
             ("Claim A-12345", "Claim A-*12345"),
             ("Claim A-*12345", "Claim A-12345"),
+            // OCR text's own backslashes and tag-like text are text too.
+            ("Clause A-12", "Clause A\\-12"),
+            ("Status open", "Status <u>open</u>"),
             ("Case_File_Signature", "CaseFileSignature"),
             ("CaseFileSignature", "Case_File_Signature"),
             ("Run `make` first", "Run make first"),
