@@ -892,18 +892,26 @@ fn fused_pieces(fused: &str, native: &str) -> Vec<MarkdownPiece> {
 }
 
 /// `markdown`'s pieces without spacing. Conversion may have added a
-/// backslash before a pipe (a table cell's escape, the only one it writes)
-/// and, in `converted` text (native Markdown), the marks of styled runs:
-/// inline tags, and asterisks anywhere, even inside a word. OCR text
-/// carries no styles, so its asterisks, tags and other backslashes are its
+/// backslash before a pipe in a table row (a cell's escape, the only one it
+/// writes) and, in `converted` text (native Markdown), the marks of styled
+/// runs: inline tags, and asterisks anywhere, even inside a word. OCR text
+/// carries no styles, so its asterisks, tags and prose backslashes are its
 /// own. Underscores and backticks are always the text's own: conversion
 /// never writes them inline.
 fn markdown_pieces(markdown: &str, converted: bool) -> Vec<MarkdownPiece> {
     let chars: Vec<char> = markdown.chars().collect();
     let mut out = Vec::with_capacity(chars.len());
+    let mut table_row = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        if i == 0 || chars[i - 1] == '\n' {
+            // A table row is a line that starts with a pipe.
+            table_row = chars[i..]
+                .iter()
+                .find(|c| !c.is_whitespace() || **c == '\n')
+                .is_some_and(|&c| c == '|');
+        }
         if c.is_whitespace() {
             i += 1;
         } else if let Some(tag) = INLINE_TAGS.iter().filter(|_| converted).find(|tag| {
@@ -913,7 +921,7 @@ fn markdown_pieces(markdown: &str, converted: bool) -> Vec<MarkdownPiece> {
             out.push(MarkdownPiece::Tag);
             i += tag.chars().count();
         } else {
-            let escape = c == '\\' && chars.get(i + 1) == Some(&'|');
+            let escape = table_row && c == '\\' && chars.get(i + 1) == Some(&'|');
             out.push(MarkdownPiece::Char(c, escape || (converted && c == '*')));
             i += 1;
         }
@@ -921,18 +929,26 @@ fn markdown_pieces(markdown: &str, converted: bool) -> Vec<MarkdownPiece> {
     out
 }
 
+/// The most pieces a character of a row takes in Markdown: itself and the
+/// marks conversion may set around a one-character styled run (bold and
+/// italic open and close, an underline or strikeout tag pair, an escape).
+const MARKS_PER_CHARACTER: usize = 12;
+
 /// How many times `row` (a row's text without spacing) stands in
 /// `markdown`, without overlap: every character of the row in order, each
 /// matching a character of the Markdown, with only what conversion may
 /// have added passed over between them. A copy starts on the row's first
-/// character.
+/// character, and spans at most [`MARKS_PER_CHARACTER`] pieces per
+/// character of the row, so a long run of marks is never walked again from
+/// each of its pieces.
 fn copies_in(markdown: &[MarkdownPiece], row: &[char]) -> usize {
     // The end of the shortest copy starting at `start`, if any: the
     // matcher's states are the row positions reached, so a mark that may be
     // either text or conversion's is tried both ways.
+    let longest = (row.len() + 1) * MARKS_PER_CHARACTER;
     let copy_at = |start: usize| -> Option<usize> {
         let mut states = vec![0usize];
-        for (at, piece) in markdown.iter().enumerate().skip(start) {
+        for (at, piece) in markdown.iter().enumerate().skip(start).take(longest) {
             let mut next = Vec::new();
             for &position in &states {
                 match *piece {
@@ -4100,7 +4116,7 @@ Terms of the agreement.
         }
         // A table cell's escaped pipe is its text's pipe.
         let header = ["Fees | Costs Schedule".to_string()];
-        let native = "Fees \\| Costs Schedule\n\nTerms of the agreement.\n";
+        let native = "| Fees \\| Costs Schedule | 2026 |\n|---|---|\n\nTerms of the agreement.\n";
         let (fused, _) = merge_native_and_ocr(native, ocr);
         assert!(rows_left_out(
             PageContentSource::Fused,
@@ -4110,6 +4126,22 @@ Terms of the agreement.
             &header
         )
         .is_empty());
+        // Codex on #25: in prose, OCR's backslash before a pipe is its own.
+        assert_eq!(left_out("Clause A|B applies", "Clause A\\|B applies"), 1);
+        // Codex on #25: a long run of marks is walked once, not again from
+        // each of its asterisks.
+        let mask = format!("{}\n\nTerms of the agreement.\n", "*".repeat(20_000));
+        let (fused, _) = merge_native_and_ocr(&mask, ocr);
+        let started = std::time::Instant::now();
+        let left = rows_left_out(
+            PageContentSource::Fused,
+            &fused,
+            (&mask, ocr),
+            &[],
+            &["*Claim A12345".to_string()],
+        );
+        assert_eq!(left.len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
