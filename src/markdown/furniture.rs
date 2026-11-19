@@ -442,6 +442,21 @@ fn is_decorative_separator(text: &str) -> bool {
     chars.all(|c| c == first)
 }
 
+/// One representative baseline per row, from a page's baselines sorted
+/// upwards. Column mates within 0.1pt share a row; that is the same
+/// tolerance the edge match uses. A line belongs to the first row within
+/// 0.1pt of its baseline.
+pub(crate) fn cluster_rows(ys: &[f32]) -> Vec<f32> {
+    let mut rows = Vec::new();
+    for &y in ys {
+        match rows.last() {
+            Some(&last) if y - last < 0.1 => {}
+            _ => rows.push(y),
+        }
+    }
+    rows
+}
+
 /// A Y-band's members in document order plus the row's coalesced text.
 /// Single source for band coalescing: the frequency build and both band
 /// passes must key on identical text.
@@ -529,19 +544,6 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // column headers (e.g., 5-row IRS form headers) that sit just inside the
     // page margin.
     const EDGE_LINE_COUNT: usize = 5;
-
-    /// One representative baseline per row. Column mates within 0.1pt share
-    /// a row; that is the same tolerance the edge match uses.
-    fn cluster_rows(ys: &[f32]) -> Vec<f32> {
-        let mut rows = Vec::new();
-        for &y in ys {
-            match rows.last() {
-                Some(&last) if y - last < 0.1 => {}
-                _ => rows.push(y),
-            }
-        }
-        rows
-    }
 
     let page_rows: HashMap<u32, Vec<f32>> = page_sorted_ys
         .iter()
@@ -891,13 +893,12 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // a header's place, below a footer's) is the header or footer. A row is
     // the page's clustered row, so a split or doubled header row goes whole.
     // Rows in protected bands are never removed and are no match. A row is
-    // judged once, by its clustered baseline, so copies of a sentence in
-    // one row cannot outscore the header.
+    // judged once, by its clustered baseline, both for the tolerance and
+    // for closeness: copies of a sentence in one row cannot outscore the
+    // header, and the cutoff never splits a row.
     // (page, key) -> (distance from the place, row baseline, clustered row).
     let mut sparse_matches: HashMap<(u32, String), (f64, f32, usize)> = HashMap::new();
-    // The sparse-page lines within the tolerance of their row's place.
-    let mut sparse_eligible: HashSet<usize> = HashSet::new();
-    for (idx, line) in lines.iter().enumerate() {
+    for line in &lines {
         let Some(rows) = page_rows.get(&line.page).filter(|rows| rows.len() <= 2) else {
             continue;
         };
@@ -920,15 +921,14 @@ pub(crate) fn strip_repeated_lines_in_frames(
         // Exactly halfway down is a footer's half, as the edge it is
         // measured from is the bottom there.
         let top_side = place > middle;
-        if !within_tolerance(f64::from(line.y) - place) {
-            continue;
-        }
         let Some(row) = rows.iter().position(|&py| (py - line.y).abs() < 0.1) else {
             continue;
         };
-        sparse_eligible.insert(idx);
         let row_y = rows[row];
         let distance = (f64::from(row_y) - place).abs();
+        if !within_tolerance(distance) {
+            continue;
+        }
         let best = sparse_matches
             .entry((line.page, key))
             .or_insert((distance, row_y, row));
@@ -965,10 +965,9 @@ pub(crate) fn strip_repeated_lines_in_frames(
             let row = page_rows
                 .get(&line.page)
                 .and_then(|rows| rows.iter().position(|&py| (py - line.y).abs() < 0.1));
-            let closest = sparse_eligible.contains(&idx)
-                && sparse_matches
-                    .get(&(line.page, key.clone()))
-                    .is_some_and(|&(_, _, best_row)| row == Some(best_row));
+            let closest = sparse_matches
+                .get(&(line.page, key.clone()))
+                .is_some_and(|&(_, _, best_row)| row == Some(best_row));
             if !closest {
                 continue;
             }
@@ -2554,6 +2553,12 @@ mod tests {
             assert_eq!(header_pages(&result, header), [1, 4]);
             let result = strip_repeated_lines_in_frames(lines(696.0), 4, &frames);
             assert_eq!(header_pages(&result, header), [1]);
+            // Codex on #24: a row at the cutoff stays whole, even with a
+            // line of it a sixteenth of a point inside.
+            let mut split = lines(695.0);
+            split.push(make_line(header, 10.0, 4, 695.0625, None));
+            let result = strip_repeated_lines_in_frames(split, 4, &frames);
+            assert_eq!(kept_at(&result, 4, header), [695.0, 695.0625]);
         }
     }
 

@@ -12,6 +12,7 @@ mod convert;
 mod furniture;
 mod heading;
 mod postprocess;
+pub(crate) use furniture::cluster_rows;
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 pub(crate) use postprocess::normalize_block_spacing;
 mod preprocess;
