@@ -809,15 +809,27 @@ fn rows_left_out(
         PageContentSource::Native => native_rows.to_vec(),
         PageContentSource::Ocr => ocr_rows.to_vec(),
         PageContentSource::Fused => {
-            // The visible text: no spacing, escapes, or inline emphasis and
-            // code marks, so a row and its formatted copy compare alike.
+            // No spacing, escapes or emphasis asterisks, on both sides.
             let squeeze = |text: &str| -> String {
                 text.chars()
-                    .filter(|c| !c.is_whitespace() && !matches!(c, '\\' | '*' | '_' | '`'))
+                    .filter(|c| !c.is_whitespace() && !matches!(c, '\\' | '*'))
                     .collect()
             };
-            let shown = squeeze(markdown);
-            let (native_shown, ocr_shown) = (squeeze(sources.0), squeeze(sources.1));
+            // The Markdown's visible text: also without the inline tags
+            // Markdown conversion writes, so a row and its formatted copy
+            // compare alike. Underscores and backticks are the text's own:
+            // conversion marks emphasis with asterisks only.
+            let visible = |markdown: &str| -> String {
+                let mut text = markdown.to_string();
+                for tag in [
+                    "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
+                ] {
+                    text = text.replace(tag, "");
+                }
+                squeeze(&text)
+            };
+            let shown = visible(markdown);
+            let (native_shown, ocr_shown) = (visible(sources.0), visible(sources.1));
             let native: Vec<String> = native_rows.iter().map(|row| squeeze(row)).collect();
             let ocr: Vec<String> = ocr_rows.iter().map(|row| squeeze(row)).collect();
             let copies = |rows: &[String], row: &str| rows.iter().filter(|r| *r == row).count();
@@ -3852,6 +3864,35 @@ mod tests {
             &header
         )
         .is_empty());
+        // An underlined body copy is a copy too.
+        let underlined =
+            "Please sign and return this form\n\n<u>Please sign and return this form</u>\n";
+        let (fused, _) = merge_native_and_ocr(underlined, ocr_plain);
+        assert!(rows_left_out(
+            PageContentSource::Fused,
+            &fused,
+            (underlined, ocr_plain),
+            &[],
+            &header
+        )
+        .is_empty());
+        // Codex on #24: underscores are the text's own, so a distinct
+        // identifier OCR adds does not bring back a removed one.
+        let identifier = ["Case_File_Signature".to_string()];
+        let native_body = "Terms of the agreement.\n";
+        let ocr_added = "Terms of the agreement.\n\nCaseFileSignature\n";
+        let (fused, source) = merge_native_and_ocr(native_body, ocr_added);
+        assert_eq!(source, PageContentSource::Fused);
+        assert_eq!(
+            rows_left_out(
+                PageContentSource::Fused,
+                &fused,
+                (native_body, ocr_added),
+                &identifier,
+                &[]
+            ),
+            identifier
+        );
     }
 
     /// [`scanned_page`] with a `footer` at the bottom edge too.
