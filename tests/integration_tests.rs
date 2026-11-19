@@ -12581,6 +12581,85 @@ fn test_a_sparse_page_follows_the_edge_mixed_size_pages_agree_on() {
 
 #[cfg(feature = "ocr")]
 #[test]
+fn test_a_sparse_page_follows_the_steadier_edge_when_both_agree() {
+    use lopdf::{dictionary, Document};
+    use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
+
+    // Codex on #23: Letter pages 1-4 and an A4 page 5 carry the header at
+    // y=750: 42 pt below the top four times, 92 pt once (a spread of 20 pt,
+    // inside the 23 pt tolerance of these pages' 460 pt span), and 750 pt
+    // above the bottom every time. The bottom is the steadier edge. On
+    // sparse Legal page 6 the sentence 52 pt below the top stays; at y=750
+    // it is the header.
+    const A4_BOX: [i64; 4] = [0, 0, 595, 842];
+    const LEGAL_BOX: [i64; 4] = [0, 0, 612, 1008];
+    let header = "Please sign and return this form";
+    let pdf = |page_6_y: u32| {
+        let mut doc = Document::with_version("1.5");
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let pages_id = doc.new_object_id();
+        let mut kids = Vec::new();
+        for page in 1..=6u32 {
+            let content = if page == 6 {
+                format!(
+                    "BT /F1 10 Tf 72 {page_6_y} Td ({header}) Tj ET\n\
+                     BT /F1 10 Tf 72 380 Td (Thank you for your order) Tj ET\n"
+                )
+            } else {
+                let mut content = format!("BT /F1 10 Tf 72 750 Td ({header}) Tj ET\n");
+                for line in 0..14u32 {
+                    content.push_str(&format!(
+                        "BT /F1 10 Tf 72 {} Td (Paragraph {line} of sheet {page}: the parties agree.) Tj ET\n",
+                        680 - 30 * line
+                    ));
+                }
+                content
+            };
+            let page_box = match page {
+                5 => A4_BOX,
+                6 => LEGAL_BOX,
+                _ => LETTER_BOX,
+            };
+            kids.push(add_page(
+                &mut doc,
+                pages_id,
+                &content,
+                page_box,
+                None,
+                &[("F1", font_id)],
+            ));
+        }
+        finish_document(doc, pages_id, kids)
+    };
+    let lines = |page, lines| pdf_inspector::PageRepeatedLines { page, lines };
+    let run = |y| process_pdf_with_ocr_mem(&pdf(y), OcrPdfOptions::new()).expect("native pass");
+    let showing = |result: &pdf_inspector::vision::OcrPdfResult| -> Vec<u32> {
+        result
+            .pages
+            .iter()
+            .filter(|page| page.markdown.contains(header))
+            .map(|page| page.page_number)
+            .collect()
+    };
+    let mut counted = vec![lines(2, 1), lines(3, 1), lines(4, 1), lines(5, 1)];
+    let body = run(956);
+    assert_eq!(showing(&body), [1, 6]);
+    assert_eq!(body.repeated_lines_by_page, counted);
+    let at_header = run(750);
+    assert_eq!(showing(&at_header), [1]);
+    assert!(at_header.pages[5]
+        .markdown
+        .contains("Thank you for your order"));
+    counted.push(lines(6, 1));
+    assert_eq!(at_header.repeated_lines_by_page, counted);
+}
+
+#[cfg(feature = "ocr")]
+#[test]
 fn test_repeated_header_keeps_its_first_page_and_is_counted() {
     use pdf_inspector::vision::{process_pdf_with_ocr_mem, OcrPdfOptions};
 
