@@ -489,7 +489,8 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
 /// a row proven on the full pages goes there only at the place the full
 /// pages show it: as far from the top edge (a header) or the bottom edge (a
 /// footer), on pages of any size, when every page involved has a frame, and
-/// at the same height otherwise.
+/// at the same height otherwise; and only once, the row closest to that
+/// place, so the same sentence a little further in is body text that stays.
 pub(crate) fn strip_repeated_lines_in_frames(
     lines: Vec<TextLine>,
     page_count: u32,
@@ -699,13 +700,32 @@ pub(crate) fn strip_repeated_lines_in_frames(
         let stddev = variance.sqrt();
         stddev / avg_span < POSITION_TOLERANCE
     };
-    // Whether `y` on `page` is where the full pages show the repeated row
-    // `key`. A sparse page has no edge rows to judge by, so this is its only
-    // position check. The full pages' places agree when every one is within
-    // the same share of their span of the places' mean; a sparse row then
-    // matches within that share of the mean, so it is always that close to
-    // a place some full page uses. When the places do not agree, a sparse
-    // page loses nothing.
+    // The cutoff is compared in f32, as every other position check is, so a
+    // row exactly at 5% stays as it always has.
+    let within_tolerance =
+        |distance: f64| (distance.abs() as f32) / full_page_span < POSITION_TOLERANCE;
+    // The middle of the full pages' rows: a sparse page whose frame is
+    // unknown has a header's place above it and a footer's below.
+    let full_page_middle: f64 = {
+        let middles: Vec<f64> = page_y_range
+            .iter()
+            .filter(|(page, _)| page_rows.get(page).is_some_and(|rows| rows.len() > 2))
+            .map(|(_, &(lo, hi))| (f64::from(lo) + f64::from(hi)) / 2.0)
+            .collect();
+        if middles.is_empty() {
+            0.0
+        } else {
+            middles.iter().sum::<f64>() / middles.len() as f64
+        }
+    };
+    // Where the full pages show the repeated row `key`, projected onto
+    // `page`: `None` when they show no place a sparse page can use. A sparse
+    // page has no edge rows to judge by, so this is its only position check:
+    // a row there goes only within the tolerance of this place. The full
+    // pages' places agree when every one is within the same share of their
+    // span of the places' mean; a sparse row then matches within that share
+    // of the mean, so it is always that close to a place some full page
+    // uses. When the places do not agree, a sparse page loses nothing.
     //
     // With frames, a place is the distance from the edge the full pages keep
     // the row at: the top or the bottom, whichever they agree on. When they
@@ -726,7 +746,7 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // numbered clause) is body text that is never removed, so its place
     // teaches nothing about the header's, and the other places must reach
     // the repeat threshold without it.
-    let at_learned_position = |key: &str, page: u32, y: f32| -> bool {
+    let learned_place = |key: &str, page: u32| -> Option<f64> {
         let seen: Vec<(u32, f32)> = placements
             .get(key)
             .into_iter()
@@ -739,12 +759,8 @@ pub(crate) fn strip_repeated_lines_in_frames(
         // The unprotected places must still make a repeat on their own.
         let seen_pages: HashSet<u32> = seen.iter().map(|&(seen_page, _)| seen_page).collect();
         if (seen_pages.len() as u32) < threshold {
-            return false;
+            return None;
         }
-        // The cutoff is compared in f32, as every other position check is,
-        // so a row exactly at 5% stays as it always has.
-        let within_tolerance =
-            |distance: f64| (distance.abs() as f32) / full_page_span < POSITION_TOLERANCE;
         // The places' mean, with the largest deviation from it, when every
         // place is within the tolerance of it.
         let agreed = |places: &[f64]| -> Option<(f64, f64)> {
@@ -759,7 +775,6 @@ pub(crate) fn strip_repeated_lines_in_frames(
                 .fold(0.0, f64::max);
             within_tolerance(deviation).then_some((mean, deviation))
         };
-        let y = f64::from(y);
         let framed: Vec<(u32, f64, (f64, f64))> = seen
             .iter()
             .filter_map(|&(seen_page, seen_y)| {
@@ -770,12 +785,12 @@ pub(crate) fn strip_repeated_lines_in_frames(
         let framed_pages: HashSet<u32> = framed.iter().map(|&(page, _, _)| page).collect();
         let edge = match framed_pages.len() {
             0 => None,
-            1 => return false,
+            1 => return None,
             _ => {
                 let from_top: Vec<f64> = framed.iter().map(|&(_, y, (_, t))| t - y).collect();
                 let from_bottom: Vec<f64> = framed.iter().map(|&(_, y, (b, _))| y - b).collect();
                 match (agreed(&from_top), agreed(&from_bottom)) {
-                    (None, None) => return false,
+                    (None, None) => return None,
                     (Some((at, _)), None) => Some((true, at)),
                     (None, Some((at, _))) => Some((false, at)),
                     (Some((top_at, _)), Some((bottom_at, _))) => {
@@ -815,7 +830,7 @@ pub(crate) fn strip_repeated_lines_in_frames(
                 // The learned place, projected onto this page, must be on
                 // it: a page too short for it has no header there.
                 let place = if from_the_top { top - at } else { bottom + at };
-                (bottom..=top).contains(&place) && within_tolerance(y - place)
+                (bottom..=top).contains(&place).then_some(place)
             }
             (_, frame) => {
                 let heights: Vec<f64> = seen.iter().map(|&(_, seen_y)| f64::from(seen_y)).collect();
@@ -825,7 +840,9 @@ pub(crate) fn strip_repeated_lines_in_frames(
                         top <= bottom || (f64::from(bottom)..=f64::from(top)).contains(&at)
                     })
                 };
-                agreed(&heights).is_some_and(|(at, _)| on_the_page(at) && within_tolerance(y - at))
+                agreed(&heights)
+                    .map(|(at, _)| at)
+                    .filter(|&at| on_the_page(at))
             }
         }
     };
@@ -866,6 +883,56 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // is kept so that document titles, column headers, etc. appear once.
     let mut removal_set: HashSet<usize> = HashSet::new();
 
+    // A sparse page loses each repeated row at most once: the row closest
+    // to the place the full pages show it, if within the tolerance. An
+    // identical sentence also within the tolerance is the page's own text
+    // and stays. Of two rows equally close, the one beyond the place (above
+    // a header's place, below a footer's) is the header or footer. A row is
+    // the page's clustered row, so a split or doubled header row goes whole.
+    // Rows in protected bands are never removed and are no match.
+    // (page, key) -> (distance from the place, line y, clustered row).
+    let mut sparse_matches: HashMap<(u32, String), (f64, f32, usize)> = HashMap::new();
+    for line in &lines {
+        let Some(rows) = page_rows.get(&line.page).filter(|rows| rows.len() <= 2) else {
+            continue;
+        };
+        if protected_bands.contains(&band_key(line)) {
+            continue;
+        }
+        let (key, _) = keys.key(&line.text(), line.page);
+        if !candidates.contains(&key) {
+            continue;
+        }
+        let Some(place) = learned_place(&key, line.page) else {
+            continue;
+        };
+        // A header's place is in the page's upper half, a footer's in its
+        // lower half.
+        let middle = match page_frames.get(&line.page) {
+            Some(&(bottom, top)) if top > bottom => (f64::from(bottom) + f64::from(top)) / 2.0,
+            _ => full_page_middle,
+        };
+        let top_side = place >= middle;
+        let distance = (f64::from(line.y) - place).abs();
+        if !within_tolerance(distance) {
+            continue;
+        }
+        let Some(row) = rows.iter().position(|&py| (py - line.y).abs() < 0.1) else {
+            continue;
+        };
+        let best = sparse_matches
+            .entry((line.page, key))
+            .or_insert((distance, line.y, row));
+        let beyond = if top_side {
+            line.y > best.1
+        } else {
+            line.y < best.1
+        };
+        if distance < best.0 || (distance == best.0 && beyond) {
+            *best = (distance, line.y, row);
+        }
+    }
+
     // Track which page first shows each candidate (to preserve first occurrence)
     let mut first_page_individual: HashMap<String, u32> = HashMap::new();
     for (idx, line) in lines.iter().enumerate() {
@@ -885,8 +952,16 @@ pub(crate) fn strip_repeated_lines_in_frames(
             continue;
         }
         let (key, _) = keys.key(&text, line.page);
-        if sparse_page && !at_learned_position(&key, line.page, line.y) {
-            continue;
+        if sparse_page {
+            let row = page_rows
+                .get(&line.page)
+                .and_then(|rows| rows.iter().position(|&py| (py - line.y).abs() < 0.1));
+            let closest = sparse_matches
+                .get(&(line.page, key.clone()))
+                .is_some_and(|&(_, _, best_row)| row == Some(best_row));
+            if !closest {
+                continue;
+            }
         }
         if candidates.contains(&key) {
             let first = first_page_individual.entry(key).or_insert(line.page);
@@ -2470,6 +2545,191 @@ mod tests {
             let result = strip_repeated_lines_in_frames(lines(696.0), 4, &frames);
             assert_eq!(header_pages(&result, header), [1]);
         }
+    }
+
+    /// `pages` pages of 20 unique body lines, each topped by `header` at
+    /// y=750 and footed by `footer` at y=50.
+    fn headed_and_footed_pages(pages: u32, header: &str, footer: &str) -> Vec<TextLine> {
+        let mut lines = headed_pages(pages, |_| header.into());
+        for page in 1..=pages {
+            lines.push(make_line(footer, 10.0, page, 50.0, None));
+        }
+        lines.sort_by_key(|line| line.page);
+        lines
+    }
+
+    /// The heights at which `needle` stays on `page`.
+    fn kept_at(result: &[TextLine], page: u32, needle: &str) -> Vec<f32> {
+        result
+            .iter()
+            .filter(|l| l.page == page && l.text().contains(needle))
+            .map(|l| l.y)
+            .collect()
+    }
+
+    /// Letter frames for pages 1..=`pages`.
+    fn letter_frames(pages: u32) -> HashMap<u32, (f32, f32)> {
+        (1..=pages).map(|page| (page, (0.0, 792.0))).collect()
+    }
+
+    #[test]
+    fn a_sparse_page_loses_only_the_match_closest_to_the_header() {
+        // Maintainer decision on mdoc#925 (M18): the header of pages 1-3
+        // (y=750) stands on sparse page 4 at its place and again as a body
+        // sentence 15 pt lower, both inside the 21.75 pt tolerance. Only the
+        // match closest to the place goes; the sentence stays. Before, both
+        // went. The same with and without the pages' frames, whichever line
+        // comes first.
+        let header = "Please sign and return this form";
+        let sparse = |rows: &[f32], frames: &HashMap<u32, (f32, f32)>| {
+            let mut lines = headed_pages(3, |_| header.into());
+            for &y in rows {
+                lines.push(make_line(header, 10.0, 4, y, None));
+            }
+            strip_repeated_lines_in_frames(lines, 4, frames)
+        };
+        for frames in [HashMap::new(), letter_frames(4)] {
+            let result = sparse(&[750.0, 735.0], &frames);
+            assert_eq!(kept_at(&result, 4, header), [735.0]);
+            assert_eq!(header_pages(&result, header), [1, 4]);
+            assert_eq!(
+                kept_at(&sparse(&[735.0, 750.0], &frames), 4, header),
+                [735.0]
+            );
+            // Above the place, the nearer one goes as well.
+            assert_eq!(
+                kept_at(&sparse(&[762.0, 745.0], &frames), 4, header),
+                [762.0]
+            );
+            // A match alone within the tolerance still goes, as before.
+            assert!(kept_at(&sparse(&[740.0], &frames), 4, header).is_empty());
+            // Neither close enough: both stay, as before.
+            assert_eq!(
+                kept_at(&sparse(&[700.0, 380.0], &frames), 4, header),
+                [700.0, 380.0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_sparse_page_of_another_size_loses_only_the_closest_match() {
+        // M18 on mixed sizes. Letter pages 1-3 carry the header 42 pt below
+        // the top; on sparse Legal page 4 that is y=966. The match there
+        // goes, the sentence 16 pt lower stays.
+        let header = "Please sign and return this form";
+        let mut frames = letter_frames(3);
+        frames.insert(4, (0.0, 1008.0));
+        let sparse = |rows: &[f32]| {
+            let mut lines = headed_pages(3, |_| header.into());
+            for &y in rows {
+                lines.push(make_line(header, 10.0, 4, y, None));
+            }
+            strip_repeated_lines_in_frames(lines, 4, &frames)
+        };
+        assert_eq!(kept_at(&sparse(&[966.0, 950.0]), 4, header), [950.0]);
+        assert_eq!(kept_at(&sparse(&[950.0, 970.0]), 4, header), [950.0]);
+        // Letter pages 1-3 and a full Legal page 4 agree from the bottom
+        // (M17): on sparse Letter page 5 the place is y=750.
+        frames.insert(5, (0.0, 792.0));
+        let mut lines = headed_pages(4, |_| header.into());
+        lines.push(make_line(header, 10.0, 5, 735.0, None));
+        lines.push(make_line(header, 10.0, 5, 750.0, None));
+        let result = strip_repeated_lines_in_frames(lines, 5, &frames);
+        assert_eq!(kept_at(&result, 5, header), [735.0]);
+    }
+
+    #[test]
+    fn of_two_equally_close_matches_the_outer_one_goes() {
+        // M18 ties: two rows 10 pt either side of the place. A header's
+        // place is in the page's upper half, so the row above it goes; a
+        // footer's is in the lower half, so the row below it goes. Line
+        // order does not matter, nor the frames.
+        let header = "Please sign and return this form";
+        let footer = "Confidential: Acme Holdings";
+        let sparse = |rows: &[(&str, f32)], frames: &HashMap<u32, (f32, f32)>| {
+            let mut lines = headed_and_footed_pages(3, header, footer);
+            for &(text, y) in rows {
+                lines.push(make_line(text, 10.0, 4, y, None));
+            }
+            strip_repeated_lines_in_frames(lines, 4, frames)
+        };
+        for frames in [HashMap::new(), letter_frames(4)] {
+            for rows in [
+                [(header, 760.0), (header, 740.0)],
+                [(header, 740.0), (header, 760.0)],
+            ] {
+                assert_eq!(kept_at(&sparse(&rows, &frames), 4, header), [740.0]);
+            }
+            for rows in [
+                [(footer, 60.0), (footer, 40.0)],
+                [(footer, 40.0), (footer, 60.0)],
+            ] {
+                assert_eq!(kept_at(&sparse(&rows, &frames), 4, footer), [60.0]);
+            }
+        }
+        // A header learned from the bottom edge (Letter pages and a full
+        // Legal page, M17) is still a header: of two rows equally close to
+        // its place on sparse Letter page 5, the upper one goes.
+        let mut frames = letter_frames(5);
+        frames.insert(4, (0.0, 1008.0));
+        let mut lines = headed_pages(4, |_| header.into());
+        lines.push(make_line(header, 10.0, 5, 740.0, None));
+        lines.push(make_line(header, 10.0, 5, 760.0, None));
+        let result = strip_repeated_lines_in_frames(lines, 5, &frames);
+        assert_eq!(kept_at(&result, 5, header), [740.0]);
+    }
+
+    #[test]
+    fn a_sparse_page_loses_its_header_and_its_footer() {
+        // M18: one match per learned row. A sparse page whose two rows are
+        // the header and the footer of the full pages loses both.
+        let header = "Please sign and return this form";
+        let footer = "Confidential: Acme Holdings";
+        for frames in [HashMap::new(), letter_frames(4)] {
+            let mut lines = headed_and_footed_pages(3, header, footer);
+            lines.push(make_line(header, 10.0, 4, 750.0, None));
+            lines.push(make_line(footer, 10.0, 4, 50.0, None));
+            let result = strip_repeated_lines_in_frames(lines, 4, &frames);
+            assert_eq!(header_pages(&result, header), [1]);
+            assert_eq!(header_pages(&result, footer), [1]);
+            assert!(!result.iter().any(|l| l.page == 4));
+        }
+    }
+
+    #[test]
+    fn the_closest_row_on_a_sparse_page_goes_whole() {
+        // M18: the match is a row. The header set twice in its row (within
+        // 0.1 pt, one physical row) goes whole; the sentence below stays.
+        let header = "Please sign and return this form";
+        let mut lines = headed_pages(3, |_| header.into());
+        lines.push(make_line(header, 10.0, 4, 750.0, None));
+        lines.push(make_line(header, 10.0, 4, 750.05, None));
+        lines.push(make_line(header, 10.0, 4, 735.0, None));
+        let result = strip_repeated_lines_in_frames(lines, 4, &letter_frames(4));
+        assert_eq!(kept_at(&result, 4, header), [735.0]);
+    }
+
+    #[test]
+    fn a_sparse_first_page_keeps_both_matches() {
+        // M11's kept copy with M18: a sparse first page keeps every match,
+        // and the first full page loses its header. A later sparse page
+        // loses only the closest match.
+        let header = "Please sign and return this form";
+        let mut lines = vec![
+            make_line(header, 10.0, 1, 750.0, None),
+            make_line(header, 10.0, 1, 735.0, None),
+        ];
+        for line in headed_pages(4, |_| header.into()) {
+            if line.page > 1 {
+                lines.push(line);
+            }
+        }
+        lines.push(make_line(header, 10.0, 5, 750.0, None));
+        lines.push(make_line(header, 10.0, 5, 735.0, None));
+        let result = strip_repeated_lines_in_frames(lines, 5, &letter_frames(5));
+        assert_eq!(kept_at(&result, 1, header), [750.0, 735.0]);
+        assert_eq!(header_pages(&result, header), [1, 1, 5]);
+        assert_eq!(kept_at(&result, 5, header), [735.0]);
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header(page)`.
