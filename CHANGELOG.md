@@ -103,8 +103,8 @@ version and date. Earlier releases are described in their
   other's deviation) wins, else the nearer one. The full pages whose page
   boxes are known decide the edge, at least two of them. When they agree
   on neither, or only one page box is known, a sparse page loses nothing,
-  even if its own page box is unknown; without page boxes, the heights
-  must agree the same way.
+  even if its own page box is unknown, nor when the learned place falls
+  off it; without page boxes, the heights must agree the same way.
 - Repeated headers and footers need at least 30% of the pages, rounded up,
   as the rule states: on 11 pages, 4 pages, not 3.
 - Repeated headers and footers: a page whose native text never reaches the
