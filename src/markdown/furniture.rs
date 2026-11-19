@@ -722,11 +722,22 @@ pub(crate) fn strip_repeated_lines_in_frames(
     // f64, and the ranges compared are exact, so rounding cannot make one
     // edge look steadier than the other. The learned place, projected onto
     // the sparse page (or the learned height), must lie within its frame
-    // when that is known.
+    // when that is known. A row in a protected band (beside a heading or a
+    // numbered clause) is body text that is never removed, so its place
+    // teaches nothing about the header's.
     let at_learned_position = |key: &str, page: u32, y: f32| -> bool {
-        let Some(seen) = placements.get(key).filter(|seen| !seen.is_empty()) else {
+        let seen: Vec<(u32, f32)> = placements
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|&&(seen_page, seen_y)| {
+                !protected_bands.contains(&(seen_page, (seen_y * 10.0).round() as i32))
+            })
+            .copied()
+            .collect();
+        if seen.is_empty() {
             return false;
-        };
+        }
         let within_tolerance = |distance: f64| {
             distance.abs() / f64::from(full_page_span) < f64::from(POSITION_TOLERANCE)
         };
@@ -2389,6 +2400,28 @@ mod tests {
         };
         assert_eq!(header_pages(&with_page_4(1000.0), header), [1, 4]);
         assert_eq!(header_pages(&with_page_4(784.0), header), [1]);
+    }
+
+    #[test]
+    fn a_protected_row_teaches_nothing_about_the_edge() {
+        // Codex on #23: Letter pages 1-3 carry the header at y=750, 42 pt
+        // below the top. Full Legal page 4 has the same sentence at y=750
+        // beside a numbered clause, so that row is protected body text. It
+        // must not make the bottom the edge: on sparse Legal page 5 the
+        // sentence at y=750 stays, and 42 pt below the top (y=966) it goes.
+        let header = "Please sign and return this form";
+        let frames: HashMap<u32, (f32, f32)> = (1..=5)
+            .map(|page| (page, (0.0, if page >= 4 { 1008.0 } else { 792.0 })))
+            .collect();
+        let with_page_5 = |y: f32| {
+            let mut lines = headed_pages(4, |_| header.into());
+            lines.push(make_line("1. The parties agree.", 10.0, 4, 750.0, None));
+            lines.push(make_line(header, 10.0, 5, y, None));
+            lines.push(make_line("Thank you for your order", 10.0, 5, 380.0, None));
+            strip_repeated_lines_in_frames(lines, 5, &frames)
+        };
+        assert_eq!(header_pages(&with_page_5(750.0), header), [1, 4, 5]);
+        assert_eq!(header_pages(&with_page_5(966.0), header), [1, 4]);
     }
 
     /// `pages` pages of 20 unique body lines, each topped by `header(page)`.
