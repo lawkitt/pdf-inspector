@@ -1354,12 +1354,32 @@ pub(crate) fn repeated_header_footer_items_in_frames(
         chart_regions,
         page_bounds,
     );
-    let line_rows: Vec<(u32, i32, f32, String, Vec<HeaderFooterItemKey>)> = lines
+    // Each page's rows as the repeated-row pass clusters them, so a row it
+    // removes whole counts once, however its baselines round.
+    let mut page_ys: HashMap<u32, Vec<f32>> = HashMap::new();
+    for line in &lines {
+        page_ys.entry(line.page).or_default().push(line.y);
+    }
+    let page_rows: HashMap<u32, Vec<f32>> = page_ys
+        .into_iter()
+        .map(|(page, mut ys)| {
+            ys.sort_by(|a, b| a.total_cmp(b));
+            ys.dedup();
+            (page, markdown::cluster_rows(&ys))
+        })
+        .collect();
+    let row_of = |line: &types::TextLine| -> usize {
+        page_rows
+            .get(&line.page)
+            .and_then(|rows| rows.iter().position(|&py| (py - line.y).abs() < 0.1))
+            .unwrap_or(0)
+    };
+    let line_rows: Vec<(u32, usize, f32, String, Vec<HeaderFooterItemKey>)> = lines
         .iter()
         .map(|line| {
             (
                 line.page,
-                (line.y * 10.0).round() as i32,
+                row_of(line),
                 line.items
                     .iter()
                     .map(|item| item.x)
@@ -1387,7 +1407,7 @@ pub(crate) fn repeated_header_footer_items_in_frames(
     // One visual row, however many lines it was grouped into: its removed
     // lines' text, left to right.
     // (page, row from the top) -> (left edge, text) of each removed line.
-    type RowKey = (u32, std::cmp::Reverse<i32>);
+    type RowKey = (u32, std::cmp::Reverse<usize>);
     let mut rows: BTreeMap<RowKey, Vec<(f32, String)>> = BTreeMap::new();
     for (page, row, left, text, keys) in line_rows {
         let mut line_removed = false;
@@ -1448,6 +1468,47 @@ mod ocr_header_footer_tests {
             mcid: None,
             baseline_shift: 0.0,
         }
+    }
+
+    #[test]
+    fn a_sparse_pages_header_row_counts_once_however_it_rounds() {
+        // Codex on #24: sparse page 4 shows a lowercase header twice in its
+        // row, two-up (x=10 and x=400, a gap line grouping keeps apart), its
+        // baselines 800.04 and 800.06 rounding to different 0.1 pt buckets.
+        // The pass removes the row whole; it counts once.
+        let header = "please sign and return this form";
+        let mut items = Vec::new();
+        let mut thresholds = HashMap::new();
+        for page in 1..=3 {
+            items.push(item(page, header, 800.0));
+            for line in 0..12 {
+                items.push(item(
+                    page,
+                    &format!("Page {page} paragraph {line} unique content"),
+                    700.0 - line as f32 * 40.0,
+                ));
+            }
+            thresholds.insert(page, 0.1);
+        }
+        let left = item(4, header, 800.04);
+        let right = TextItem {
+            x: 400.0,
+            ..item(4, header, 800.06)
+        };
+        items.push(left.clone());
+        items.push(right.clone());
+        thresholds.insert(4, 0.1);
+        let repeated = repeated_header_footer_items(
+            &items,
+            &thresholds,
+            &HashMap::new(),
+            4,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        assert!(repeated.items.contains(&HeaderFooterItemKey::from(&left)));
+        assert!(repeated.items.contains(&HeaderFooterItemKey::from(&right)));
+        assert_eq!(repeated.rows_by_page.get(&4).map(Vec::len), Some(1));
     }
 
     #[test]

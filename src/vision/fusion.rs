@@ -809,9 +809,11 @@ fn rows_left_out(
         PageContentSource::Native => native_rows.to_vec(),
         PageContentSource::Ocr => ocr_rows.to_vec(),
         PageContentSource::Fused => {
+            // The visible text: no spacing, escapes, or inline emphasis and
+            // code marks, so a row and its formatted copy compare alike.
             let squeeze = |text: &str| -> String {
                 text.chars()
-                    .filter(|c| !c.is_whitespace() && *c != '\\')
+                    .filter(|c| !c.is_whitespace() && !matches!(c, '\\' | '*' | '_' | '`'))
                     .collect()
             };
             let shown = squeeze(markdown);
@@ -3757,22 +3759,14 @@ mod tests {
         let header = ["Дело № 2-123/2026".to_string()];
         let footer = ["Confidential: Acme".to_string()];
         let both = [header[0].clone(), footer[0].clone()];
-        let body = "Текст.
-";
+        let body = "Текст.\n";
         // Native text that kept the header brings it back.
-        let shown = "Дело № 2-123/2026
-
-Текст страницы.
-";
+        let shown = "Дело № 2-123/2026\n\nТекст страницы.\n";
         assert_eq!(
             repeated_lines_left_out(
                 PageContentSource::Fused,
                 shown,
-                (
-                    shown,
-                    "Текст страницы.
-"
-                ),
+                (shown, "Текст страницы.\n"),
                 &[],
                 &header
             ),
@@ -3788,8 +3782,7 @@ mod tests {
             repeated_lines_left_out(PageContentSource::Fused, body, (body, body), &both, &header),
             2
         );
-        let spaced = "Confi dential: Acme
-";
+        let spaced = "Confi dential: Acme\n";
         assert_eq!(
             repeated_lines_left_out(PageContentSource::Fused, spaced, ("", spaced), &footer, &[]),
             0
@@ -3812,12 +3805,8 @@ mod tests {
         // so the page is fused. The sentence it shows is the body copy: one
         // row was left out, not none.
         let header = ["Please sign and return this form".to_string()];
-        let native = "Please sign and return this form
-";
-        let ocr = "Please sign and return this form
-
-A stamp: received.
-";
+        let native = "Please sign and return this form\n";
+        let ocr = "Please sign and return this form\n\nA stamp: received.\n";
         let (fused, source) = merge_native_and_ocr(native, ocr);
         assert_eq!(source, PageContentSource::Fused);
         let rows =
@@ -3825,12 +3814,7 @@ A stamp: received.
         assert_eq!(rows((native, ocr)), header);
         // Removed from the native text only, with OCR keeping both copies:
         // the content shows the native copy, so one copy is left out.
-        let ocr_both = "Please sign and return this form
-
-Please sign and return this form
-
-A stamp: received.
-";
+        let ocr_both = "Please sign and return this form\n\nPlease sign and return this form\n\nA stamp: received.\n";
         assert_eq!(
             rows_left_out(
                 PageContentSource::Fused,
@@ -3841,11 +3825,24 @@ A stamp: received.
             ),
             header
         );
+        // Codex on #24: native text keeps the header and a formatted body
+        // copy, OCR drops the header and adds a stamp. Both copies are on
+        // the page, so nothing was left out.
+        let formatted =
+            "Please sign and return this form\n\nPlease sign and **return** this form\n";
+        let ocr_plain = "Please sign and return this form\n\nA stamp: received.\n";
+        let (fused_formatted, source) = merge_native_and_ocr(formatted, ocr_plain);
+        assert_eq!(source, PageContentSource::Fused);
+        assert!(rows_left_out(
+            PageContentSource::Fused,
+            &fused_formatted,
+            (formatted, ocr_plain),
+            &[],
+            &header
+        )
+        .is_empty());
         // Native text that kept both copies brings the row back.
-        let native_both = "Please sign and return this form
-
-Please sign and return this form
-";
+        let native_both = "Please sign and return this form\n\nPlease sign and return this form\n";
         let (fused, _) = merge_native_and_ocr(native_both, ocr);
         assert!(rows_left_out(
             PageContentSource::Fused,
