@@ -14,6 +14,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use super::fonts::resolve_array;
 use super::geometry::PageRotation;
+use super::optional_content::{owner_off, OffLayers};
 use super::page_box::{visible_page_box, PageBox};
 use crate::text_utils::decode_pdf_text_string;
 use crate::types::{ItemType, TextItem};
@@ -83,6 +84,9 @@ pub(crate) struct Collector {
     examined: usize,
     /// Pages whose text is not reliable enough to read marked text from.
     unreliable_pages: HashSet<u32>,
+    /// The optional content the document's default configuration turns
+    /// off, read with the first page.
+    layers: Option<OffLayers>,
 }
 
 impl Collector {
@@ -90,20 +94,28 @@ impl Collector {
         Self::default()
     }
 
-    /// Read one page's annotations. Malformed entries are skipped.
-    pub(crate) fn add_page(&mut self, doc: &Document, page: u32, page_id: ObjectId) {
+    /// Read one page's annotations. Malformed entries are skipped. Returns
+    /// how many annotations that carry text it left out because they are
+    /// in optional content the default configuration turns off: no reader
+    /// shows them, so they are hidden text, not comments.
+    pub(crate) fn add_page(&mut self, doc: &Document, page: u32, page_id: ObjectId) -> u32 {
         let Some(annots) = doc
             .get_dictionary(page_id)
             .ok()
             .and_then(|dict| dict.get(b"Annots").ok())
             .and_then(|annots| resolve_array(doc, annots))
         else {
-            return;
+            return 0;
         };
+        let layers = self
+            .layers
+            .get_or_insert_with(|| OffLayers::read(doc))
+            .clone();
+        let mut off_left_out = 0;
         let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
         for entry in annots {
             if self.examined >= MAX_ANNOTS_EXAMINED || self.found.len() >= MAX_ANNOTATIONS {
-                return;
+                return off_left_out;
             }
             self.examined += 1;
             let (object, dict) = match entry {
@@ -114,8 +126,12 @@ impl Collector {
                 Object::Dictionary(dict) => (None, dict),
                 _ => continue,
             };
-            self.add_annotation(doc, page, object, dict, page_box);
+            let off = owner_off(doc, &layers, dict);
+            if self.add_annotation(doc, page, object, dict, page_box, off) {
+                off_left_out += 1;
+            }
         }
+        off_left_out
     }
 
     fn add_annotation(
@@ -125,9 +141,10 @@ impl Collector {
         object: Option<ObjectId>,
         dict: &Dictionary,
         page_box: PageBox,
-    ) {
+        off: bool,
+    ) -> bool {
         let Some(subtype) = name(doc, dict, b"Subtype") else {
-            return;
+            return false;
         };
         let kind = match subtype {
             b"Text" => AnnotationKind::Text,
@@ -136,7 +153,7 @@ impl Collector {
             b"Underline" => AnnotationKind::Underline,
             b"StrikeOut" => AnnotationKind::StrikeOut,
             b"Squiggly" => AnnotationKind::Squiggly,
-            _ => return,
+            _ => return false,
         };
         let parent = match dict.get(b"IRT") {
             Ok(Object::Reference(id)) => Some(*id),
@@ -156,7 +173,8 @@ impl Collector {
                     // 32000-1, table 172).
                     None => !matches!(state.as_str(), "Marked" | "Unmarked"),
                 };
-                if is_review {
+                // A state in off optional content is not shown either.
+                if is_review && !off {
                     self.states.push(ReviewState {
                         object,
                         parent,
@@ -165,16 +183,19 @@ impl Collector {
                         order: self.states.len(),
                     });
                 }
-                return;
+                return false;
             }
         }
 
         let Some(text) = annotation_text(doc, dict) else {
-            return;
+            return false;
         };
         let Some(rect) = rect(doc, dict) else {
-            return;
+            return false;
         };
+        if off {
+            return true;
+        }
         let quads = if kind.is_markup() {
             quads(doc, dict)
         } else {
@@ -194,6 +215,7 @@ impl Collector {
             reply_to,
             page_box,
         });
+        false
     }
 
     /// Leave out the marked text of a page whose text is unreliable (it

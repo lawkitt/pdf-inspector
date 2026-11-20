@@ -200,6 +200,19 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- Content in an optional-content layer that the document's default
+  configuration turns off (`/OCProperties /D`: listed in `/OFF`, or not
+  listed in `/ON` under `/BaseState /OFF`) is left out of the Markdown and
+  counted in `hidden_text_by_page`, as no reader shows it: `/OC` marked
+  content, form XObjects carrying an off `/OC` or invoked in off content,
+  and `/OCMD` membership dictionaries (their `/VE` visibility expression,
+  or their `/P` policy over `/OCGs`). Annotations that carry text and form
+  field widgets with an off `/OC` are left out too and counted the same
+  way, one stretch each; links with an off `/OC` are dropped. Before, such
+  text reached the Markdown although every reader hides it
+  (lawkitt/mdoc#1004). `include_invisible` does not bring it back. Usage
+  (`/AS`, print or view only) is not read: the default configuration
+  decides.
 - White text drawn inside a form XObject is no longer dropped when it sits
   on a dark fill: forms skipped every white-filled run, though the page's
   own text stopped being filtered by colour for exactly that reason. Such

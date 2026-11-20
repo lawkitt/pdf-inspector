@@ -3018,19 +3018,19 @@ pub(crate) fn extract_page_text_items_with_options(
     // come back with `include_invisible`; unlike it they are counted for
     // the caller (see `hidden_paint`). Before the clip test, which leaves
     // out runs that are not on the page at all and must not count here.
+    // Runs in optional content the default configuration turns off are
+    // left out and counted the same way, `include_invisible` or not: no
+    // reader shows them, and they are no scan's text layer.
     paint_log.finish();
-    let hidden_text = if include_invisible {
-        HiddenText::default()
-    } else {
-        drop_hidden_runs(
-            &mut items,
-            &mut item_clips,
-            &mut replaced_text,
-            &mut item_coverage,
-            &item_runs,
-            &paint_log,
-        )
-    };
+    let hidden_text = drop_hidden_runs(
+        &mut items,
+        &mut item_clips,
+        &mut replaced_text,
+        &mut item_coverage,
+        &item_runs,
+        &paint_log,
+        include_invisible,
+    );
     if hidden_text.runs > 0 {
         log::debug!(
             "page {page_num}: {} hidden text run(s) in {} stretch(es) left out",
@@ -3669,6 +3669,54 @@ mod tests {
             assert_eq!(texts, ["After", "Body", "Inside", "Straddling"]);
             assert!(!skipped_invisible);
         }
+    }
+
+    #[test]
+    fn off_layer_text_stays_out_when_invisible_text_is_kept() {
+        use lopdf::{dictionary, Object};
+
+        let content = b"BT /F1 12 Tf 80 700 Td (Body) Tj ET
+            3 Tr BT /F1 12 Tf 80 650 Td (Layer) Tj ET 0 Tr
+            /OC /L1 BDC BT /F1 12 Tf 80 600 Td (Off) Tj ET EMC";
+        let (mut doc, page_id) = simple_doc_with_content(content);
+        let layer =
+            doc.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal("L1") });
+        doc.catalog_mut().unwrap().set(
+            "OCProperties",
+            dictionary! {
+                "OCGs" => vec![Object::Reference(layer)],
+                "D" => dictionary! { "OFF" => vec![Object::Reference(layer)] },
+            },
+        );
+        doc.get_dictionary_mut(page_id)
+            .unwrap()
+            .get_mut(b"Resources")
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "Properties",
+                dictionary! { "L1" => Object::Reference(layer) },
+            );
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let extract = |include_invisible: bool| {
+            let ((items, _, _), _, _, _) = extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &font_cmaps,
+                include_invisible,
+                &mut FontStyleCache::new(),
+                &mut FormWalkBudget::new(),
+            )
+            .unwrap();
+            items.into_iter().map(|item| item.text).collect::<Vec<_>>()
+        };
+
+        // The retry that reads a scan's invisible text layer keeps that
+        // layer, never a layer the document turns off.
+        assert_eq!(extract(false), ["Body"]);
+        assert_eq!(extract(true), ["Body", "Layer"]);
     }
 
     #[test]

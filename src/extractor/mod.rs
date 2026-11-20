@@ -14,6 +14,7 @@ pub(crate) mod hidden_paint;
 pub(crate) mod invisible;
 mod layout;
 mod links;
+pub(crate) mod optional_content;
 pub(crate) mod page_box;
 mod reading_order;
 mod scripts;
@@ -125,8 +126,8 @@ impl PositionOptions {
         }
     }
 }
+use links::extract_page_links;
 pub(crate) use links::form_field_names_by_page;
-use links::{extract_form_fields, extract_page_links};
 pub(crate) use page_box::{visible_page_box, PageBox};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -943,7 +944,17 @@ fn extract_positioned_text_impl(
     // Extract AcroForm field values. Widgets on a turned page turn with it,
     // like links, so positional consumers keep them on the text they cover;
     // in the visible-box frame they take the page's (turned) shift as well.
-    let form_items: Vec<TextItem> = extract_form_fields(doc, &page_id_to_num)
+    // A field whose widget is in off optional content is hidden text: left
+    // out, and counted with the page's hidden text.
+    let (form_items, off_fields) = links::extract_form_fields_and_off(doc, &page_id_to_num);
+    for (page, fields) in off_fields {
+        if page_filter.is_none_or(|filter| filter.contains(&page)) {
+            let hidden = hidden_text.entry(page).or_default();
+            hidden.runs += fields;
+            hidden.stretches += fields;
+        }
+    }
+    let form_items: Vec<TextItem> = form_items
         .into_iter()
         .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)))
         .map(|mut item| {

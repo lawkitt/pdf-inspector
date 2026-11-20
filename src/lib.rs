@@ -227,9 +227,15 @@ pub struct PageRepeatedLines {
 /// image covers its whole box. Conservative: text over an image, a
 /// shading or anything else whose colour is not read stays,
 /// whatever its own colour, as does text in a colour space or font (Type3)
-/// whose colours are not read, rotated text, text in optional content and
-/// text under a translucent, blended or masked paint. Render-mode-3 text is
-/// left out separately and not counted here.
+/// whose colours are not read, rotated text, text in optional content that
+/// may be on, and text under a translucent, blended or masked paint.
+/// Render-mode-3 text is left out separately and not counted here.
+///
+/// Text in optional content that the document's default configuration
+/// turns off (`/OCProperties /D`) is hidden too, whatever its colour:
+/// marked content, form XObjects and `/OCMD` membership dictionaries. So
+/// are annotations that carry text and form field values whose `/OC` is
+/// off, which leave the annotation list and the text: one stretch each.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageHiddenText {
     /// 1-indexed page number.
@@ -979,9 +985,12 @@ fn extract_pages_markdown_mem_impl(
         }
 
         let page_1idx = page_0idx + 1;
-        if let Some(&page_id) = lopdf_pages.get(&page_1idx) {
-            annotations.add_page(&doc, page_1idx, page_id);
-        }
+        // Annotations in off optional content are left out of the list and
+        // counted as the page's hidden text.
+        let off_annotations = match lopdf_pages.get(&page_1idx) {
+            Some(&page_id) => annotations.add_page(&doc, page_1idx, page_id),
+            None => 0,
+        };
 
         // Partition items, removal decisions, and rects for this page only.
         let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
@@ -1062,10 +1071,14 @@ fn extract_pages_markdown_mem_impl(
                 names,
             });
         }
-        if let Some(hidden) = hidden_text.get(&page_1idx) {
+        let hidden_stretches = hidden_text
+            .get(&page_1idx)
+            .map_or(0, |hidden| hidden.stretches)
+            + off_annotations;
+        if hidden_stretches > 0 {
             hidden_text_by_page.push(PageHiddenText {
                 page: page_1idx,
-                stretches: hidden.stretches,
+                stretches: hidden_stretches,
             });
         }
 
