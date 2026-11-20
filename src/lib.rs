@@ -59,6 +59,7 @@ pub use extractor::annotations::{
     MAX_ANNOTATIONS, MAX_ANNOTATION_AUTHOR_CHARS, MAX_ANNOTATION_DATE_CHARS, MAX_ANNOTATION_QUADS,
     MAX_ANNOTATION_TEXT_CHARS,
 };
+pub use extractor::attachments::{MAX_ATTACHED_FILES, MAX_ATTACHED_FILE_NAME_CHARS};
 pub use extractor::geometry::PageRotation;
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_and_rotations_mem,
@@ -336,6 +337,35 @@ pub struct PdfAnnotation {
     /// spaces. `None` for notes and FreeText, when nothing is under the
     /// quads, and on pages whose text needs OCR.
     pub marked_text: Option<String>,
+}
+
+/// A file attached to the PDF, reported beside the Markdown; its content is
+/// never read.
+///
+/// The files come from the document's `/Names /EmbeddedFiles` tree, which
+/// also holds a portfolio's (`/Collection`) files, and from the
+/// `/FileAttachment` annotations of the requested pages. A file counts once
+/// however many of them name it: an annotation pointing at a file
+/// specification or embedded stream the tree already lists adds nothing. A
+/// file specification without an embedded file only refers to a file
+/// outside the PDF and is not listed. Counts and names are bounded:
+/// [`MAX_ATTACHED_FILES`], [`MAX_ATTACHED_FILE_NAME_CHARS`].
+///
+/// A file's name is personal data as much as the document's text: a caller
+/// that only needs to say attachments exist can count the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfAttachedFile {
+    /// The 1-indexed page of the `/FileAttachment` annotation carrying the
+    /// file; `None` for a file the document lists in its name tree.
+    pub page: Option<u32>,
+    /// The file specification's name (`/UF`, else `/F`, else a
+    /// platform-specific name), else the name tree's key for it, trimmed;
+    /// `None` when there is none.
+    pub name: Option<String>,
+    /// The file's size in bytes as the PDF declares it (`/Params /Size`),
+    /// else the length of an embedded stream stored without a filter;
+    /// `None` when neither gives it.
+    pub size: Option<u64>,
 }
 
 /// The shortest side, in points, an image must be drawn at to count in
@@ -758,6 +788,11 @@ pub struct PagesExtractionResult {
     /// order and then the order of each page's `/Annots`. They are never in
     /// the Markdown.
     pub annotations: Vec<PdfAnnotation>,
+    /// The files attached to the PDF (see [`PdfAttachedFile`]): the name
+    /// tree's, whatever pages were requested, then those of the requested
+    /// pages' `/FileAttachment` annotations, in page order. Their content
+    /// is never in the Markdown.
+    pub attached_files: Vec<PdfAttachedFile>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -1195,6 +1230,16 @@ fn extract_pages_markdown_mem_impl(
             invisible_text_by_page: invisible_text_pages,
             hidden_text_by_page,
             annotations: annotations.finish(&all_items, &page_rotations),
+            attached_files: extractor::attachments::attached_files(
+                &doc,
+                &pages_slice
+                    .iter()
+                    .filter_map(|page| {
+                        let page = page.checked_add(1)?;
+                        Some((page, *lopdf_pages.get(&page)?))
+                    })
+                    .collect(),
+            ),
             is_complex: complexity.is_complex,
         },
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]

@@ -11,6 +11,13 @@ version and date. Earlier releases are described in their
 
 ### Added
 
+- Per-page Markdown extraction and the OCR pipeline list the files attached
+  to the PDF (`attached_files`, a list of `PdfAttachedFile`: the page of its
+  annotation, if any, its name and size), from the `/Names /EmbeddedFiles`
+  tree, which holds a portfolio's files too, and the requested pages'
+  `/FileAttachment` annotations. A file named by both counts once, and a
+  file specification without an embedded file is not listed. Their content
+  is never read; Markdown output is unchanged (lawkitt/mdoc#1005).
 - Per-page Markdown extraction and the OCR pipeline report the pictures each
   page shows (`images_by_page`, a list of `PageImages`), from the executed
   content scan: images drawn directly or through forms (image XObjects,
