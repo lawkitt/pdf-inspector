@@ -17,6 +17,13 @@
 //! invoked under and their bounding box; a form that is not walked to its
 //! end paints an unknown region over its box.
 //!
+//! A run shown in optional content that the document's default
+//! configuration turns off (see `optional_content`) is hidden whatever its
+//! colour or what lies under it: an open `/OC` marked-content sequence
+//! whose properties are off, or a form carrying an off `/OC`, invoked in
+//! off content or inside such a form. Paints in optional content, off or
+//! not, stay unknown regions, as below.
+//!
 //! Conservative by construction: when in doubt the run stays. An image, a
 //! shading, an inline image, a non-rectangular fill, a fill cut by a clip
 //! of unknown shape, anything in optional content, and any paint whose
@@ -35,6 +42,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use super::clip_boundaries::{ClipBounds, ClipTracker};
 use super::get_number;
+use super::optional_content::{owner_off, OffLayers};
 use super::text_paint::RunPaint;
 use crate::types::{ItemType, TextItem};
 
@@ -272,18 +280,20 @@ enum XObject {
     /// `optional` when it carries optional content (`/OC`), which may be
     /// off.
     Image { opaque: bool, optional: bool },
-    /// A form, with its bounding box and matrix.
+    /// A form, with its bounding box and matrix; `off` when its optional
+    /// content is off in the default configuration.
     Form {
         bbox: Option<[f32; 4]>,
         matrix: [f32; 6],
         optional: bool,
+        off: bool,
     },
     /// Anything else.
     Other,
 }
 
 impl XObject {
-    fn read(doc: &Document, obj: &Object) -> XObject {
+    fn read(doc: &Document, layers: &OffLayers, obj: &Object) -> XObject {
         let Some(dict) = resolve(doc, obj).and_then(|o| match o {
             Object::Stream(s) => Some(&s.dict),
             Object::Dictionary(d) => Some(d),
@@ -323,6 +333,7 @@ impl XObject {
                     bbox,
                     matrix,
                     optional,
+                    off: owner_off(doc, layers, dict),
                 }
             }
             _ => XObject::Other,
@@ -400,6 +411,9 @@ pub(super) struct ShownRun {
     /// The colours the run paints with (fill, stroke or both), `None` when
     /// the run is not judged by colour.
     ink: Option<([u8; 3], Option<[u8; 3]>)>,
+    /// Shown in optional content the default configuration turns off: no
+    /// reader shows it, whatever its colour.
+    off: bool,
 }
 
 /// The glyph runs shown inside an ActualText span, so that the replacement
@@ -432,10 +446,15 @@ impl SpanRuns {
 
     /// How the span's replacement, emitted now, is shown: as its glyph runs
     /// were when they were all alike and nothing has been painted since;
-    /// otherwise unjudged.
-    pub(super) fn close(self, log: &PaintLog) -> ShownRun {
+    /// otherwise unjudged, and off when it ends in off optional content or
+    /// its glyph runs were all off.
+    pub(super) fn close(self, log: &PaintLog<'_>) -> ShownRun {
         match self.first {
             Some(first) if self.alike && first.seq == log.paints.len() => first,
+            Some(first) if self.alike && first.off => ShownRun {
+                off: true,
+                ..log.unjudged()
+            },
             _ => log.unjudged(),
         }
     }
@@ -443,6 +462,18 @@ impl SpanRuns {
 
 type States = HashMap<Vec<u8>, Option<StateUpdate>>;
 type XObjects = HashMap<Vec<u8>, XObject>;
+/// Per `/Properties` resource name, whether it is optional content the
+/// default configuration turns off.
+type Properties = HashMap<Vec<u8>, bool>;
+
+/// An open marked-content sequence.
+#[derive(Clone, Copy, Debug)]
+struct Marked {
+    /// Tagged `/OC`: optional content, which may be off.
+    optional: bool,
+    /// Optional content the default configuration turns off.
+    off: bool,
+}
 
 /// A form XObject being walked: its own clip, and what to restore when it
 /// ends, as a `Do` restores the graphics state it was invoked in.
@@ -456,7 +487,7 @@ struct FormFrame {
     marked_len: usize,
     path: Vec<Subpath>,
     /// The invoking stream's resources, when the form has its own.
-    resources: Option<(States, XObjects)>,
+    resources: Option<(States, XObjects, Properties)>,
     /// Whether what the form paints may not land as painted: it was
     /// invoked at less than full alpha (a transparency group's alpha
     /// applies to everything in it however its contents set their own), in
@@ -465,31 +496,43 @@ struct FormFrame {
     /// Whether what the form paints may not keep its colour: it was
     /// invoked blended, soft-masked or overprinted, or inside such a form.
     uncoloured: bool,
+    /// Whether the form is off: it carries optional content the default
+    /// configuration turns off, was invoked in such content, or inside
+    /// such a form.
+    off: bool,
 }
 
 /// A form invoked and not yet entered: where it may paint, the clip it was
-/// invoked under, and whether it carries optional content.
+/// invoked under, and whether it carries optional content, and off.
 #[derive(Clone, Copy, Debug)]
 struct PendingForm {
     area: Area,
     clip: ClipBounds,
     optional: bool,
+    off: bool,
 }
 
 /// What a page has painted so far, and the graphics state that decides how
 /// its next paint lands.
-pub(super) struct PaintLog {
+pub(super) struct PaintLog<'a> {
+    /// The document, to read optional content a marked-content sequence
+    /// carries inline; `None` for a detached log.
+    doc: Option<&'a Document>,
+    /// The optional content the document's default configuration turns
+    /// off.
+    layers: OffLayers,
     paints: Vec<Paint>,
     overflowed: bool,
     compositing: Compositing,
     /// The line width in user space (`w`).
     line_width: f32,
     saved: Vec<(Compositing, f32)>,
-    /// Per open marked-content sequence, whether it is optional content.
-    marked: Vec<bool>,
+    /// The open marked-content sequences.
+    marked: Vec<Marked>,
     path: Vec<Subpath>,
     states: States,
     xobjects: XObjects,
+    properties: Properties,
     /// A form XObject just invoked, with the clip it was invoked under: the
     /// walker enters it next, or it was not walked and paints somewhere in
     /// its area.
@@ -497,11 +540,13 @@ pub(super) struct PaintLog {
     forms: Vec<FormFrame>,
 }
 
-impl PaintLog {
-    /// An empty log reading `gs` and `Do` operands from the page's
+impl<'a> PaintLog<'a> {
+    /// An empty log reading `gs`, `Do` and `BDC` operands from the page's
     /// resources, its own before inherited ones.
-    pub(super) fn page(doc: &Document, page_id: ObjectId) -> PaintLog {
+    pub(super) fn page(doc: &'a Document, page_id: ObjectId) -> PaintLog<'a> {
         let mut log = PaintLog {
+            doc: Some(doc),
+            layers: OffLayers::read(doc),
             paints: Vec::new(),
             overflowed: false,
             compositing: Compositing::default(),
@@ -511,6 +556,7 @@ impl PaintLog {
             path: Vec::new(),
             states: HashMap::new(),
             xobjects: HashMap::new(),
+            properties: HashMap::new(),
             pending_form: None,
             forms: Vec::new(),
         };
@@ -545,7 +591,13 @@ impl PaintLog {
             for (name, obj) in xobjects {
                 self.xobjects
                     .entry(name.clone())
-                    .or_insert_with(|| XObject::read(doc, obj));
+                    .or_insert_with(|| XObject::read(doc, &self.layers, obj));
+            }
+        }
+        if let Some(properties) = section(b"Properties") {
+            for (name, obj) in properties {
+                let off = self.layers.hides(doc, obj);
+                self.properties.entry(name.clone()).or_insert(off);
             }
         }
     }
@@ -553,8 +605,10 @@ impl PaintLog {
     /// A log for a form walked on its own, outside any page: nothing it
     /// paints is judged.
     #[cfg(test)]
-    pub(super) fn detached() -> PaintLog {
+    pub(super) fn detached() -> PaintLog<'static> {
         PaintLog {
+            doc: None,
+            layers: OffLayers::None,
             paints: Vec::new(),
             overflowed: true,
             compositing: Compositing::default(),
@@ -564,6 +618,7 @@ impl PaintLog {
             path: Vec::new(),
             states: HashMap::new(),
             xobjects: HashMap::new(),
+            properties: HashMap::new(),
             pending_form: None,
             forms: Vec::new(),
         }
@@ -579,11 +634,14 @@ impl PaintLog {
             area,
             clip,
             optional,
+            off,
         } = self.pending_form.take().unwrap_or(PendingForm {
             area: Area::EVERYWHERE,
             clip: ClipBounds::Unknown,
             optional: false,
+            off: false,
         });
+        let off = off || self.off() || owner_off(doc, &self.layers, form);
         let mut clips = ClipTracker::starting_with(clip);
         let bbox = form
             .get(b"BBox")
@@ -616,6 +674,7 @@ impl PaintLog {
                 let outer = (
                     std::mem::take(&mut self.states),
                     std::mem::take(&mut self.xobjects),
+                    std::mem::take(&mut self.properties),
                 );
                 self.add_resources(doc, own);
                 outer
@@ -637,6 +696,7 @@ impl PaintLog {
             resources,
             inexact,
             uncoloured,
+            off,
         });
     }
 
@@ -652,9 +712,10 @@ impl PaintLog {
         self.saved.truncate(frame.saved_len);
         self.marked.truncate(frame.marked_len);
         self.path = frame.path;
-        if let Some((states, xobjects)) = frame.resources {
+        if let Some((states, xobjects, properties)) = frame.resources {
             self.states = states;
             self.xobjects = xobjects;
+            self.properties = properties;
         }
         if !walked_all {
             self.record(frame.area, Kind::Unknown, ClipBounds::None);
@@ -694,7 +755,15 @@ impl PaintLog {
     }
 
     fn in_optional_content(&self) -> bool {
-        self.marked.iter().any(|&oc| oc)
+        self.marked.iter().any(|marked| marked.optional)
+    }
+
+    /// Whether what is shown now is in optional content the default
+    /// configuration turns off: an open marked-content sequence or the form
+    /// being walked is off.
+    fn off(&self) -> bool {
+        self.marked.iter().any(|marked| marked.off)
+            || self.forms.last().is_some_and(|frame| frame.off)
     }
 
     /// Whether a paint now may not land as painted (see `FormFrame`).
@@ -764,13 +833,25 @@ impl PaintLog {
                     None => self.compositing = Compositing::UNKNOWN,
                 }
             }
-            "BDC" => self.marked.push(
-                operands
+            "BDC" => {
+                let optional = operands
                     .first()
                     .and_then(|o| o.as_name().ok())
-                    .is_some_and(|tag| tag == b"OC"),
-            ),
-            "BMC" => self.marked.push(false),
+                    .is_some_and(|tag| tag == b"OC");
+                let off = optional
+                    && match operands.get(1) {
+                        Some(Object::Name(name)) => {
+                            self.properties.get(name).copied().unwrap_or(false)
+                        }
+                        Some(inline) => self.doc.is_some_and(|doc| self.layers.hides(doc, inline)),
+                        None => false,
+                    };
+                self.marked.push(Marked { optional, off });
+            }
+            "BMC" => self.marked.push(Marked {
+                optional: false,
+                off: false,
+            }),
             "EMC" => {
                 let floor = self.forms.last().map_or(0, |frame| frame.marked_len);
                 if self.marked.len() > floor {
@@ -871,6 +952,7 @@ impl PaintLog {
                         bbox,
                         matrix,
                         optional,
+                        off,
                     } => {
                         let area = bbox
                             .and_then(|bbox| Area::around(corners(bbox, &concat(&matrix, ctm))))
@@ -879,6 +961,7 @@ impl PaintLog {
                             area,
                             clip,
                             optional,
+                            off,
                         });
                     }
                     _ => self.record(Area::EVERYWHERE, Kind::Unknown, clip),
@@ -982,21 +1065,28 @@ impl PaintLog {
         ShownRun {
             seq: self.paints.len(),
             ink: ink.filter(|_| judged),
+            off: self.off(),
         }
     }
 
     /// Something other than a text run shown now (a form's text, an
     /// ActualText replacement, an image placeholder): never judged by
-    /// colour, still covered by what comes later.
+    /// colour, still covered by what comes later, and off in optional
+    /// content the default configuration turns off.
     pub(super) fn unjudged(&self) -> ShownRun {
         ShownRun {
             seq: self.paints.len(),
             ink: None,
+            off: self.off() || self.pending_form.is_some_and(|form| form.off),
         }
     }
 
-    /// Whether `item`, shown as `run`, is hidden (see the module docs).
+    /// Whether `item`, shown as `run`, is hidden (see the module docs). A
+    /// text run in off optional content is hidden wherever it lies.
     pub(super) fn hides(&self, item: &TextItem, run: &ShownRun) -> bool {
+        if run.off && matches!(item.item_type, ItemType::Text) && !item.text.trim().is_empty() {
+            return true;
+        }
         if self.overflowed
             || !matches!(item.item_type, ItemType::Text)
             || item.text.trim().is_empty()
@@ -1103,14 +1193,17 @@ pub(crate) struct HiddenText {
 /// matching entry of `runs`), keeping the vectors parallel to it (`clips`,
 /// `replaced_text`, `coverage`) aligned. A run its clip leaves out is left
 /// to `drop_clipped_away_runs` and not counted here: it is not on the page
-/// at all.
+/// at all. With `off_only`, only runs in off optional content are hidden:
+/// a walk that keeps invisible text to read a scan's text layer keeps the
+/// runs judged by colour, but no layer turned off is a scan's text layer.
 pub(super) fn drop_hidden_runs(
     items: &mut Vec<TextItem>,
     clips: &mut Vec<Option<super::clip_boundaries::ClipRect>>,
     replaced_text: &mut Vec<bool>,
     coverage: &mut crate::types::ItemCoverage,
     runs: &[ShownRun],
-    log: &PaintLog,
+    log: &PaintLog<'_>,
+    off_only: bool,
 ) -> HiddenText {
     debug_assert_eq!(items.len(), runs.len());
     let mut hidden = HiddenText::default();
@@ -1125,7 +1218,12 @@ pub(super) fn drop_hidden_runs(
             if super::clip_boundaries::excluded_by_clip(item, *clip) {
                 return true;
             }
-            if !log.hides(item, run) {
+            let hides = if off_only {
+                run.off && matches!(item.item_type, ItemType::Text) && !item.text.trim().is_empty()
+            } else {
+                log.hides(item, run)
+            };
+            if !hides {
                 let blank = matches!(item.item_type, ItemType::Text) && item.text.trim().is_empty();
                 open &= blank;
                 return true;
@@ -1176,7 +1274,7 @@ mod tests {
         }
     }
 
-    fn empty_log() -> PaintLog {
+    fn empty_log() -> PaintLog<'static> {
         PaintLog {
             overflowed: false,
             ..PaintLog::detached()
@@ -1185,7 +1283,7 @@ mod tests {
 
     /// The log after `ops`, all at the identity CTM with no clip, filling
     /// in `fill`.
-    fn log_after(ops: &str, fill: [u8; 3]) -> PaintLog {
+    fn log_after(ops: &str, fill: [u8; 3]) -> PaintLog<'static> {
         let mut log = empty_log();
         for op in Content::decode(ops.as_bytes()).unwrap().operations {
             log.observe(
@@ -1420,7 +1518,11 @@ mod tests {
         }
         // Painted after the run: the run is covered, whatever its colour.
         assert!(log.hides(&item, &shown));
-        let unjudged = ShownRun { seq: 0, ink: None };
+        let unjudged = ShownRun {
+            seq: 0,
+            ink: None,
+            off: false,
+        };
         assert!(log.hides(&item, &unjudged));
     }
 

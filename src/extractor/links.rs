@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::fonts::{resolve_array, resolve_dict};
 use super::get_number;
+use super::optional_content::{owner_off, OffLayers};
 
 /// Upper bound on the number of form-field nodes visited during a single
 /// `extract_form_fields` pass. A crafted PDF can chain thousands of distinct
@@ -50,6 +51,9 @@ impl FieldWalkBudget {
 
 pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> Vec<TextItem> {
     let mut links = Vec::new();
+    // A link in optional content the default configuration turns off is
+    // not on the page a reader sees.
+    let layers = OffLayers::read(doc);
 
     // Try to get the page dictionary
     if let Ok(page_dict) = doc.get_dictionary(page_id) {
@@ -76,6 +80,9 @@ pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> V
                 };
 
                 if let Some(annot_dict) = annot_dict {
+                    if owner_off(doc, &layers, annot_dict) {
+                        continue;
+                    }
                     // Check if this is a Link annotation
                     if let Ok(subtype) = annot_dict.get(b"Subtype") {
                         if let Ok(subtype_name) = subtype.as_name() {
@@ -177,11 +184,23 @@ pub(crate) fn extract_link_uri(doc: &Document, annot_dict: &lopdf::Dictionary) -
 /// An item carries the field's value only. The field's name (`/T`, joined
 /// with its parents' names) is not drawn on the page, so it stays out of
 /// the text; [`form_field_names_by_page`] counts the names left out.
+#[cfg(test)]
 pub(crate) fn extract_form_fields(
     doc: &Document,
     page_map: &HashMap<ObjectId, u32>,
 ) -> Vec<TextItem> {
     walk_acroform(doc, page_map).items
+}
+
+/// The form field value items (see `extract_form_fields`), with how many fields each 1-indexed
+/// page left out because their widget is in optional content the default
+/// configuration turns off: no reader sees their values.
+pub(crate) fn extract_form_fields_and_off(
+    doc: &Document,
+    page_map: &HashMap<ObjectId, u32>,
+) -> (Vec<TextItem>, BTreeMap<u32, u32>) {
+    let found = walk_acroform(doc, page_map);
+    (found.items, found.off_by_page)
 }
 
 /// How many form field names each 1-indexed page leaves out of its text:
@@ -194,12 +213,15 @@ pub(crate) fn form_field_names_by_page(
     walk_acroform(doc, page_map).names_left_out
 }
 
-/// What one walk of the AcroForm field tree finds: the value items, and per
-/// page how many field names were left out of them.
+/// What one walk of the AcroForm field tree finds: the value items, per
+/// page how many field names were left out of them, and per page how many
+/// fields were left out whole because their widget is in off optional
+/// content (their names are not counted as left out).
 #[derive(Default)]
 struct FormFields {
     items: Vec<TextItem>,
     names_left_out: BTreeMap<u32, u32>,
+    off_by_page: BTreeMap<u32, u32>,
 }
 
 fn walk_acroform(doc: &Document, page_map: &HashMap<ObjectId, u32>) -> FormFields {
@@ -239,6 +261,7 @@ fn walk_acroform(doc: &Document, page_map: &HashMap<ObjectId, u32>) -> FormField
         return found;
     }
     let annotation_pages = annotation_page_map(doc, page_map);
+    let layers = OffLayers::read(doc);
 
     // Bound the walk so a crafted PDF cannot send us into unbounded recursion
     // via a `/Kids` cycle, a deep chain, or an oversized array of invalid or
@@ -261,6 +284,7 @@ fn walk_acroform(doc: &Document, page_map: &HashMap<ObjectId, u32>) -> FormField
                 "",
                 page_map,
                 &annotation_pages,
+                &layers,
                 &mut found,
                 &mut budget,
                 0,
@@ -306,6 +330,7 @@ fn walk_form_fields(
     parent_name: &str,
     page_map: &HashMap<ObjectId, u32>,
     annotation_pages: &HashMap<ObjectId, u32>,
+    layers: &OffLayers,
     found: &mut FormFields,
     budget: &mut FieldWalkBudget,
     depth: usize,
@@ -376,6 +401,7 @@ fn walk_form_fields(
                         &full_name,
                         page_map,
                         annotation_pages,
+                        layers,
                         found,
                         budget,
                         depth + 1,
@@ -470,6 +496,13 @@ fn walk_form_fields(
         .and_then(|p| page_map.get(&p).copied())
         .or_else(|| annotation_pages.get(&field_id).copied())
         .unwrap_or(1);
+
+    // A widget in optional content the default configuration turns off is
+    // not drawn: its value is hidden text, left out and counted.
+    if owner_off(doc, layers, field_dict) {
+        *found.off_by_page.entry(page_num).or_default() += 1;
+        return;
+    }
 
     // The name is the form's internal key, not something the page draws:
     // only the value is visible, so only the value is text.
