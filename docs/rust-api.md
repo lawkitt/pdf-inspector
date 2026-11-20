@@ -612,6 +612,29 @@ here. Stamps, ink, file attachments, links, shapes and form widgets are
 drawn and read like the rest of the page. See
 [Optional native page rendering](#optional-native-page-rendering).
 
+## Attached files
+
+Files attached to the PDF are listed beside the Markdown, and their content
+is never read: `PagesExtractionResult::attached_files` and
+`vision::OcrPdfResult::attached_files`, as `PdfAttachedFile`s. The list holds
+the files of the document's `/Names /EmbeddedFiles` tree (a portfolio's,
+`/Collection`, among them) whatever pages were requested, in tree order, then
+those of the requested pages' `/FileAttachment` annotations, in page order.
+A file counts once however many of these name it: an annotation pointing at
+a file specification or embedded stream already listed adds nothing. A file
+specification without an embedded stream refers to a file outside the PDF
+and is not listed.
+
+Each entry gives the annotation's page (`None` for the tree's files), the
+file's name (`/UF`, else `/F` or a platform name, else the tree's key) and
+its size (`/Params /Size`, else the length of an unfiltered stream). A file
+name is personal data as much as the document's text, so a caller that only
+needs to say attachments exist can count the list. The walk is bounded: at
+most `MAX_ATTACHED_FILES` (10,000) files, 100,000 name-tree nodes and
+annotation entries examined, names cut at `MAX_ATTACHED_FILE_NAME_CHARS`
+(512) characters; reference cycles in the tree are ignored, and nothing
+unreadable fails the extraction.
+
 ## Processing modes
 
 | Mode | What it does | Returns |
@@ -676,7 +699,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
-| `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, the counts of what the Markdown leaves out (images_by_page, form_field_names_by_page, invisible_text_by_page), annotations, is_complex |
+| `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, the counts of what the Markdown leaves out (images_by_page, form_field_names_by_page, invisible_text_by_page), annotations, attached_files, is_complex |
 | `PdfAnnotation` | An annotation that carries text, reported beside the Markdown: page, kind, author, date, text, rect, quads, in_reply_to, resolved, marked_text (see [Annotations](#annotations)) |
 | `AnnotationKind` | `Text` (sticky note), `FreeText`, `Highlight`, `Underline`, `StrikeOut`, `Squiggly` |
 | `AnnotationRect` | `x`, `y`, `width`, `height` in the visible-page-box frame, lower-left origin, `y` up |

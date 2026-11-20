@@ -251,6 +251,11 @@ pub struct OcrPdfResult {
     /// markup with a comment), from native extraction; never in the
     /// Markdown. `in_reply_to` indexes this list.
     pub annotations: Vec<crate::PdfAnnotation>,
+    /// The files attached to the PDF (see [`crate::PdfAttachedFile`]),
+    /// from native extraction: the name tree's, whatever pages were
+    /// selected, then those of the selected pages' `/FileAttachment`
+    /// annotations. Never read, never in the Markdown.
+    pub attached_files: Vec<crate::PdfAttachedFile>,
     /// Selected pages where deterministic table detection found tables.
     pub pages_with_tables: Vec<u32>,
     /// Selected pages where deterministic layout found multiple columns.
@@ -582,6 +587,7 @@ pub fn process_pdf_with_ocr_mem(
         repeated_lines_by_page,
         hidden_text_by_page: native.hidden_text_by_page,
         annotations: native.annotations,
+        attached_files: native.attached_files,
         pages_with_tables: pages_with_tables.clone(),
         pages_with_columns: native.pages_with_columns,
         is_complex: native.is_complex || !pages_with_tables.is_empty(),
